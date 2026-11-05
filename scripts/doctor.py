@@ -297,6 +297,36 @@ def check_model(rep):
                  "delete it; the dashboard regenerates it")
 
 
+def _dashsvc_status():
+    """(installed, active) for the dashboard service, never raising."""
+    try:
+        import dashsvc
+        st = dashsvc.status()
+        return bool(st.get("installed")), bool(st.get("active"))
+    except Exception:
+        return False, False
+
+
+def dashboard_not_running_reason():
+    installed, _ = _dashsvc_status()
+    if installed:
+        return "the dashboard service exists but is not running"
+    return "the dashboard service is not installed"
+
+
+def dashboard_fix():
+    """The command that will actually work, given what is installed.
+
+    The doctor used to always say `systemctl --user restart hunter-dashboard`,
+    which fails with "Unit not found" when the installer never created the unit -
+    advice that cannot work is worse than none.
+    """
+    installed, _ = _dashsvc_status()
+    if installed:
+        return "systemctl --user restart hunter-dashboard"
+    return "hunter dashboard install"
+
+
 def check_port(rep, port=None):
     try:
         import config as cfgmod
@@ -317,8 +347,8 @@ def check_port(rep, port=None):
         s.close()
 
     if not listening:
-        rep.warn(f"nothing listening on port {port}", "the dashboard is not running",
-                 "systemctl --user start hunter-dashboard")
+        rep.warn(f"nothing listening on port {port}", dashboard_not_running_reason(),
+                 dashboard_fix())
         return
 
     # Listening, but is it healthy?
@@ -333,7 +363,7 @@ def check_port(rep, port=None):
     except Exception as exc:
         rep.fail(f"port {port} is open but the dashboard is not healthy",
                  str(exc),
-                 "systemctl --user restart hunter-dashboard")
+                 dashboard_fix())
 
 
 def check_disk(rep):

@@ -195,6 +195,7 @@ def collect_status():
             "predictions_pairs": len(preds.get("predictions", {}) or {}),
         },
         "dashboard": dash,
+        "dashboard_service": dashboard_service_status(),
         "config": {
             "sizing_fraction": cfgmod.get(cfg, "trading.sizing_fraction"),
             "cooldown_hours": cfgmod.get(cfg, "trading.cooldown_hours"),
@@ -319,17 +320,40 @@ def render_status(data, as_json=False):
     # --- dashboard ---
     L.append(term.section("Dashboard"))
     dh = data["dashboard"]
+    svc = data.get("dashboard_service") or {}
     if dh["responding"]:
         where = term.grey("127.0.0.1:{}  {}ms".format(dh["port"], dh["latency_ms"]))
         L.append(f"  {term.green('responding')}  {where}")
     else:
         port = dh["port"] or "?"
         L.append(f"  {term.yellow('[WARN]')} not responding on 127.0.0.1:{port}")
-        L.append(f"         {term.grey('Fix: systemctl --user restart hunter-dashboard')}")
+
+        # The fix depends on whether the service actually exists. Saying
+        # "systemctl --user restart hunter-dashboard" unconditionally is what
+        # produced "Unit hunter-dashboard.service not found" on a fresh install.
+        if svc.get("installed"):
+            L.append(f"         {term.grey('Fix: systemctl --user restart hunter-dashboard')}")
+        else:
+            L.append(f"         {term.grey('The service is not installed. To create and start it:')}")
+            L.append(f"         {term.grey('  hunter dashboard install')}")
 
     L.append("")
     L.append(term.rule())
     return "\n".join(L)
+
+
+def dashboard_service_status():
+    """Whether the systemd unit exists and is running.
+
+    Separate from `dashboard.responding` on purpose: a unit can exist but be
+    stopped, or not exist at all, and the correct advice differs.
+    """
+    try:
+        import dashsvc
+        return dashsvc.status()
+    except Exception:
+        return {"installed": False, "active": False, "unit": "hunter-dashboard.service",
+                "port": 8082, "path": ""}
 
 
 def crontab_job_states():
@@ -621,8 +645,59 @@ def cmd_uninstall(args):
     return 0 if res.get("ok") else 1
 
 
+def cmd_dashboard(args):
+    """Install, start, stop or inspect the dashboard service."""
+    import dashsvc
+
+    action = getattr(args, "action", None) or "status"
+
+    if action == "status":
+        st = dashsvc.status()
+        if args.json:
+            print(json.dumps(st, indent=2))
+            return 0
+        state = "active" if st["active"] else ("installed, not running" if st["installed"]
+                                               else "not installed")
+        print(f"  {term.bold('hunter-dashboard.service')}  {state}")
+        print(f"  {term.grey('unit  ' + st['path'])}")
+        if not st["installed"]:
+            print(f"  {term.grey('Fix: hunter dashboard install')}")
+        return 0
+
+    if action == "install":
+        # The app root is the directory containing this script's parent.
+        app = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        res = dashsvc.install(app, data_dir=os.path.join(os.path.dirname(app), "data"))
+        if args.json:
+            print(json.dumps(res, indent=2))
+            return 0
+        if res.get("error"):
+            print(f"  {term.red('[FAIL]')} {res['error']}")
+            return 1
+        if res["written"] and res["started"]:
+            print(f"  {term.green('[OK]')} dashboard service installed and started")
+            print(f"  {term.grey('open  http://127.0.0.1:' + str(dashsvc.PORT))}")
+            return 0
+        print(f"  {term.yellow('[WARN]')} written={res['written']} "
+              f"enabled={res['enabled']} started={res['started']}")
+        print(f"  {term.grey('Fix: systemctl --user status hunter-dashboard')}")
+        return 1
+
+    if action == "remove":
+        res = dashsvc.remove()
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            print(f"  {term.green('[OK]')} dashboard service removed")
+        return 0
+
+    print(f"  unknown action: {action}", file=sys.stderr)
+    return 2
+
+
 COMMANDS = {
     "where": (cmd_where, "show where the app, data and logs live"),
+    "dashboard": (cmd_dashboard, "install, start, stop or inspect the dashboard service"),
     "status": (cmd_status, "live state: hunting mode, balance, data, jobs, dashboard"),
     "start": (cmd_start, "start hunting (enables the scanning job)"),
     "stop": (cmd_stop, "stop hunting (market-sells an open position first)"),
@@ -665,6 +740,12 @@ def build_parser():
         if name == "setup":
             sp.add_argument("--force", action="store_true",
                             help="replace credentials that are already saved")
+        if name == "dashboard":
+            dsub = sp.add_subparsers(dest="action", metavar="<action>")
+            dsub.add_parser("status", help="is the service installed and running?")
+            dsub.add_parser("install", help="create, enable and start the service")
+            dsub.add_parser("remove", help="stop, disable and delete the service")
+
         if name == "cron":
             sp.add_argument("action",
                             choices=["install", "remove", "status", "list",

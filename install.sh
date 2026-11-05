@@ -402,6 +402,44 @@ ensure_path() {
 }
 
 # ---------------------------------------------------------------------------
+# Dashboard service
+# ---------------------------------------------------------------------------
+# `hunter status` used to tell the user to run
+# `systemctl --user restart hunter-dashboard` when the dashboard was down - but
+# nothing ever created that unit, so the command failed with "Unit not found" on
+# every fresh install. Reporting a fix that cannot work is worse than reporting
+# nothing, so the installer now creates the unit.
+#
+# The dashboard is STARTED here (unlike the cron jobs, which are registered
+# disabled). It is a read-only web UI serving localhost and placing no orders,
+# and it is how the user reaches Settings to fetch data - so leaving it down
+# would mean the first thing they see is a broken page.
+install_service() {
+    heading "Dashboard service"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        step "would install hunter-dashboard.service"
+        return 0
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemd is not available; the dashboard will not start automatically"
+        info "run it by hand:  hunter dashboard"
+        return 0
+    fi
+
+    if "$VENV_DIR/bin/python" "$APP_DIR/scripts/dashsvc.py" install \
+            --app "$APP_DIR" --data "$DATA_DIR" >/dev/null 2>&1; then
+        step "installed hunter-dashboard.service"
+        info "started and enabled - it will come back after a reboot"
+        ok
+    else
+        warn "could not install the dashboard service"
+        info "the dashboard can still be run by hand:  hunter dashboard"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 finish() {
@@ -429,6 +467,7 @@ main() {
     fetch_model
     install_crontab
     link_command
+    install_service
     finish
 }
 

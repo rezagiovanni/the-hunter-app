@@ -296,11 +296,12 @@ def uninstall(dry_run=False, assume_yes=False, delete_data=False,
     # service. This is the same class of leak as `crontab` ignoring $HOME: the
     # tests stubbed the crontab and the HOME but not systemd, so an uninstall
     # test stopped the running dashboard on the development machine.
-    systemctl = os.environ.get("HUNTER_SYSTEMCTL") or "systemctl"
+    # Stop and remove the unit through the one module that owns it, so the
+    # service definition has a single source of truth.
     try:
-        subprocess.run([systemctl, "--user", "stop", "hunter-dashboard.service"],
-                       capture_output=True, timeout=15)
-        done.append(("dashboard service", True))
+        import dashsvc
+        res = dashsvc.remove()
+        done.append(("dashboard service", bool(res.get("stopped") or res.get("deleted"))))
     except Exception:
         done.append(("dashboard service", False))
 
@@ -487,11 +488,17 @@ def _self_check():
     check("human_bytes GB", "GB" in human_bytes(5 * 1024**3))
 
     # ---- 6b. systemd access is redirectable, so a test cannot stop it ----
+    # lifecycle no longer calls systemctl itself: the unit is owned by dashsvc,
+    # which is where $HUNTER_SYSTEMCTL is honoured. Assert that the delegation
+    # exists and that nothing here bypasses it.
     impl = open(__file__).read().split("def _self_check")[0]
-    check("systemctl honours HUNTER_SYSTEMCTL",
-          'os.environ.get("HUNTER_SYSTEMCTL")' in impl)
+    check("uninstall delegates service removal to dashsvc", "dashsvc.remove()" in impl)
     check("no bare systemctl call remains",
           'subprocess.run(["systemctl"' not in impl)
+
+    import dashsvc
+    check("dashsvc honours HUNTER_SYSTEMCTL",
+          "HUNTER_SYSTEMCTL" in open(dashsvc.__file__).read().split("def _self_check")[0])
 
     # ---- 7. no sudo anywhere in the lifecycle module ----
     impl = open(__file__).read().split("def _self_check")[0]
