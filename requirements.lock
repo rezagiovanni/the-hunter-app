@@ -1,0 +1,50 @@
+# The Hunter -- pinned dependency stack (T-018)
+#
+# Exact versions, deliberately. Generated from the set that was verified on the
+# Armbian aarch64 STB (Python 3.12.3, glibc 2.39) during M1.
+#
+# Why pinned: joblib unpickling requires the same scikit-learn series that
+# trained the model. An unpinned install resolves to whatever is newest that
+# day, so a "successful" install could later fail to load the model, or a user
+# installing in six months would get an untested stack.
+#
+# Two of these pins differ from what the STB first resolved. The STB got
+# numpy 2.5.4 / scipy 1.18.1, which publish wheels for Python 3.12+ only, so
+# that stack cannot install on the dev machine (Python 3.11) and the lock
+# would not be a single portable file. numpy 2.4.6 / scipy 1.17.1 have wheels
+# for both 3.11 and 3.12 on both architectures, so they are pinned instead.
+# This also means the machine that trains the model and the machine that runs
+# it use the same numerical stack.
+#
+# Install with:  pip install -r requirements.lock
+# Never install bare package names on an installed machine.
+
+# --- direct dependencies ---
+requests==2.34.2
+fastapi==0.162.0
+uvicorn==0.54.0
+joblib==1.6.0
+scikit-learn==1.9.1
+PyYAML==6.0.3
+
+# --- transitive (pinned so resolution cannot drift) ---
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.16.0
+certifi==2026.10.23
+charset-normalizer==3.5.2
+click==8.5.0
+cloudpickle==3.1.2
+h11==0.16.0
+idna==3.20
+narwhals==2.28.0
+numpy==2.4.6       # py3.11+3.12 compatible; 2.5.x is py3.12-only
+opentelemetry-api==1.45.2
+pydantic==2.14.2
+pydantic-core==2.50.2
+scipy==1.17.1      # py3.11+3.12 compatible; 1.18.x is py3.12-only
+starlette==1.10.0
+threadpoolctl==3.7.0
+typing-extensions==4.16.0
+typing-inspection==0.4.5
+urllib3==2.8.0

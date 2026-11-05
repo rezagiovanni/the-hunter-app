@@ -1,0 +1,72 @@
+# The Hunter — user settings
+#
+# This file is yours. `hunter upgrade` replaces the application code but never
+# touches this file, so changes you make here survive upgrades.
+#
+# Every key is optional. Delete a key and the built-in default is used, so a
+# partial file is safe. Values shown below are the defaults.
+#
+# Percentages are fractions: 0.02 means 2%, not 20%.
+
+trading:
+  # Fraction of current balance committed per trade. 0.40 = 40%.
+  sizing_fraction: 0.40
+
+  # Refuse to open a trade that would commit less than this.
+  min_trade_balance_idr: 10000
+
+  # Per-pair cooldown after an exit, in hours.
+  cooldown_hours: 4
+
+  # Measured average gap-through when a market stop fires. Used to model the
+  # fill price of a stop exit. Change only if you have measured your own.
+  stop_slip_fraction: 0.0094
+
+  # How many ticks a resting limit buy may sit unfilled before it is cancelled.
+  order_timeout_checks: 6
+
+
+# Each framework keeps its own exit geometry. They are deliberately different:
+# A aims for a wider target with a breakeven ratchet, B takes a smaller target
+# with a tighter stop and no ratchet.
+frameworks:
+
+  A:
+    target_pct: 0.02          # +2% resting limit sell
+    stop_pct: 0.04            # -4% market stop trigger
+    ratchet_enabled: true
+    ratchet_trigger_pct: 0.012  # at +1.2%, move the stop up
+    ratchet_stop_pct: -0.003    # stop floor becomes +0.3% (covers fees)
+
+  B:
+    target_pct: 0.015         # +1.5%
+    stop_pct: 0.025           # -2.5%
+    ratchet_enabled: false    # B uses a fixed stop, no ratchet
+    ratchet_trigger_pct: 0.012
+    ratchet_stop_pct: -0.003
+
+
+# Data retention. The prune job removes bars older than this, and the deep
+# backfill fetches from slightly further back so the two do not fight at the
+# boundary (prune trims to the floor, backfill re-fetches it, prune trims again
+# - one wasted API call per pair per run).
+data:
+  retention_years: 2.0
+  backfill_slack_days: 30
+
+
+# Entry filters. These decide whether a pair is tradeable at all.
+gates:
+  min_candles: 100            # minimum candles of history (~25h at 15m)
+  max_spread_pct: 0.50        # reject pairs wider than this (%)
+  max_age_minutes: 30         # reject candles older than this
+  ml_veto_threshold: 0.60     # veto if P(down) >= 60% (tier-1 pairs exempt)
+  ml_max_age_seconds: 3600    # ignore predictions older than 1 hour
+
+
+server:
+  # Loopback by default: the dashboard is only reachable from this machine.
+  # Set to 0.0.0.0 only if you understand that the control endpoints are
+  # unauthenticated and would be exposed to your network.
+  host: 127.0.0.1
+  port: 8082

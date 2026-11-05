@@ -1,0 +1,55 @@
+#!/bin/sh
+# hunter — The Hunter's command.
+#
+# This wrapper exists so the command works from any directory and with any
+# Python, without the user needing to know where the app lives. It resolves its
+# own location (which is a symlink) and hands over to cli.py.
+#
+# Resolution order for the interpreter:
+#   1. $HUNTER_PYTHON           — explicit override
+#   2. <app>/venv/bin/python     — the installer's venv (a full install)
+#   3. python3                   — whatever python3 is on PATH
+#
+# The development .venv is deliberately NOT used. It exists only to serve the
+# dashboard (fastapi/uvicorn/pillow) and does not contain requests or scikit-
+# learn, so the engine could not run under it. That venv is selected by the
+# dashboard's systemd unit directly, not through this wrapper.
+#
+# No arguments are interpreted here; everything goes straight to the CLI.
+
+set -u
+
+# --- resolve this script's real location, following symlinks ---
+SELF=$0
+while [ -L "$SELF" ]; do
+    LINK=$(readlink "$SELF")
+    case $LINK in
+        /*) SELF=$LINK ;;
+        *)  SELF=$(dirname "$SELF")/$LINK ;;
+    esac
+done
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)
+
+# BIN_DIR is either <app>/bin (installed) or <repo>/bin (development).
+APP_ROOT=$(CDPATH= cd -- "$BIN_DIR/.." && pwd)
+
+# --- pick an interpreter ---
+if [ -n "${HUNTER_PYTHON:-}" ] && [ -x "$HUNTER_PYTHON" ]; then
+    PY=$HUNTER_PYTHON
+elif [ -x "$APP_ROOT/venv/bin/python" ]; then
+    PY=$APP_ROOT/venv/bin/python
+elif command -v python3 >/dev/null 2>&1; then
+    PY=python3
+else
+    echo "hunter: no python3 found" >&2
+    exit 127
+fi
+
+CLI=$APP_ROOT/scripts/cli.py
+if [ ! -f "$CLI" ]; then
+    echo "hunter: cannot find $CLI" >&2
+    echo "hunter: this wrapper expects to live in <app>/bin" >&2
+    exit 1
+fi
+
+exec "$PY" "$CLI" "$@"
