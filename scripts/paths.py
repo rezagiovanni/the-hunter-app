@@ -78,23 +78,30 @@ def resolve_data_dir(env=None, repo_root=None) -> str:
     xdg = env.get("XDG_DATA_HOME")
     home = env.get("HOME") or os.path.expanduser("~")
 
+    # First: is this the INSTALLED layout? Decide from where the code lives, not
+    # from $HOME. The installed tree is <root>/app/, so the root is the parent of
+    # the directory holding this file.
+    #
+    # Deriving it from $HOME instead was fragile in a way that only showed up in
+    # a real install: run the installed command with a different HOME (a
+    # different user, sudo, a minimal cron environment) and it silently fell
+    # through to the development fallback, then wrote state into app/data/ and
+    # looked for config at app/config.yaml. Where the code lives is a fact;
+    # $HOME is a guess.
+    if os.path.basename(repo_root) == "app":
+        return os.path.join(os.path.dirname(repo_root), "data")
+
+    # Then: an install root under $HOME, for the case where the code has not been
+    # placed under app/ yet (e.g. an in-progress install).
     if xdg:
         base = os.path.join(os.path.abspath(os.path.expanduser(xdg)), "the-hunter")
     else:
         base = os.path.join(home, ".local", "share", "the-hunter")
 
-    # The install root holds app/, data/, market/ and config.yaml. Data lives in
-    # `data/` under it, NOT at the root: returning the root as the data dir made
-    # it identical to the code tree's parent, so state files would land beside
-    # the source and config.yaml would resolve outside the app entirely.
-    installed = os.path.join(base, "data")
-
-    # Use the installed-app location only when it already exists. On the dev
-    # machine nothing has created it, so we fall through to the repo's own data
-    # directory and behaviour is unchanged.
     if os.path.isdir(base):
-        return installed
+        return os.path.join(base, "data")
 
+    # Development: the repo's own data directory.
     return os.path.abspath(os.path.join(repo_root, "data"))
 
 
@@ -111,6 +118,10 @@ def config_root(env=None, repo_root=None) -> str:
     explicit = env.get("HUNTER_DATA_DIR")
     if explicit:
         return os.path.dirname(os.path.abspath(_expand(explicit, env)))
+
+    # Installed layout: <root>/app/ means the root is the parent.
+    if os.path.basename(repo_root) == "app":
+        return os.path.dirname(repo_root)
 
     xdg = env.get("XDG_DATA_HOME")
     home = env.get("HOME") or os.path.expanduser("~")
@@ -264,6 +275,29 @@ def _self_check():
           resolve_data_dir(env={"HOME": "/nonexistent-home"},
                            repo_root=REPO_ROOT) ==
           os.path.join(REPO_ROOT, "data"))
+
+    # --- 7c. an installed tree resolves from its own location ---
+    # The install root must NOT be derived from $HOME. Running the installed
+    # command under a different HOME (another user, sudo, a minimal cron
+    # environment) must still find the real install root. This was a real
+    # failure in a real install: the app wrote state into app/data/.
+    with _tf.TemporaryDirectory() as installed:
+        root = os.path.join(installed, "the-hunter")
+        app = os.path.join(root, "app")
+        os.makedirs(app)
+        os.makedirs(os.path.join(root, "data"))
+
+        for fake_home in (installed, "/nonexistent-home", "/tmp"):
+            got = resolve_data_dir(env={"HOME": fake_home}, repo_root=app)
+            check(f"installed data dir is independent of HOME ({fake_home})",
+                  got == os.path.join(root, "data"), got)
+
+        got_cfg = config_root(env={"HOME": "/nonexistent-home"}, repo_root=app)
+        check("installed config root is independent of HOME", got_cfg == root, got_cfg)
+
+        check("data never resolves inside app/",
+              not resolve_data_dir(env={"HOME": "/nonexistent-home"},
+                                   repo_root=app).startswith(app + os.sep))
 
     # --- 8. no hardcoded developer home anywhere in the *implementation* ---
     # Scan only the code above this self-check: the check's own source
