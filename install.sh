@@ -342,14 +342,63 @@ link_command() {
         return 0
     fi
 
+    ensure_path
+}
+
+# ---------------------------------------------------------------------------
+# PATH
+# ---------------------------------------------------------------------------
+# Symlinking into ~/.local/bin is not enough on its own. Debian, Ubuntu and
+# Armbian put this in the skeleton .profile:
+#
+#     if [ -d "$HOME/.local/bin" ] ; then
+#         PATH="$HOME/.local/bin:$PATH"
+#     fi
+#
+# That test runs when the profile is first read. If the directory did not exist
+# yet - the usual case on a freshly flashed image - nothing is added, and every
+# future shell has a PATH without ~/.local/bin. Creating the directory afterwards
+# does not help, because the profile is not re-read. The result is a working
+# install and a `hunter: command not found`.
+#
+# So this function fixes the PATH itself rather than telling the user to.
+ensure_path() {
     case ":$PATH:" in
-        *":$BIN_DIR:"*) : ;;
-        *)
-            warn "$BIN_DIR is not on your PATH"
-            info "add this to your shell profile:"
-            info "  export PATH=\"$BIN_DIR:\$PATH\""
-            ;;
+        *":$BIN_DIR:"*) return 0 ;;
     esac
+
+    if [ "$DRY_RUN" = "1" ]; then
+        step "would add $BIN_DIR to PATH in .profile"
+        return 0
+    fi
+
+    PROFILE="$HOME/.profile"
+    MARKER="# added by the-hunter installer"
+    LINE="export PATH=\"$BIN_DIR:\$PATH\""
+
+    if [ -f "$PROFILE" ] && grep -qF "$MARKER" "$PROFILE" 2>/dev/null; then
+        step "$BIN_DIR already recorded in .profile"
+    else
+        {
+            printf '\n%s\n%s\n' "$MARKER" "$LINE"
+        } >> "$PROFILE" 2>/dev/null \
+            && step "added $BIN_DIR to PATH in .profile" \
+            || { warn "could not write to $PROFILE"; }
+    fi
+
+    # Make it work in the CURRENT shell too, so `hunter` runs immediately.
+    # A script cannot change its parent's environment, so the best available
+    # thing is to place the command somewhere that is already on PATH.
+    if [ -w /usr/local/bin ] 2>/dev/null; then
+        ln -sf "$APP_DIR/bin/hunter" /usr/local/bin/hunter 2>/dev/null \
+            && step "also linked /usr/local/bin/hunter (already on PATH)"
+    else
+        printf '\n'
+        warn "\"%shunter\" will not work in this shell yet"
+        info "run this once, now:"
+        info "  export PATH=\"$BIN_DIR:\$PATH\""
+        info "then, and in every new shell, it will just work."
+    fi
 }
 
 # ---------------------------------------------------------------------------

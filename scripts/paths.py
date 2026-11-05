@@ -31,6 +31,8 @@ No trading logic lives here. Paths only.
 """
 
 import os
+import shutil
+import tempfile
 
 # ---------------------------------------------------------------------------
 # Repo root
@@ -91,8 +93,29 @@ def resolve_data_dir(env=None, repo_root=None) -> str:
     if os.path.basename(repo_root) == "app":
         return os.path.join(os.path.dirname(repo_root), "data")
 
-    # Then: an install root under $HOME, for the case where the code has not been
-    # placed under app/ yet (e.g. an in-progress install).
+    # Then: a development checkout uses its OWN data directory. This comes
+    # BEFORE the $HOME install root on purpose.
+    #
+    # It used to come after, and that was a real bug: once any install existed at
+    # ~/.local/share/the-hunter (for example a test install left one), the
+    # development repo silently resolved to the INSTALL's data. The dashboard
+    # kept serving dev data because it computes its paths itself, but the CLI and
+    # the engine import this module - so a tick launched through them would have
+    # read and written a different state file, forking the bot's history.
+    #
+    # A checkout is identified by its own layout, not by what happens to exist
+    # under $HOME.
+    # A checkout by layout: it carries either the source tree or its own data.
+    # Testing for `data/` alone was not enough - a bare path that exists on
+    # neither count must still fall through to the documented order below, which
+    # is what the fallback self-check exercises with a non-existent /repo.
+    if (os.path.isdir(os.path.join(repo_root, "data"))
+            or os.path.isdir(os.path.join(repo_root, "scripts"))):
+        return os.path.abspath(os.path.join(repo_root, "data"))
+
+    # Last: an install root under $HOME, for the case where the code has not been
+    # placed under app/ yet (e.g. an in-progress install). Only used when it
+    # actually exists - otherwise the documented last resort is the repo.
     if xdg:
         base = os.path.join(os.path.abspath(os.path.expanduser(xdg)), "the-hunter")
     else:
@@ -101,37 +124,23 @@ def resolve_data_dir(env=None, repo_root=None) -> str:
     if os.path.isdir(base):
         return os.path.join(base, "data")
 
-    # Development: the repo's own data directory.
     return os.path.abspath(os.path.join(repo_root, "data"))
 
 
 def config_root(env=None, repo_root=None) -> str:
-    """The directory holding config.yaml.
+    """The directory holding config.yaml: the parent of the data directory.
 
-    Installed: the install root (~/.local/share/the-hunter), i.e. the parent of
-    data/, so wiping data/ does not destroy settings. Development: the repo, so
-    a dev config.yaml sits beside the code and is gitignored.
+    Derived from resolve_data_dir() rather than reimplementing the same
+    precedence rules. It used to be a second copy of those rules, and the two
+    drifted: on a machine with an install at ~/.local/share/the-hunter, the data
+    directory resolved to the development repo (correct) while config.yaml
+    resolved to the install (wrong), so one process used two different roots.
+
+    Deriving it means the two can never disagree, and the documented property -
+    config.yaml sits beside data/, so wiping data/ does not destroy settings -
+    holds by construction.
     """
-    env = os.environ if env is None else env
-    repo_root = REPO_ROOT if repo_root is None else repo_root
-
-    explicit = env.get("HUNTER_DATA_DIR")
-    if explicit:
-        return os.path.dirname(os.path.abspath(_expand(explicit, env)))
-
-    # Installed layout: <root>/app/ means the root is the parent.
-    if os.path.basename(repo_root) == "app":
-        return os.path.dirname(repo_root)
-
-    xdg = env.get("XDG_DATA_HOME")
-    home = env.get("HOME") or os.path.expanduser("~")
-    base = (os.path.join(os.path.abspath(_expand(xdg, env)), "the-hunter")
-            if xdg else os.path.join(home, ".local", "share", "the-hunter"))
-
-    if os.path.isdir(base):
-        return base
-
-    return os.path.abspath(repo_root)
+    return os.path.dirname(resolve_data_dir(env=env, repo_root=repo_root))
 
 
 def resolve_app_root(env=None, repo_root=None) -> str:
@@ -236,10 +245,37 @@ def _self_check():
     got = resolve_data_dir(env={"HUNTER_DATA_DIR": "~/hdata", "HOME": "/fake"}, repo_root="/repo")
     check("~ expanded in HUNTER_DATA_DIR", got == "/fake/hdata")
 
+    # --- 5b. config_root is always the parent of the data dir ---
+    # This is the invariant that was violated: the two used independent copies of
+    # the precedence rules and drifted, so one process read the repo's data and
+    # the install's config. Checked across every layout, not just this machine.
+    for label, env in (
+        ("no env", {}),
+        ("explicit data dir", {"HUNTER_DATA_DIR": "/tmp/x/data"}),
+        ("XDG", {"XDG_DATA_HOME": "/tmp/xdg"}),
+        ("odd HOME", {"HOME": "/tmp/oddhome"}),
+    ):
+        dd = resolve_data_dir(env=env, repo_root=REPO_ROOT)
+        cr = config_root(env=env, repo_root=REPO_ROOT)
+        check(f"config_root is the parent of data ({label})",
+              os.path.abspath(cr) == os.path.dirname(os.path.abspath(dd)),
+              f"{cr} vs {dd}")
+
     # --- 6. live resolution on this machine is the repo's data dir ---
     # This is the property that makes the change invisible in development.
     live = resolve_data_dir(env={}, repo_root=REPO_ROOT)
     check("this machine resolves to <repo>/data", live == os.path.join(REPO_ROOT, "data"))
+
+    # A checkout must win over an install root under $HOME. Without this, a test
+    # install (or a real one) that creates ~/.local/share/the-hunter makes the
+    # dev repo resolve to the install's data, which forks the bot's history.
+    if os.path.isdir(os.path.join(REPO_ROOT, "data")):
+        fake_home = tempfile.mkdtemp()
+        os.makedirs(os.path.join(fake_home, ".local", "share", "the-hunter", "data"))
+        got = resolve_data_dir(env={"HOME": fake_home}, repo_root=REPO_ROOT)
+        check("a checkout wins over a $HOME install root",
+              got == os.path.join(REPO_ROOT, "data"), got)
+        shutil.rmtree(fake_home, ignore_errors=True)
 
     # --- 7. every declared path sits under DATA_DIR or APP_ROOT ---
     d = describe()
