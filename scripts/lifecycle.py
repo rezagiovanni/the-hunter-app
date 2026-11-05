@@ -292,8 +292,13 @@ def uninstall(dry_run=False, assume_yes=False, delete_data=False,
         done.append(("crontab block", f"error: {exc}"))
 
     # ---- dashboard ----
+    # Honour $HUNTER_SYSTEMCTL so a test cannot stop the developer's real
+    # service. This is the same class of leak as `crontab` ignoring $HOME: the
+    # tests stubbed the crontab and the HOME but not systemd, so an uninstall
+    # test stopped the running dashboard on the development machine.
+    systemctl = os.environ.get("HUNTER_SYSTEMCTL") or "systemctl"
     try:
-        subprocess.run(["systemctl", "--user", "stop", "hunter-dashboard.service"],
+        subprocess.run([systemctl, "--user", "stop", "hunter-dashboard.service"],
                        capture_output=True, timeout=15)
         done.append(("dashboard service", True))
     except Exception:
@@ -480,6 +485,13 @@ def _self_check():
     check("human_bytes bytes", human_bytes(512) == "512 B")
     check("human_bytes KB", "KB" in human_bytes(2048))
     check("human_bytes GB", "GB" in human_bytes(5 * 1024**3))
+
+    # ---- 6b. systemd access is redirectable, so a test cannot stop it ----
+    impl = open(__file__).read().split("def _self_check")[0]
+    check("systemctl honours HUNTER_SYSTEMCTL",
+          'os.environ.get("HUNTER_SYSTEMCTL")' in impl)
+    check("no bare systemctl call remains",
+          'subprocess.run(["systemctl"' not in impl)
 
     # ---- 7. no sudo anywhere in the lifecycle module ----
     impl = open(__file__).read().split("def _self_check")[0]
