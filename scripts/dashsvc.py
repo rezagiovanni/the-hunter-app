@@ -58,11 +58,44 @@ def unit_path(env=None) -> str:
     return os.path.join(unit_dir(env), UNIT_NAME)
 
 
-def render_unit(app_root, data_dir=None, home=None) -> str:
+def resolve_venv(app_root, venv=None):
+    """Find the interpreter, or explain why none was found.
+
+    The install layout is:
+
+        <root>/app/        <- the code (app_root)
+        <root>/venv/       <- the virtualenv, a SIBLING of app/
+        <root>/data/
+
+    The first version assumed <app_root>/venv, i.e. the venv INSIDE app/. It is
+    not, so ExecStart named an interpreter that does not exist and systemd
+    reported status=203/EXEC, restarting the unit in a loop forever.
+
+    Order: an explicit venv, then the real sibling layout, then a venv inside
+    app_root (a checkout where the venv sits beside the code).
+    """
+    if venv:
+        return os.path.join(venv, "bin", "python")
+
+    parent = os.path.dirname(app_root)
+    candidates = [
+        os.path.join(parent, "venv", "bin", "python"),      # installed layout
+        os.path.join(app_root, "venv", "bin", "python"),    # venv beside the code
+        os.path.join(parent, ".venv", "bin", "python"),     # a dev checkout
+        os.path.join(app_root, ".venv", "bin", "python"),   # a dev checkout
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    # Nothing found: name the installed layout, which is what the installer makes.
+    return candidates[0]
+
+
+def render_unit(app_root, data_dir=None, home=None, venv=None) -> str:
     """The unit file. Pure function of its inputs, so it can be asserted on."""
     home = home or os.path.expanduser("~")
     data_dir = data_dir or os.path.join(home, ".local", "share", "the-hunter", "data")
-    py = os.path.join(app_root, "venv", "bin", "python")
+    py = resolve_venv(app_root, venv)
     script = os.path.join(app_root, "scripts", "dashboard.py")
 
     return f"""[Unit]
@@ -109,7 +142,7 @@ def is_active(env=None, ctl=None) -> bool:
         return False
 
 
-def install(app_root, data_dir=None, env=None, ctl=None, start=True) -> dict:
+def install(app_root, data_dir=None, env=None, ctl=None, start=True, venv=None) -> dict:
     """Write the unit, reload the daemon, enable and (optionally) start it.
 
     Returns a dict of what happened, including why, so the caller can report
@@ -120,11 +153,30 @@ def install(app_root, data_dir=None, env=None, ctl=None, start=True) -> dict:
     res = {"written": False, "reloaded": False, "enabled": False,
            "started": False, "path": unit_path(env), "error": None}
 
+    # Refuse to install a unit that cannot possibly run. A unit whose ExecStart
+    # names a missing interpreter starts, fails with 203/EXEC and loops forever -
+    # which is exactly what happened when ExecStart pointed at <app>/venv.
+    py = resolve_venv(app_root, venv)
+    if not os.path.exists(py):
+        res["error"] = (f"the interpreter does not exist: {py}\n"
+                        f"       the unit would fail with 203/EXEC and restart forever")
+        return res
+    if not os.access(py, os.X_OK):
+        res["error"] = f"the interpreter is not executable: {py}"
+        return res
+    res["interpreter"] = py
+
+    script = os.path.join(app_root, "scripts", "dashboard.py")
+    if not os.path.exists(script):
+        res["error"] = f"dashboard.py not found: {script}"
+        return res
+
     path = unit_path(env)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as fh:
-            fh.write(render_unit(app_root, data_dir=data_dir, home=env.get("HOME")))
+            fh.write(render_unit(app_root, data_dir=data_dir, home=env.get("HOME"),
+                                 venv=venv))
         os.chmod(path, 0o644)
         res["written"] = True
     except Exception as e:
@@ -297,7 +349,39 @@ def _self_check() -> int:
     check("unit has a [Service] section", "[Service]" in u)
     check("unit has an [Install] section", "[Install]" in u)
     check("it runs the dashboard script", "dashboard.py" in u)
-    check("it uses the app's venv python", "/opt/app/venv/bin/python" in u)
+
+    # The venv is a SIBLING of app/, not inside it. Asserting the old
+    # <app>/venv path is what let the 203/EXEC bug through: the test agreed with
+    # the code and both were wrong about the layout the installer creates.
+    with tempfile.TemporaryDirectory() as td:
+        root = os.path.join(td, "the-hunter")
+        app = os.path.join(root, "app")
+        os.makedirs(os.path.join(app, "scripts"))
+        os.makedirs(os.path.join(root, "venv", "bin"))
+        py = os.path.join(root, "venv", "bin", "python")
+        open(py, "w").write("#!/bin/sh\nexit 0\n")
+        os.chmod(py, 0o755)
+
+        check("resolve_venv finds the SIBLING venv", resolve_venv(app) == py,
+              resolve_venv(app))
+        u2 = render_unit(app, data_dir=os.path.join(root, "data"), home=td)
+        check("ExecStart names the interpreter that actually exists", py in u2, u2)
+        check("ExecStart does not point inside app/",
+              os.path.join(app, "venv") not in u2, u2)
+
+        # install() must refuse a unit it cannot make work
+        bad_app = os.path.join(td, "broken", "app")
+        os.makedirs(os.path.join(bad_app, "scripts"))
+        open(os.path.join(bad_app, "scripts", "dashboard.py"), "w").write("")
+        stub2 = os.path.join(td, "ctl2")
+        open(stub2, "w").write("#!/bin/sh\nexit 0\n")
+        os.chmod(stub2, 0o755)
+        bad = install(bad_app, data_dir=os.path.join(td, "d"), env={"HOME": td}, ctl=stub2)
+        check("install refuses a missing interpreter", bad["written"] is False, bad)
+        check("it explains 203/EXEC in the refusal",
+              "203/EXEC" in (bad.get("error") or ""), bad)
+        check("nothing was written for a broken unit",
+              not os.path.exists(unit_path({"HOME": td})))
     check("it sets HUNTER_DATA_DIR explicitly",
           "Environment=HUNTER_DATA_DIR=/opt/data" in u, u)
     check("it restarts on crash", "Restart=always" in u)
@@ -375,7 +459,11 @@ def _self_check() -> int:
         env = {"HOME": td, "HUNTER_SYSTEMCTL": stub}
         app = os.path.join(td, "app")
         os.makedirs(os.path.join(app, "scripts"))
-        os.makedirs(os.path.join(app, "venv", "bin"))
+        open(os.path.join(app, "scripts", "dashboard.py"), "w").write("")
+        os.makedirs(os.path.join(td, "venv", "bin"))
+        _py = os.path.join(td, "venv", "bin", "python")
+        open(_py, "w").write("#!/bin/sh\nexit 0\n")
+        os.chmod(_py, 0o755)
 
         res = install(app, data_dir=os.path.join(td, "data"), env=env, ctl=stub)
         check("install wrote the unit", res["written"], res)
