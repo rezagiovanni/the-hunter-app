@@ -150,7 +150,25 @@ def main():
     processed = 0
     total_added = 0
 
-    for csv_path in csv_files:
+    # Best-effort progress reporting. A two-year backfill runs for tens of
+    # minutes and used to show nothing but "running" for the whole time; the
+    # panel has a progress bar, and nothing ever filled it. Reporting is
+    # deliberately non-fatal: this script must still work when run by cron,
+    # where setup_state may not be importable at all.
+    def _report(done):
+        try:
+            import setup_state
+            setup_state.set_progress("backfill-deep", done, len(csv_files),
+                                     f"{done}/{len(csv_files)} pairs")
+        except Exception:
+            pass
+
+    _report(0)
+
+    for _idx, csv_path in enumerate(csv_files, 1):
+        # Reported at the top of the iteration for the pair just finished, so
+        # every `continue` path below is covered without repeating the call.
+        _report(_idx - 1)
         symbol = os.path.splitext(os.path.basename(csv_path))[0]
         existing = read_csv(csv_path)
 
@@ -198,6 +216,7 @@ def main():
         })
 
     # Report artifact (user requirement: repair jobs leave a verifiable file)
+    _report(len(csv_files))
     os.makedirs(REPORT_DIR, exist_ok=True)
     report_data = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(now_ts)),

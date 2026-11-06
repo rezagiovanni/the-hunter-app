@@ -462,7 +462,24 @@ def cmd_job(args):
         print(f"hunter _job {name}: missing {script}", file=sys.stderr)
         return 2
 
-    r = subprocess.run([sys.executable, str(script)], cwd=str(HERE.parent))
+    # Use the interpreter that can actually run the job, and run it unbuffered.
+    #
+    # Two bugs lived in the one line this replaces:
+    #   [sys.executable, script]
+    # 1. sys.executable is whatever python started the CLI. Under cron that is
+    #    usually fine, but when `hunter _job` is invoked from the dashboard's
+    #    venv it has no `requests`, and the job dies instantly. This is the
+    #    THIRD place the same wrong-interpreter assumption appeared (dashboard's
+    #    _resolve_engine_python and setup_state.engine_python were the others),
+    #    so it now goes through the one shared resolver.
+    # 2. No `-u`. Cron redirects stdout to a log file, and Python block-buffers
+    #    a redirected stream, so a job that runs for 40 minutes wrote NOTHING to
+    #    its log until it exited. A running job looked dead.
+    import setup_state
+    py = setup_state.engine_python()
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    r = subprocess.run([py, "-u", str(script)], cwd=str(HERE.parent), env=env)
     return r.returncode
 
 
