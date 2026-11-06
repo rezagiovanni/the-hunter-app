@@ -112,8 +112,14 @@ Environment=HUNTER_DATA_DIR={data_dir}
 ExecStart={py} {script}
 Restart=always
 RestartSec=5
-# The dashboard reads CSVs and serves HTML. It needs no privileges.
-NoNewPrivileges=true
+# NO NoNewPrivileges HERE. It was added as hardening and it broke the one thing
+# the dashboard genuinely needs to do: manage the crontab. /usr/bin/crontab is
+# setgid crontab, and /var/spool/cron/crontabs is drwx-wx--T root:crontab - the
+# setgid bit is what grants read access to the user's own crontab file.
+# NoNewPrivileges=true makes setgid binaries run WITHOUT the setgid bit, so
+# `crontab -l` became a plain-user call and failed with
+#   crontabs/<user>/: fopen: Permission denied
+# The consequence was a Cron Jobs panel with no toggles at all.
 
 [Install]
 WantedBy=default.target
@@ -388,6 +394,17 @@ def _self_check() -> int:
     check("it is wanted by default.target", "WantedBy=default.target" in u)
     check("it works without working directory surprises",
           "WorkingDirectory=/opt/app" in u)
+
+    # The unit must NOT set NoNewPrivileges. It looks like harmless hardening,
+    # but /usr/bin/crontab is setgid crontab and /var/spool/cron/crontabs is
+    # drwx-wx--T root:crontab - the setgid bit is the ONLY thing that lets a
+    # user read their own crontab. NoNewPrivileges=true makes setgid binaries
+    # run without it, so `crontab -l` fails with
+    #   crontabs/<user>/: fopen: Permission denied
+    # and the Cron Jobs panel renders no toggles at all.
+    active = [ln for ln in u.splitlines()
+              if ln.strip().startswith("NoNewPrivileges")]
+    check("it does NOT strip setgid rights (crontab needs them)", not active, active)
     check("the port in the description matches PORT",
           str(PORT) in u.splitlines()[1], u.splitlines()[1])
 

@@ -66,17 +66,47 @@ def engine_python():
     if override and os.path.exists(override):
         return override
 
-    app_venv = os.path.join(paths.APP_ROOT, "venv", "bin", "python")
-    if os.path.exists(app_venv):
-        return app_venv
+    # The installer puts the venv BESIDE app/, not inside it:
+    #     <root>/app/    <- code (paths.APP_ROOT)
+    #     <root>/venv/   <- virtualenv that has `requests`
+    # Looking only at <app>/venv was the same mistake that made the dashboard
+    # service fail with 203/EXEC, and here it was worse: the fallback was
+    # python3, so every setup job died in 0s with ModuleNotFoundError and the
+    # Settings page showed "failed" with no reason.
 
+    # A DEV CHECKOUT has .venv beside the code, but that venv serves the
+    # dashboard (fastapi/uvicorn/pillow) and does NOT have requests. So
+    # existence is not enough - probe each candidate for the import the jobs
+    # actually need, and take the first that works. Returns (path, ok).
+    parent = os.path.dirname(str(paths.APP_ROOT))
+    candidates = [
+        os.path.join(parent, "venv", "bin", "python"),           # installed
+        os.path.join(str(paths.APP_ROOT), "venv", "bin", "python"),
+        os.path.join(parent, ".venv", "bin", "python"),          # dev checkout
+        os.path.join(str(paths.APP_ROOT), ".venv", "bin", "python"),
+    ]
     found = shutil.which("python3")
     if found:
-        return found
+        candidates.append(found)
+    candidates.append(sys.executable)
+
+    for cand in candidates:
+        if not cand or not os.path.exists(cand):
+            continue
+        try:
+            probe = subprocess.run([cand, "-c", "import requests"],
+                                   capture_output=True, text=True, timeout=15)
+            if probe.returncode == 0:
+                return cand
+        except (OSError, subprocess.TimeoutExpired):
+            continue
 
     return sys.executable
 
 
+# Paths and limits. These live above _blank() because engine_python() now
+# returns before them; deleting them here would be a silent NameError at import
+# of the state file rather than a visible failure.
 STATE_FILE = os.path.join(paths.DATA_DIR, "setup_state.json")
 LOCK_FILE = os.path.join(paths.DATA_DIR, "setup.lock")
 
@@ -127,9 +157,6 @@ ACTIONS = {
 ORDER = ["market", "backfill-deep", "backfill-stale", "prune"]
 
 
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
 def _blank():
     return {
         "actions": {
@@ -637,7 +664,31 @@ def _self_check():
 
         # ---- 12. an unknown action is refused, not crashed into ----
         ok, msg = start("no-such-action", background=False)
-        check("unknown action is refused", not ok, msg)
+        # --- engine_python picks an interpreter that can actually import requests ---
+    # The first version looked only at <app>/venv, which does not exist in the
+    # installed layout (the venv is a SIBLING of app/), so every setup job fell
+    # through to python3 and died in 0s with ModuleNotFoundError. The symptom was
+    # "failed" with no reason on the Settings page.
+    py = engine_python()
+    check("engine_python returns an existing path", os.path.exists(py), py)
+    try:
+        probe = subprocess.run([py, "-c", "import requests"],
+                               capture_output=True, text=True, timeout=20)
+        check("engine_python can import requests", probe.returncode == 0,
+              (probe.stderr or "").strip()[-160:])
+    except Exception as exc:
+        check("engine_python can import requests", False, str(exc))
+
+    # It must not look ONLY inside <app>/venv - that path never exists in an
+    # install, and assuming it did is what caused the failure.
+    src = open(os.path.abspath(__file__)).read()
+    genv = src.split("def engine_python")[1].split("def ")[0]
+    check("engine_python considers the sibling venv",
+          'os.path.dirname(str(paths.APP_ROOT))' in genv, genv[:200])
+    check("engine_python probes rather than trusting a path",
+          '"-c", "import requests"' in genv)
+
+    check("unknown action is refused", not ok, msg)
 
     STATE_FILE = real_state
 
