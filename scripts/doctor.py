@@ -297,34 +297,32 @@ def check_model(rep):
                  "delete it; the dashboard regenerates it")
 
 
-def _dashsvc_status():
-    """(installed, active) for the dashboard service, never raising."""
+def _dashsvc_diagnose():
+    """dashsvc.diagnose(), never raising. {} if the module is unavailable."""
     try:
         import dashsvc
-        st = dashsvc.status()
-        return bool(st.get("installed")), bool(st.get("active"))
+        return dashsvc.diagnose()
     except Exception:
-        return False, False
+        return {}
 
 
 def dashboard_not_running_reason():
-    installed, _ = _dashsvc_status()
-    if installed:
-        return "the dashboard service exists but is not running"
-    return "the dashboard service is not installed"
+    d = _dashsvc_diagnose()
+    return d.get("reason") or "the dashboard service is not running"
 
 
 def dashboard_fix():
-    """The command that will actually work, given what is installed.
+    """A command that will actually work in the current state.
 
-    The doctor used to always say `systemctl --user restart hunter-dashboard`,
-    which fails with "Unit not found" when the installer never created the unit -
-    advice that cannot work is worse than none.
+    Three distinct cases, which the doctor used to collapse into one wrong
+    answer (`systemctl --user restart hunter-dashboard`, which fails with
+    "Unit not found" when no unit exists):
+      no unit        -> hunter dashboard install
+      no user manager -> sudo loginctl enable-linger $USER
+      unit stopped   -> systemctl --user status hunter-dashboard
     """
-    installed, _ = _dashsvc_status()
-    if installed:
-        return "systemctl --user restart hunter-dashboard"
-    return "hunter dashboard install"
+    d = _dashsvc_diagnose()
+    return d.get("fix") or "hunter dashboard status"
 
 
 def check_port(rep, port=None):
@@ -347,8 +345,17 @@ def check_port(rep, port=None):
         s.close()
 
     if not listening:
-        rep.warn(f"nothing listening on port {port}", dashboard_not_running_reason(),
-                 dashboard_fix())
+        d = _dashsvc_diagnose()
+        if d.get("installed") and d.get("bus") is False:
+            # A distinct, named fault: the unit exists and will never start until
+            # linger is enabled. Worth its own line because the symptom (nothing
+            # listening) looks identical to a stopped service.
+            rep.fail(f"nothing listening on port {port}",
+                     "the unit exists but this user has no systemd manager, so it cannot start",
+                     "sudo loginctl enable-linger $USER")
+        else:
+            rep.warn(f"nothing listening on port {port}", dashboard_not_running_reason(),
+                     dashboard_fix())
         return
 
     # Listening, but is it healthy?

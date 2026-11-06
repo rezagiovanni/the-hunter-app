@@ -656,12 +656,33 @@ def cmd_dashboard(args):
         if args.json:
             print(json.dumps(st, indent=2))
             return 0
-        state = "active" if st["active"] else ("installed, not running" if st["installed"]
-                                               else "not installed")
-        print(f"  {term.bold('hunter-dashboard.service')}  {state}")
-        print(f"  {term.grey('unit  ' + st['path'])}")
-        if not st["installed"]:
-            print(f"  {term.grey('Fix: hunter dashboard install')}")
+
+        if st["active"]:
+            tag = term.green("running")
+        elif not st["installed"]:
+            tag = term.yellow("not installed")
+        else:
+            tag = term.yellow("installed, not running")
+
+        print(f"  {term.bold('hunter-dashboard.service')}  {tag}")
+        print(f"  {term.grey('unit   ' + st['path'])}")
+        print(f"  {term.grey('port   ' + str(st['port']))}")
+        if st["installed"]:
+            print(f"  {term.grey('enabled ' + ('yes' if st.get('enabled') else 'no'))}")
+            print(f"  {term.grey('user systemd manager ' + ('reachable' if st.get('bus') else 'NOT reachable'))}")
+
+        # Say WHY, and give a command that works in this exact state.
+        if not st["active"]:
+            print()
+            print(f"  {term.yellow('reason')}  {st.get('reason','')}")
+            if st.get("fix"):
+                print(f"  {term.grey('Fix: ' + st['fix'])}")
+            if st.get("bus") and st["installed"]:
+                tail = dashsvc.journal_tail(8)
+                if tail:
+                    print()
+                    for line in tail:
+                        print(f"  {term.grey(line[:110])}")
         return 0
 
     if action == "install":
@@ -678,10 +699,35 @@ def cmd_dashboard(args):
             print(f"  {term.green('[OK]')} dashboard service installed and started")
             print(f"  {term.grey('open  http://127.0.0.1:' + str(dashsvc.PORT))}")
             return 0
-        print(f"  {term.yellow('[WARN]')} written={res['written']} "
-              f"enabled={res['enabled']} started={res['started']}")
-        print(f"  {term.grey('Fix: systemctl --user status hunter-dashboard')}")
+
+        # Written but not started: report the real cause, not the flags.
+        st = dashsvc.status()
+        print(f"  {term.yellow('[WARN]')} the unit was written but did not start")
+        print(f"  {term.grey('reason  ' + st.get('reason',''))}")
+        if st.get("fix"):
+            print(f"  {term.grey('Fix: ' + st['fix'])}")
+        if st.get("bus"):
+            tail = dashsvc.journal_tail(8)
+            if tail:
+                print()
+                for line in tail:
+                    print(f"  {term.grey(line[:110])}")
+        else:
+            print(f"  {term.grey('Note: this user has no running systemd manager.')}")
+            print(f"  {term.grey('      The dashboard can also run in the foreground:')}")
+            print(f"  {term.grey('        hunter dashboard run')}")
         return 1
+
+    if action == "run":
+        # Foreground fallback for machines without a usable user systemd manager.
+        app = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        py = os.path.join(app, "venv", "bin", "python")
+        if not os.path.exists(py):
+            py = sys.executable
+        script = os.path.join(app, "scripts", "dashboard.py")
+        print(f"  {term.grey('starting the dashboard in the foreground; Ctrl-C to stop')}")
+        print(f"  {term.grey('open  http://127.0.0.1:' + str(dashsvc.PORT))}")
+        return subprocess.call([py, script])
 
     if action == "remove":
         res = dashsvc.remove()
@@ -742,8 +788,9 @@ def build_parser():
                             help="replace credentials that are already saved")
         if name == "dashboard":
             dsub = sp.add_subparsers(dest="action", metavar="<action>")
-            dsub.add_parser("status", help="is the service installed and running?")
+            dsub.add_parser("status", help="is it installed, running, and why not?")
             dsub.add_parser("install", help="create, enable and start the service")
+            dsub.add_parser("run", help="run it in the foreground (no systemd needed)")
             dsub.add_parser("remove", help="stop, disable and delete the service")
 
         if name == "cron":

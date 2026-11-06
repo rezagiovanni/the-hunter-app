@@ -184,16 +184,95 @@ def remove(env=None, ctl=None) -> dict:
     return res
 
 
+def user_bus_available(ctl=None) -> bool:
+    """Can we actually talk to this user's systemd manager?
+
+    This matters because `systemctl --user cat` can read the unit FILE while
+    `start` / `is-active` fail, because those need a connection to the user
+    manager's DBus. On a headless box reached over SSH, the manager often is not
+    running at all unless linger is enabled - the unit looks installed and will
+    never start. Distinguishing the two turns "not running" into a real reason.
+    """
+    ctl = ctl or systemctl_cmd()
+    try:
+        r = _run(ctl, ["--user", "is-system-running"], timeout=10)
+        # "offline"/"unknown" mean we reached the client but not a manager.
+        out = (r.stdout or "").strip()
+        if r.returncode != 0 and out in ("", "offline", "unknown"):
+            return False
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def is_enabled(env=None, ctl=None) -> bool:
+    ctl = ctl or systemctl_cmd()
+    try:
+        r = _run(ctl, ["--user", "is-enabled", UNIT_NAME], timeout=10)
+        return r.stdout.strip() in ("enabled", "enabled-runtime")
+    except Exception:
+        return False
+
+
+def journal_tail(lines: int = 12, ctl=None):
+    """The last few log lines for the unit, or [] if unavailable."""
+    ctl = ctl or systemctl_cmd()
+    try:
+        r = subprocess.run([ctl, "--user", "-u", UNIT_NAME, "-n", str(lines),
+                            "--no-pager", "status"],
+                           capture_output=True, text=True, timeout=15)
+        return [l for l in (r.stdout or "").splitlines() if l.strip()][:lines]
+    except Exception:
+        return []
+
+
+def diagnose(env=None, ctl=None) -> dict:
+    """Why is the dashboard not running, and what should the user actually do?
+
+    Returns {installed, active, enabled, bus, reason, fix}. The fix is a command
+    that can work in the state described - never a restart of a unit that does
+    not exist, and never a plain start when the user manager is unreachable.
+    """
+    env = os.environ if env is None else env
+    ctl = ctl or systemctl_cmd()
+
+    installed = is_installed(env, ctl)
+    active = is_active(env, ctl)
+    enabled = is_enabled(env, ctl) if installed else False
+    bus = user_bus_available(ctl)
+
+    if not installed:
+        return {"installed": False, "active": False, "enabled": False, "bus": bus,
+                "reason": "the dashboard service is not installed",
+                "fix": "hunter dashboard install"}
+
+    if active:
+        return {"installed": True, "active": True, "enabled": enabled, "bus": bus,
+                "reason": "running", "fix": None}
+
+    if not bus:
+        return {
+            "installed": True, "active": False, "enabled": enabled, "bus": False,
+            "reason": ("the unit exists, but this user's systemd manager is not "
+                       "reachable, so it cannot be started"),
+            "fix": "sudo loginctl enable-linger $USER",
+        }
+
+    return {
+        "installed": True, "active": False, "enabled": enabled, "bus": True,
+        "reason": "the unit exists but has stopped or failed to start",
+        "fix": f"systemctl --user status {UNIT_NAME}",
+    }
+
+
 def status(env=None, ctl=None) -> dict:
     """What a caller needs to print an honest line about the dashboard service."""
     env = os.environ if env is None else env
-    return {
-        "unit": UNIT_NAME,
-        "port": PORT,
-        "installed": is_installed(env, ctl),
-        "active": is_active(env, ctl),
-        "path": unit_path(env),
-    }
+    d = diagnose(env, ctl)
+    d["unit"] = UNIT_NAME
+    d["port"] = PORT
+    d["path"] = unit_path(env)
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +315,42 @@ def _self_check() -> int:
         p2 = unit_path(env={"HOME": td, "XDG_CONFIG_HOME": os.path.join(td, "cfg")})
         check("XDG_CONFIG_HOME is honoured",
               p2 == os.path.join(td, "cfg", "systemd", "user", UNIT_NAME), p2)
+
+    # --- 2b. diagnose() names the right cause in each state ---
+    with tempfile.TemporaryDirectory() as td:
+        def stub(name, script):
+            path = os.path.join(td, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + script)
+            os.chmod(path, 0o755)
+            return path
+
+        # no user manager: is-system-running says offline
+        no_bus = stub("ctl_nobus", 'case "$*" in *is-system-running*) echo offline; exit 1;; '
+                                  '*cat*) exit 0;; *is-active*) echo inactive;; '
+                                  '*is-enabled*) echo enabled;; esac; exit 0\n')
+        d = diagnose(env={"HOME": td}, ctl=no_bus)
+        check("diagnose: reports the manager unreachable", d["bus"] is False, d)
+        check("diagnose: fix is enable-linger, not a restart",
+              "enable-linger" in (d["fix"] or ""), d)
+
+        # unit genuinely absent
+        absent = stub("ctl_absent", 'case "$*" in *cat*) exit 1;; '
+                                    '*is-active*) echo inactive;; esac; exit 0\n')
+        d2 = diagnose(env={"HOME": td}, ctl=absent)
+        check("diagnose: absent unit says not installed", d2["installed"] is False, d2)
+        check("diagnose: absent unit fix is install",
+              d2["fix"] == "hunter dashboard install", d2)
+
+        # unit present, manager works, not running
+        running_bus = stub("ctl_bus", 'case "$*" in *is-system-running*) echo running;; '
+                                      '*cat*) exit 0;; *is-active*) echo inactive;; '
+                                      '*is-enabled*) echo enabled;; esac; exit 0\n')
+        d3 = diagnose(env={"HOME": td}, ctl=running_bus)
+        check("diagnose: stopped unit names a status command",
+              "systemctl --user status" in (d3["fix"] or ""), d3)
+        check("diagnose: never advises restarting a missing unit",
+              "restart" not in (d2["fix"] or ""), d2)
 
     # --- 3. systemctl is redirectable, so a test cannot touch the real unit ---
     import inspect
