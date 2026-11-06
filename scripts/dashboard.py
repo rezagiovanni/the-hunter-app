@@ -1232,6 +1232,8 @@ def _settings_panel() -> str:
         lock = (f"<div class='su-dim'>One heavy job at a time: "
                 f"<b>{S.ACTIONS[busy]['label']}</b> is running.</div>")
 
+    cron_html = _cron_switches_html()
+
     return f"""
 <div class="panel" id="settingsPanel">
   <h2>Settings — First-Time Setup</h2>
@@ -1245,7 +1247,45 @@ def _settings_panel() -> str:
     page and it keeps going.
   </div>
 </div>
+{cron_html}
 """
+
+
+def _cron_switches_html() -> str:
+    """Render toggle switches for every managed cron job."""
+    import crontab_manager as cm
+    try:
+        states = cm.job_states() or {}
+    except Exception:
+        states = {}
+
+    rows = []
+    for name, schedule, desc in cm.JOBS:
+        on = bool(states.get(name))
+        checked = " checked" if on else ""
+        rows.append(
+            f"<div class='su-row'>"
+            f"<div class='su-main'>"
+            f"<div class='su-name'>{name}</div>"
+            f"<div class='su-desc'>{desc} · <code>{schedule}</code></div>"
+            f"</div>"
+            f"<label class='cron-switch'>"
+            f"<input type='checkbox'{checked} onchange=\"toggleCron('{name}', this)\">"
+            f"<span class='cron-slider'></span>"
+            f"</label>"
+            f"</div>"
+        )
+
+    rows_html = "\n".join(rows)
+    return (
+        "<div class=\"panel\" id=\"cronPanel\">"
+        "  <h2>Cron Jobs</h2>"
+        "  <p class=\"su-dim\">Toggle each scheduled job on or off. "
+        "The <b>scanning</b> job runs the trading engine; keep it off while you are fetching data.</p>"
+        "  <div class=\"su-list\">" + rows_html + "</div>"
+        "  <div id=\"cronStatus\" class=\"su-dim\" style=\"margin-top:8px\"></div>"
+        "</div>"
+    )
 
 
 def _framework_panel(state: dict, control: dict) -> str:
@@ -2430,38 +2470,38 @@ CHART_JS = """
     }
 
     function switchPage(page, closeDrawer = true) {
-        const pageHome = document.getElementById('pageHome');
-        const pageOthers = document.getElementById('pageOthers');
-        const navHome = document.getElementById('navHome');
-        const navOthers = document.getElementById('navOthers');
+        const pages = {
+            home: document.getElementById('pageHome'),
+            others: document.getElementById('pageOthers'),
+            settings: document.getElementById('pageSettings')
+        };
+        const navs = {
+            home: document.getElementById('navHome'),
+            others: document.getElementById('navOthers'),
+            settings: document.getElementById('navSettings')
+        };
         const activeCrumb = document.getElementById('activeCrumb');
         const drawer = document.getElementById('navDrawer');
         const overlay = document.getElementById('navOverlay');
+        const crumbMap = {home: '/ home', others: '/ analytics', settings: '/ settings'};
+        const hashMap = {home: '#home', others: '#analytics', settings: '#settings'};
 
-        if (page === 'home') {
-            if (pageHome) pageHome.style.display = 'block';
-            if (pageOthers) pageOthers.style.display = 'none';
-            if (navHome) navHome.classList.add('active');
-            if (navOthers) navOthers.classList.remove('active');
-            if (activeCrumb) activeCrumb.textContent = '/ home';
-            history.replaceState(null, '', '#home');
-        } else {
-            if (pageHome) pageHome.style.display = 'none';
-            if (pageOthers) pageOthers.style.display = 'block';
-            if (navOthers) navOthers.classList.add('active');
-            if (navHome) navHome.classList.remove('active');
-            if (activeCrumb) activeCrumb.textContent = '/ others';
-            history.replaceState(null, '', '#others');
+        Object.values(pages).forEach(el => { if (el) el.style.display = 'none'; });
+        Object.values(navs).forEach(el => { if (el) el.classList.remove('active'); });
+
+        if (pages[page]) pages[page].style.display = 'block';
+        if (navs[page]) navs[page].classList.add('active');
+        if (activeCrumb) activeCrumb.textContent = crumbMap[page] || '/ home';
+        history.replaceState(null, '', hashMap[page] || '#home');
+
+        if (page === 'others') {
             setTimeout(() => {
                 if (typeof drawChart === 'function') {
-                    if (!chartData) {
-                        loadPair(true);
-                    } else {
-                        drawChart();
-                    }
+                    if (!chartData) { loadPair(true); } else { drawChart(); }
                 }
             }, 60);
         }
+
         if (closeDrawer) {
             if (drawer) drawer.classList.remove('open');
             if (overlay) overlay.classList.remove('open');
@@ -2541,7 +2581,7 @@ CHART_JS = """
             const pos = document.querySelector('tr.open-trade');
             const warn = pos
                 ? 'STOP will market-sell the open position NOW, then pause hunting.'
-                : 'Stop hunting and pause cron_a?';
+                : 'Stop and Pause Hunting?';
             if (!window.confirm(warn)) return;
         }
         if (sw) sw.classList.add('busy');
@@ -2598,6 +2638,33 @@ CHART_JS = """
     // Settings — first-time setup actions
     // ----------------------------------------------------------------------
     let setupPolling = null;
+
+    function setCronStatus(msg, kind) {
+        const el = document.getElementById("cronStatus");
+        if (!el) return;
+        el.textContent = msg;
+        el.style.color = kind === "error" ? "#f87171" : "#9ca3af";
+    }
+
+    function toggleCron(job, checkbox) {
+        const enabled = checkbox.checked;
+        const action = enabled ? "enable" : "disable";
+        setCronStatus("Updating " + job + "...");
+        fetch("/api/cron/" + job + "/" + action, {method: "POST"})
+            .then(r => r.json().then(data => ({ok: r.ok, data})))
+            .then(resp => {
+                if (resp.ok && resp.data.ok) {
+                    setCronStatus(job + " " + (enabled ? "enabled" : "disabled"));
+                } else {
+                    checkbox.checked = !enabled;
+                    setCronStatus(resp.data.error || ("Failed to " + action + " " + job), "error");
+                }
+            })
+            .catch(err => {
+                checkbox.checked = !enabled;
+                setCronStatus(String(err), "error");
+            });
+    }
 
     function runSetup(action) {
         const btns = document.querySelectorAll('#settingsPanel .su-btn');
@@ -3454,6 +3521,36 @@ async def api_frameworks_list():
             "frameworks": list_frameworks()}
 
 
+@app.post("/api/cron/{job}/{action}")
+async def api_cron_toggle(job: str, action: str):
+    """Enable or disable a single managed cron job from the Settings page.
+
+    action must be 'enable' or 'disable'. The job name must be one of the
+    managed jobs known to crontab_manager.
+    """
+    import crontab_manager as cm
+    if action not in ("enable", "disable"):
+        return JSONResponse({"ok": False, "error": "invalid action"}, status_code=400)
+    if not any(j[0] == job for j in cm.JOBS):
+        return JSONResponse({"ok": False, "error": f"unknown job: {job}"}, status_code=400)
+    try:
+        cm.set_job(job, action == "enable")
+        return {"ok": True, "job": job, "enabled": action == "enable"}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.get("/api/cron")
+async def api_cron_list():
+    """Return the current on/off state of every managed cron job."""
+    import crontab_manager as cm
+    try:
+        states = cm.job_states() or {}
+        return {"jobs": {name: bool(states.get(name)) for name, _, _ in cm.JOBS}}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
 @app.post("/api/frameworks/{name}/activate")
 async def api_framework_activate(name: str):
     """
@@ -3638,8 +3735,15 @@ async def dashboard():
             <button class="nav-item" id="navOthers" type="button" onclick="switchPage('others')">
                 <span class="nav-icon">▶</span>
                 <div class="nav-meta">
-                    <div class="nav-title">OTHERS</div>
+                    <div class="nav-title">ANALYTICS</div>
                     <div class="nav-desc">Pipeline health, charts, stale data, top 20</div>
+                </div>
+            </button>
+            <button class="nav-item" id="navSettings" type="button" onclick="switchPage('settings')">
+                <span class="nav-icon">▶</span>
+                <div class="nav-meta">
+                    <div class="nav-title">SETTINGS</div>
+                    <div class="nav-desc">First-time setup, cron jobs, framework config</div>
                 </div>
             </button>
         </div>
@@ -3675,9 +3779,12 @@ async def dashboard():
         </div>
 
         {_model_report_section()}
+    </div>
 
-        {_framework_panel(state, control)}
+    <!-- PAGE C: SETTINGS VIEW -->
+    <div id="pageSettings" style="display:none;">
         {_settings_panel()}
+        {_framework_panel(state, control)}
     </div>
 
     <!-- PAGE B: OTHERS VIEW -->

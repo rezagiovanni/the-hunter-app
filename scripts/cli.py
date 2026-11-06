@@ -640,8 +640,11 @@ def cmd_uninstall(args):
         print()
         print(f"  {t.bold('Kept')}: {', '.join(res['kept'])}")
         print(f"  {t.grey('Reinstalling later will pick them up.')}")
-    if not res.get("deleted_data"):
-        print(f"  {t.grey('Trade history was NOT deleted.')}")
+    if res.get("deleted_data"):
+        print(f"  {t.grey('OHLCV CSVs and hunter_state.json were deleted.')}")
+    else:
+        print(f"  {t.grey('Trade history, OHLCV data and config.yaml were kept.')}")
+        print(f"  {t.grey('Run with --delete-data to remove them as well.')}")
     return 0 if res.get("ok") else 1
 
 
