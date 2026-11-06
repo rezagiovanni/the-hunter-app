@@ -27,6 +27,11 @@ import requests
 BASE_URL = "https://indodax.com"
 # Paths from paths.py - see that module for why this is centralised.
 import sys as _sys
+
+# CSV reading/writing lives in ohlcv_io so there is exactly one implementation.
+# It was copied into five modules and four of the copies wrote straight over the
+# live file, which would silently truncate a pair's entire history on a kill.
+from ohlcv_io import CSV_COLUMNS, read_csv, write_csv  # noqa: F401
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from paths import DATA_DIR, OHLCV_DIR, REPORTS_DIR as REPORT_DIR
 
@@ -35,31 +40,8 @@ BAR_SECONDS = 900          # 15 minutes
 CHUNK_DAYS = 240
 CHUNK_SECONDS = CHUNK_DAYS * 86400
 SLEEP_BETWEEN_REQUESTS = 0.35
-CSV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
-def read_csv(path: str) -> list[dict]:
-    rows = []
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append({
-                "timestamp": int(row["timestamp"]),
-                "open":      float(row["open"]),
-                "high":      float(row["high"]),
-                "low":       float(row["low"]),
-                "close":     float(row["close"]),
-                "volume":    float(row["volume"]),
-            })
-    return rows
-
-
-def write_csv(path: str, rows: list[dict]) -> None:
-    rows_sorted = sorted(rows, key=lambda r: r["timestamp"])
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows_sorted)
 
 
 def find_gaps(rows: list[dict]) -> list[tuple[int, int]]:

@@ -28,6 +28,7 @@ import datetime as dt
 import glob
 import json
 import os
+import tempfile
 import time
 import requests
 
@@ -38,6 +39,11 @@ _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from paths import DATA_DIR, OHLCV_DIR, REPORTS_DIR as REPORT_DIR
 
 import config as _config  # noqa: E402
+
+# CSV reading/writing lives in ohlcv_io so there is exactly one implementation.
+# It was copied into five modules and four of the copies wrote straight over the
+# live file, which would silently truncate a pair's entire history on a kill.
+from ohlcv_io import CSV_COLUMNS, read_csv, write_csv  # noqa: F401
 
 # The deep floor is ROLLING, not a fixed date. It used to be the literal
 # "2021-01-01", which meant the fetch window silently widened every year: by
@@ -73,30 +79,8 @@ TIMEFRAME = "15"
 CHUNK_DAYS = 7                    # 672 bars — under the 673-bar silent cap
 CHUNK_SECONDS = CHUNK_DAYS * 86400
 SLEEP_BETWEEN_REQUESTS = 0.35
-CSV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
-def read_csv(path: str) -> list[dict]:
-    rows = []
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            rows.append({
-                "timestamp": int(row["timestamp"]),
-                "open":      float(row["open"]),
-                "high":      float(row["high"]),
-                "low":       float(row["low"]),
-                "close":     float(row["close"]),
-                "volume":    float(row["volume"]),
-            })
-    return rows
-
-
-def write_csv(path: str, rows: list[dict]) -> None:
-    rows_sorted = sorted(rows, key=lambda r: r["timestamp"])
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows_sorted)
 
 
 def fetch_bars(symbol: str, from_ts: int, to_ts: int) -> list[dict]:
