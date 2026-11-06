@@ -2485,8 +2485,15 @@ CHART_JS = """
         // A #hunt-... hash is handled by openHuntPage() (its own initialiser),
         // so do NOT force switchPage('home') there — that would overwrite the
         // breadcrumb and hide the hunt page underneath it.
-        if (window.location.hash === '#others') {
+        //
+        // Every page switchPage() can navigate to must be listed here. This
+        // knew only about '#others' while switchPage writes '#settings' and
+        // '#analytics', so a plain F5 on Settings or Analytics fell through to
+        // the else branch and landed on Home.
+        if (window.location.hash === '#others' || window.location.hash === '#analytics') {
             switchPage('others', false);
+        } else if (window.location.hash === '#settings') {
+            switchPage('settings', false);
         } else if (/^#hunt-/i.test(window.location.hash || '')) {
             // leave the view to the hunt-page initialiser
         } else {
@@ -2634,8 +2641,11 @@ CHART_JS = """
                     return;
                 }
                 if (d.message) window.alert(d.message);
-                // Reload so the trade table reflects the liquidation
-                window.location.reload();
+                // Reload so the trade table reflects the liquidation.
+                // Goes through refreshDashboard() so the current page (Settings,
+                // Analytics or Home) is preserved - a bare location.reload()
+                // dropped the user back to Home.
+                refreshDashboard();
             })
             .catch(e => {
                 if (sw) sw.classList.remove('busy');
@@ -2662,7 +2672,8 @@ CHART_JS = """
                     return;
                 }
                 ctrlState.framework = d.framework;
-                window.location.reload();
+                // same reason as above: keep the user where they were
+                refreshDashboard();
             })
             .catch(e => window.alert('Switch request failed: ' + e));
     }
@@ -2825,8 +2836,15 @@ CHART_JS = """
     }
 
     function currentPage() {
-        const others = document.getElementById('pageOthers');
-        if (others && getComputedStyle(others).display !== 'none') return 'others';
+        // Every page must be listed here. This knew only about 'others' and
+        // 'home', so a refresh pressed while on Settings recorded the page as
+        // 'home' and the reload dropped the user back to Home.
+        const pages = ['pageSettings', 'pageOthers', 'pageHome'];
+        const names = {pageSettings: 'settings', pageOthers: 'others', pageHome: 'home'};
+        for (const id of pages) {
+            const el = document.getElementById(id);
+            if (el && getComputedStyle(el).display !== 'none') return names[id];
+        }
         return 'home';
     }
 
@@ -2862,6 +2880,10 @@ CHART_JS = """
 
         if (st.page === 'others') {
             switchPage('others', false);
+        } else if (st.page === 'settings') {
+            switchPage('settings', false);
+        } else {
+            switchPage('home', false);
         }
         if (st.mode === 'live') {
             setTradingMode('live');
