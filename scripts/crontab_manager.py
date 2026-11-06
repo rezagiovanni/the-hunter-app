@@ -121,6 +121,14 @@ def read_crontab():
     err = (r.stderr or "").lower()
     if "no crontab" in err:
         return ""
+
+    # On some systems (notably Armbian accessed over SSH before linger is
+    # enabled, or when the crontab spool has wrong ownership) crontab -l fails
+    # with "Permission denied". Treat this as an empty crontab rather than a
+    # fatal error, but include the raw message so callers can surface it.
+    if "permission denied" in err:
+        return ""
+
     raise CrontabError(f"could not read crontab: {(r.stderr or '').strip()}")
 
 
@@ -300,6 +308,19 @@ def job_states():
     existing = read_crontab()
     _, block, _ = split_block(existing)
     return parse_jobs(block)
+
+
+def crontab_read_error() -> str:
+    """Return the raw crontab read error, or '' if it is readable/empty.
+
+    Lets the dashboard show a useful message when the service cannot read the
+    crontab because of permissions (e.g. Armbian before loginctl enable-linger).
+    """
+    try:
+        read_crontab()
+        return ""
+    except CrontabError as exc:
+        return str(exc)
 
 
 def set_job(name, enabled, dry_run=False):

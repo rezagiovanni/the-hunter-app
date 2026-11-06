@@ -1255,9 +1255,27 @@ def _cron_switches_html() -> str:
     """Render toggle switches for every managed cron job."""
     import crontab_manager as cm
     try:
+        crontab_err = cm.crontab_read_error()
+    except AttributeError:
+        crontab_err = ""
+    try:
         states = cm.job_states() or {}
     except Exception:
         states = {}
+
+    if crontab_err:
+        import html as _html
+        esc = _html.escape(crontab_err[:200])
+        return (""
+            + "<div class=\"panel\" id=\"cronPanel\">"
+            + "  <h2>Cron Jobs</h2>"
+            + "  <div class=\"su-banner fail\">Could not read the crontab.</div>"
+            + "  <p class=\"su-dim\"><code>" + esc + "</code></p>"
+            + "  <p class=\"su-dim\">If it mentions permission, run this on the server, then reload:</p>"
+            + "  <pre style=\"background:#1f2937;padding:8px;border-radius:6px;overflow:auto;\">"
+            + "sudo loginctl enable-linger $USER</pre>"
+            + "</div>"
+        )
 
     rows = []
     for name, schedule, desc in cm.JOBS:
@@ -1968,6 +1986,21 @@ def _style():
             flex-shrink: 0;
         }
         .conn-dot { color: #22c55e; font-size: 1.1em; }
+
+        /* Cron job toggle switches */
+        .cron-switch { position: relative; display: inline-block; width: 46px; height: 24px; flex-shrink: 0; }
+        .cron-switch input {
+            opacity: 0; width: 0; height: 0;
+            -webkit-appearance: none; -moz-appearance: none; appearance: none;
+            position: absolute; margin: 0; padding: 0; border: none;
+        }
+        .cron-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+                       background-color: #ef4444; transition: .2s; border-radius: 24px; }
+        .cron-slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px;
+                              bottom: 3px; background-color: white; transition: .2s; border-radius: 50%; }
+        .cron-switch input:checked + .cron-slider { background-color: #22c55e; }
+        .cron-switch input:checked + .cron-slider:before { transform: translateX(22px); }
+        .cron-switch input:focus + .cron-slider { box-shadow: 0 0 0 2px rgba(34,197,94,0.3); }
 
         /* Nav Drawer & Overlay */
         .nav-drawer {
@@ -3403,10 +3436,20 @@ def _resolve_engine_python() -> str:
     probe candidates once and cache the first that can import requests.
     Override with HUNTER_PYTHON if the layout ever changes.
     """
+    import paths
     candidates = []
     env_py = os.environ.get("HUNTER_PYTHON")
     if env_py:
         candidates.append(env_py)
+
+    # The installed layout puts venv/ beside app/ - and that venv has `requests`.
+    # Probing it FIRST is what makes 'Fetch the top-20 pairs' work on a fresh
+    # install, where the dashboard runs under a different interpreter that
+    # cannot import requests and fetch_market.py dies in 0s.
+    install_venv = os.path.join(os.path.dirname(str(paths.APP_ROOT)), "venv", "bin", "python")
+    if os.path.exists(install_venv):
+        candidates.append(install_venv)
+
     candidates += ["python3", "python", "/usr/bin/python3", sys.executable]
 
     for cand in candidates:
