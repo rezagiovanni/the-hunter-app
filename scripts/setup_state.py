@@ -128,13 +128,22 @@ ACTIONS = {
         "heavy": False,
         "requires": [],
     },
+    "ohlcv": {
+        "label": "Create the candle files",
+        "desc": "Fetches recent 15m candles for every pair, creating the CSV "
+                "files the backfills then extend.",
+        "script": "fetch_ohlcv.py",
+        "log": "ohlcv.log",
+        "heavy": False,
+        "requires": ["market"],
+    },
     "backfill-deep": {
         "label": "Deep backfill (2 years)",
         "desc": "Pulls two years of 15m candles for every pair. Takes a while.",
         "script": "backfill_deep.py",
         "log": "backfill-deep.log",
         "heavy": True,
-        "requires": ["market"],
+        "requires": ["market", "ohlcv"],
     },
     "backfill-stale": {
         "label": "Fill gaps",
@@ -142,7 +151,7 @@ ACTIONS = {
         "script": "backfill_stale.py",
         "log": "backfill-stale.log",
         "heavy": True,
-        "requires": ["market"],
+        "requires": ["market", "ohlcv"],
     },
     "prune": {
         "label": "Prune old data",
@@ -154,7 +163,14 @@ ACTIONS = {
     },
 }
 
-ORDER = ["market", "backfill-deep", "backfill-stale", "prune"]
+# Order matters: fetch_ohlcv CREATES the CSVs that both backfills only extend.
+# Without it they find nothing, print "nothing to do" and exit 0 - which the
+# panel faithfully recorded as "done" while no data existed at all.
+ORDER = ["market", "ohlcv", "backfill-deep", "backfill-stale", "prune"]
+
+# Actions whose whole purpose is to produce OHLCV CSVs. If one of these exits 0
+# but no CSV exists afterwards, it did not do its job. See record_exit().
+DATA_PRODUCING = {"ohlcv", "backfill-deep", "backfill-stale"}
 
 
 def _blank():
@@ -458,12 +474,34 @@ def record_exit(name, exit_code, log_path=None, reason=None):
     line from a status line - an earlier version read "depth done for 20 pairs"
     from a SUCCESSFUL market fetch and reported the job as failed. Only an
     explicit reason from the caller, or the exit code itself, is used.
+
+    A zero exit is NOT sufficient for success on a data-producing action. On a
+    fresh install the backfills found no CSVs, printed "nothing to do" and
+    exited 0 - and the panel showed "done" for four jobs that had produced no
+    data at all. If the action is supposed to create CSVs and there are still
+    none, that is a failure with a reason, not a success.
     """
+    if exit_code == 0 and name in DATA_PRODUCING and not _has_ohlcv():
+        _update(name, state=FAILED, exit_code=exit_code,
+                finished_at=time.time(), pid=None,
+                detail="finished but produced no candle files - run 'Create the "
+                       "candle files' first")
+        return
+
     detail = reason if reason else ("completed" if exit_code == 0
                                     else f"exit code {exit_code}")
     _update(name, state=DONE if exit_code == 0 else FAILED,
             exit_code=exit_code, finished_at=time.time(), pid=None,
             detail=detail)
+
+
+def _has_ohlcv():
+    """True if the OHLCV directory holds at least one CSV file."""
+    try:
+        import glob as _glob
+        return bool(_glob.glob(os.path.join(paths.OHLCV_DIR, "*.csv")))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +702,47 @@ def _self_check():
 
         # ---- 12. an unknown action is refused, not crashed into ----
         ok, msg = start("no-such-action", background=False)
-        # --- engine_python picks an interpreter that can actually import requests ---
+        # --- the setup order must include the step that CREATES the CSVs ---
+    # backfill_deep and backfill_stale only EXTEND existing CSVs. With no CSVs
+    # they print "nothing to do" and exit 0, which was recorded as "done" - so a
+    # fresh install showed four green ticks and zero data. fetch_ohlcv is what
+    # creates the files, and it was missing from the flow entirely.
+    check("the flow includes the CSV-creating step", "ohlcv" in ORDER, ORDER)
+    check("ohlcv runs before either backfill",
+          ORDER.index("ohlcv") < ORDER.index("backfill-deep")
+          and ORDER.index("ohlcv") < ORDER.index("backfill-stale"), ORDER)
+    check("the backfills require ohlcv",
+          "ohlcv" in ACTIONS["backfill-deep"]["requires"]
+          and "ohlcv" in ACTIONS["backfill-stale"]["requires"])
+    check("ohlcv is a data-producing action", "ohlcv" in DATA_PRODUCING)
+
+    # --- a zero exit with no CSVs must NOT be recorded as done ---
+    # This is the false-success that made the Analytics page show 0 pairs while
+    # the Settings page said every action had finished.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        real_state, real_ohlcv = STATE_FILE, paths.OHLCV_DIR
+        try:
+            STATE_FILE = os.path.join(_td, "setup_state.json")
+            paths.OHLCV_DIR = os.path.join(_td, "ohlcv")     # empty
+            os.makedirs(paths.OHLCV_DIR)
+            save(_blank())
+            record_exit("backfill-deep", 0, reason="completed in 1s")
+            st = load()["actions"]["backfill-deep"]
+            check("zero exit with no CSVs is FAILED, not done",
+                  st["state"] == FAILED, st)
+            check("it explains why", "no candle files" in st.get("detail", ""),
+                  st.get("detail"))
+
+            # and with a CSV present the same exit is a genuine success
+            open(os.path.join(paths.OHLCV_DIR, "X.csv"), "w").write("a")
+            record_exit("backfill-deep", 0, reason="completed in 1s")
+            st2 = load()["actions"]["backfill-deep"]
+            check("zero exit WITH CSVs is done", st2["state"] == DONE, st2)
+        finally:
+            STATE_FILE, paths.OHLCV_DIR = real_state, real_ohlcv
+
+    # --- engine_python picks an interpreter that can actually import requests ---
     # The first version looked only at <app>/venv, which does not exist in the
     # installed layout (the venv is a SIBLING of app/), so every setup job fell
     # through to python3 and died in 0s with ModuleNotFoundError. The symptom was
