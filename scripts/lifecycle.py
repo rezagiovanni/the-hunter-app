@@ -107,12 +107,42 @@ def human_bytes(n):
 # ---------------------------------------------------------------------------
 # Upgrade
 # ---------------------------------------------------------------------------
+# Where a release comes from when the user does not say. install.sh builds the
+# same URL; keeping it here means `hunter upgrade` works with no arguments
+# instead of raising "no release source given" - which is what it did, because
+# --source defaulted to None and nothing else supplied a value.
+DEFAULT_RELEASE_URL = (
+    "https://github.com/rezagiovanni/the-hunter-app/archive/refs/tags/v{version}.tar.gz"
+)
+
+
+def default_source(version=None):
+    """The published tarball for a version, or the current app version."""
+    if version is None:
+        version = _app_version()
+    return DEFAULT_RELEASE_URL.format(version=version)
+
+
+def _app_version():
+    """The app's version, read from the one place that declares it."""
+    try:
+        import cli
+        return getattr(cli, "VERSION", "0.1.0")
+    except Exception:
+        return "0.1.0"
+
+
 def upgrade(source=None, dry_run=False, assume_yes=False, keep_jobs=True):
     """Replace app/ from a release tarball. Preserve data, config and jobs.
 
-    `source` is a tarball path or URL. Returns a dict describing what happened.
+    `source` is a tarball path or URL. When it is None the published release for
+    the current version is used, so `hunter upgrade` needs no arguments.
+    Returns a dict describing what happened.
     """
     import crontab_manager as cm
+
+    if not source:
+        source = default_source()
 
     root = install_root()
     target = app_dir()
@@ -142,6 +172,8 @@ def upgrade(source=None, dry_run=False, assume_yes=False, keep_jobs=True):
     except Exception:
         result["jobs_before"] = {}
 
+    result["source"] = source
+
     if dry_run:
         result["ok"] = True
         return result
@@ -159,7 +191,9 @@ def upgrade(source=None, dry_run=False, assume_yes=False, keep_jobs=True):
             pass          # not fatal; the tarball is the source of truth
 
     if not source:
-        raise LifecycleError("no release source given")
+        raise LifecycleError(
+            "no release source: pass --source <path-or-url>, "
+            f"or check the default {default_source()}")
 
     # ---- unpack ----
     import tempfile

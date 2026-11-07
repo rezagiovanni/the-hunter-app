@@ -858,7 +858,8 @@ def build_parser():
                             help="do not ask before selling an open position")
         if name == "upgrade":
             sp.add_argument("--source", default=None,
-                            help="release tarball path or URL")
+                            help="release tarball path or URL "
+                                 "(default: the published release for this version)")
             sp.add_argument("--dry-run", action="store_true",
                             help="show what would change without changing it")
         if name == "uninstall":
