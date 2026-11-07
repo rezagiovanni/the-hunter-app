@@ -160,6 +160,11 @@ def collect_status():
     ctl = read_json(paths.CONTROL_FILE, {}) or {}
 
     trades = st.get("trade_log", []) or []
+    # Tolerate malformed rows. A hand-edited or truncated state file should not
+    # take down `hunter status` with an AttributeError - status is the command a
+    # user runs to find out whether anything is wrong, so it must survive bad
+    # input and report on it rather than crash. Non-dict entries are ignored.
+    trades = [t for t in trades if isinstance(t, dict)]
     wins = sum(1 for t in trades if (t.get("net_pnl_idr") or 0) > 0)
     net = sum((t.get("net_pnl_idr") or 0) for t in trades)
 
@@ -646,6 +651,9 @@ def cmd_upgrade(args):
         print(f"       would replace: {', '.join(res['replaced']) or 'app/'}")
         print(f"       would preserve: {', '.join(res['preserved']) or 'nothing'}")
         return 0
+
+    if res.get("source"):
+        print(f"  {t.grey('source: ' + res['source'])}")
 
     if not res.get("ok"):
         print(f"  {t.red('[FAIL]')} upgrade did not complete", file=sys.stderr)
