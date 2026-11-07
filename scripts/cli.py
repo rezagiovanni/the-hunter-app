@@ -124,6 +124,36 @@ def read_json(path, default=None):
 # ---------------------------------------------------------------------------
 # State collection — one place, used by both the human and JSON views
 # ---------------------------------------------------------------------------
+def _model_accuracy():
+    """A few aggregate numbers from the scored outcomes, or None.
+
+    Reads only the tail of the outcomes file: `hunter status` must stay fast, and
+    a full report on every call would re-parse the whole log. The aggregates are
+    recomputed from a bounded window and clearly labelled as such.
+    """
+    import ml_report
+    try:
+        if not os.path.exists(ml_report.OUTCOME_LOG):
+            return None
+        recs = list(ml_report.load_outcomes(ml_report.OUTCOME_LOG).values())
+        if not recs:
+            return None
+        # newest 5000 scored predictions - enough to be stable, cheap to read
+        recs.sort(key=lambda r: r.get("horizon_ts") or 0)
+        recs = recs[-5000:]
+        vetoed = [r for r in recs if r.get("veto")]
+        allowed = [r for r in recs if not r.get("veto")]
+        if not vetoed or not allowed:
+            return None
+        return {
+            "n": len(recs),
+            "vetoed_down_rate": sum(1 for r in vetoed if r["actual"] == "down") / len(vetoed),
+            "allowed_down_rate": sum(1 for r in allowed if r["actual"] == "down") / len(allowed),
+        }
+    except Exception:
+        return None
+
+
 def collect_status():
     """Everything `hunter status` reports, as plain data."""
     st = read_json(paths.STATE_FILE, {}) or {}
@@ -193,6 +223,7 @@ def collect_status():
             "predictions_age_s": (round(time.time() - preds["generated_at"])
                                   if preds.get("generated_at") else None),
             "predictions_pairs": len(preds.get("predictions", {}) or {}),
+            "accuracy": _model_accuracy(),
         },
         "dashboard": dash,
         "dashboard_service": dashboard_service_status(),
@@ -303,6 +334,18 @@ def render_status(data, as_json=False):
             tag = term.green("fresh") if fresh else term.yellow("stale")
             L.append(f"  {term.pad('Predictions', 18)}: {m['predictions_pairs']} pairs, "
                      f"{ago(time.time() - age) if age else 'just now'}  {tag}")
+
+            # Accuracy, if any prediction has had its horizon close. Reading the
+            # outcomes file is a handful of lines; building a full report on every
+            # status call would mean re-reading the whole log.
+            acc = m.get("accuracy")
+            if acc:
+                L.append(f"  {term.pad('Veto accuracy', 18)}: fell "
+                         f"{acc['vetoed_down_rate'] * 100:.0f}% of vetoed vs "
+                         f"{acc['allowed_down_rate'] * 100:.0f}% allowed  "
+                         f"({acc['n']:,} scored)")
+            elif m["present"]:
+                L.append(f"  {term.grey('Accuracy   : run `hunter ml outcome` once predictions age past 1h')}")
 
     # --- jobs ---
     L.append(term.section("Jobs (crontab)"))
@@ -761,8 +804,30 @@ def cmd_dashboard(args):
     return 2
 
 
+def cmd_ml(args):
+    """Model health: score closed predictions, then report accuracy."""
+    import ml_report
+
+    action = getattr(args, "action", None) or "report"
+
+    if action in ("outcome", "both"):
+        n = ml_report.record_outcomes(verbose=True)
+        if action == "outcome":
+            return 0
+
+    if action in ("report", "both"):
+        rep = ml_report.build_report()
+        if args.json:
+            print(json.dumps(rep, indent=2, default=str))
+        else:
+            print()
+            print(ml_report.render_report(rep))
+    return 0
+
+
 COMMANDS = {
     "where": (cmd_where, "show where the app, data and logs live"),
+    "ml": (cmd_ml, "model health: score predictions and report accuracy"),
     "dashboard": (cmd_dashboard, "install, start, stop or inspect the dashboard service"),
     "status": (cmd_status, "live state: hunting mode, balance, data, jobs, dashboard"),
     "start": (cmd_start, "start hunting (enables the scanning job)"),
@@ -806,6 +871,12 @@ def build_parser():
         if name == "setup":
             sp.add_argument("--force", action="store_true",
                             help="replace credentials that are already saved")
+        if name == "ml":
+            msub = sp.add_subparsers(dest="action", metavar="<action>")
+            msub.add_parser("report", help="accuracy, calibration and veto record")
+            msub.add_parser("outcome", help="score predictions whose horizon closed")
+            msub.add_parser("both", help="score, then report")
+
         if name == "dashboard":
             dsub = sp.add_subparsers(dest="action", metavar="<action>")
             dsub.add_parser("status", help="is it installed, running, and why not?")
