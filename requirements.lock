@@ -1,0 +1,46 @@
+# The Hunter — runtime dependencies for the installed app.
+#
+# The app is a data pipeline plus a local web dashboard on top of the public
+# Indodax REST API. Apart from these packages it is pure Python. Every pin below
+# ships manylinux wheels for x86_64 AND aarch64 on Python 3.11 and 3.12, which is
+# why they are exact: an unpinned install resolves to whatever is newest that day
+# and can land on a version with no wheel for the target, which then has to build
+# from source or fail.
+#
+# WHAT IS NOT HERE, AND WHY
+#
+# The ML veto layer was removed from the product on 2026-11-08. That removed the
+# entire scientific stack — scikit-learn, numpy, scipy, joblib, threadpoolctl and
+# cloudpickle — which was ~120 MB of compiled wheels and the single largest part
+# of the install. A fresh install no longer needs those, imports ~127 MB less,
+# and runs unchanged on a 1 GB ARM board.
+#
+# The lock is the exact transitive closure of the four direct deps, resolved in a
+# clean Python 3.11 venv. Do NOT add a package without confirming both
+# interpreters have a wheel for it — the installed machine has no compiler.
+#
+# Install with:  pip install -r requirements.lock
+# Never install bare package names on an installed machine.
+
+# --- direct dependencies ---
+requests==2.34.2
+fastapi==0.162.0
+uvicorn==0.54.0
+PyYAML==6.0.3
+
+# --- transitive (pinned so resolution cannot drift) ---
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.16.0
+certifi==2026.10.23
+charset-normalizer==3.5.2
+click==8.5.1
+h11==0.16.0
+idna==3.20
+opentelemetry-api==1.45.2
+pydantic==2.14.3
+pydantic_core==2.50.4
+starlette==1.10.0
+typing_extensions==4.16.0
+typing-inspection==0.4.5
+urllib3==2.8.0
