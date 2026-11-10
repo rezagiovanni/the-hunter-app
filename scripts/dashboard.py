@@ -1236,6 +1236,44 @@ def _parse_date(date_str: str, end_of_day: bool = False):
         return None
 
 
+def _trades_for(symbol: str) -> list:
+    """Closed trades for one symbol, oldest first, with the fields a chart needs.
+
+    Read from hunter_state.json's trade_log. Malformed rows are skipped rather
+    than raised: a chart must not fail because one trade record is odd.
+    """
+    import state as _state
+    try:
+        st = _state.load_state()
+    except Exception:
+        return []
+    out = []
+    for t in (st.get("trade_log") or []):
+        if not isinstance(t, dict):
+            continue
+        if (t.get("symbol") or "").upper() != symbol.upper():
+            continue
+        entry, exit_ = t.get("entry_time"), t.get("exit_time")
+        if not entry or not exit_:
+            continue
+        try:
+            out.append({
+                "hunt_id": t.get("hunt_id"),
+                "entry_time": float(entry),
+                "exit_time": float(exit_),
+                "entry_price": float(t.get("entry_price") or 0),
+                "exit_price": float(t.get("exit_price") or 0),
+                "net_pnl_idr": float(t.get("net_pnl_idr") or 0),
+                "net_pnl_pct": float(t.get("net_pnl_pct") or 0),
+                "exit_reason": t.get("exit_reason") or "",
+                "framework": t.get("framework") or "",
+            })
+        except (TypeError, ValueError):
+            continue
+    out.sort(key=lambda x: x["entry_time"])
+    return out
+
+
 @app.get("/api/ohlcv/{pair}")
 async def api_ohlcv(pair: str, tf: str = DEFAULT_TF, from_date: str = "", to_date: str = ""):
     """
@@ -1296,6 +1334,9 @@ async def api_ohlcv(pair: str, tf: str = DEFAULT_TF, from_date: str = "", to_dat
         rows = _aggregate(rows, factor2)
         aggregated = True
 
+    # Overlay data. The chart shades each trade's holding window so the user can
+    # see what happened AFTER the bot exited - the whole point of the overlay.
+    # Times are epoch seconds, so they survive any timeframe aggregation.
     return JSONResponse({
         "pair": symbol,
         "tf": tf,
@@ -1304,6 +1345,7 @@ async def api_ohlcv(pair: str, tf: str = DEFAULT_TF, from_date: str = "", to_dat
         "total_bars": len(rows),
         "from": from_ts,
         "to": to_ts,
+        "trades": _trades_for(symbol),
     })
 
 
@@ -2159,6 +2201,67 @@ CHART_JS = """
         const y = p => padT + priceH - ((p - min) / (max - min)) * priceH;
         const volTop = padT + priceH + 10;
 
+        // ---- Trade overlay: shade where the bot was IN a position ----
+        //
+        // Drawn BEFORE the candles so the shading sits behind them, and clipped
+        // to the price pane so a tall band cannot bleed into the volume strip.
+        //
+        // Two problems this has to solve:
+        //  1. A trade can be SHORTER than one candle (the sample median hold is
+        //     2.6 bars and the minimum is 0.1). Scaling strictly by duration
+        //     would make those invisible, so every band has a minimum width.
+        //  2. The band must not hide the price action the user came to see,
+        //     hence low alpha plus a thin, opaque entry/exit edge.
+        const trades = (data.trades || []);
+        const bandInfo = [];
+        if (trades.length) {
+            const times = candles.map(c => c.t);
+            const barSec = times.length > 1
+                ? Math.max(60, times[times.length - 1] - times[0]) / (times.length - 1)
+                : 900;
+            const tFirst = times[0], tLast = times[times.length - 1] + barSec;
+            const timeToX = ts => padL + ((ts - tFirst) / (tLast - tFirst)) * chartW;
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(padL, padT, chartW, priceH);
+            ctx.clip();
+            for (const t of trades) {
+                if (t.exit_time < tFirst || t.entry_time > tLast) continue;
+                let x1 = timeToX(Math.max(t.entry_time, tFirst));
+                let x2 = timeToX(Math.min(t.exit_time, tLast));
+                const minW = Math.max(3, (chartW / candles.length) * 0.6);
+                if (x2 - x1 < minW) {
+                    const mid = (x1 + x2) / 2;
+                    x1 = mid - minW / 2; x2 = mid + minW / 2;
+                }
+                const win = t.net_pnl_idr >= 0;
+                ctx.fillStyle = win ? 'rgba(34,197,94,0.16)' : 'rgba(239,68,68,0.16)';
+                ctx.fillRect(x1, padT, x2 - x1, priceH);
+                ctx.strokeStyle = win ? 'rgba(34,197,94,0.85)' : 'rgba(239,68,68,0.85)';
+                ctx.lineWidth = 1;
+                ctx.beginPath(); ctx.moveTo(x1, padT); ctx.lineTo(x1, padT + priceH); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(x2, padT); ctx.lineTo(x2, padT + priceH); ctx.stroke();
+                bandInfo.push({x1: x1, x2: x2, trade: t});
+            }
+            ctx.restore();
+
+            if (bandInfo.length) {
+                ctx.fillStyle = 'rgba(34,197,94,0.16)';
+                ctx.fillRect(padL + 4, padT + 4, 10, 10);
+                ctx.fillStyle = 'var(--text-secondary)';
+                ctx.font = '10px sans-serif';
+                ctx.textAlign = 'left';
+                ctx.fillText('win', padL + 18, padT + 12);
+                ctx.fillStyle = 'rgba(239,68,68,0.16)';
+                ctx.fillRect(padL + 48, padT + 4, 10, 10);
+                ctx.fillStyle = 'var(--text-secondary)';
+                ctx.fillText('loss', padL + 62, padT + 12);
+                ctx.fillStyle = 'var(--text-muted)';
+                ctx.fillText('shaded = bot in position', padL + 100, padT + 12);
+            }
+        }
+
         // Grid + price labels (right side)
         ctx.strokeStyle = 'rgba(51,65,85,0.6)';
         ctx.fillStyle = 'var(--text-secondary)';
@@ -2229,19 +2332,42 @@ CHART_JS = """
                 ctx.setLineDash([]);
                 const pct = ((c.c - c.o) / c.o * 100).toFixed(2);
                 const col = c.c >= c.o ? '#26a69a' : '#ef5350';
+
+                // Which trade window is under the cursor? The overlay answers
+                // "what did the bot do here", and the reason for the exit
+                // matters more than the shading colour.
+                const hit = bandInfo.find(b => xx >= b.x1 && xx <= b.x2);
+                let tradeHtml = '';
+                if (hit) {
+                    const t = hit.trade;
+                    const ok = t.net_pnl_idr >= 0;
+                    const c2 = ok ? '#22c55e' : '#ef4444';
+                    const mins = Math.max(0, Math.round((t.exit_time - t.entry_time) / 60));
+                    const held = mins >= 60 ? `${(mins / 60).toFixed(1)}h` : `${mins}m`;
+                    tradeHtml =
+                        `<div style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(148,163,184,.35)">` +
+                        `<b style="color:${c2}">${t.hunt_id}</b> &nbsp;` +
+                        `<span style="color:${c2}">${t.net_pnl_pct >= 0 ? '+' : ''}` +
+                        `${(t.net_pnl_pct * 100).toFixed(2)}%</span><br>` +
+                        `${t.exit_reason}<br>` +
+                        `held ${held} &nbsp; FW ${t.framework || '?'}` +
+                        `</div>`;
+                }
+
                 tooltip.style.display = 'block';
                 tooltip.innerHTML =
                     `<b>${fmtTime(c.t, tf)} WIB</b><br>` +
                     `O ${fmtPrice(c.o)} &nbsp; H ${fmtPrice(c.h)}<br>` +
                     `L ${fmtPrice(c.l)} &nbsp; C <span style="color:${col}">${fmtPrice(c.c)}</span><br>` +
-                    `<span style="color:${col}">${pct >= 0 ? '+' : ''}${pct}%</span> &nbsp; Vol ${fmtPrice(c.v)}`;
-                const tipW = 160;
+                    `<span style="color:${col}">${pct >= 0 ? '+' : ''}${pct}%</span> &nbsp; Vol ${fmtPrice(c.v)}` +
+                    tradeHtml;
+                const tipW = hit ? 180 : 160;
                 let tx = xx + 12;
                 if (tx + tipW > W) {
                     tx = Math.max(4, xx - tipW - 12);
                 }
                 tooltip.style.left = tx + 'px';
-                tooltip.style.top = Math.max(4, Math.min(H - 85, y(c.c) - 10)) + 'px';
+                tooltip.style.top = Math.max(4, Math.min(H - (hit ? 120 : 85), y(c.c) - 10)) + 'px';
             } else {
                 if (tooltip) tooltip.style.display = 'none';
             }
