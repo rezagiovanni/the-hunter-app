@@ -2347,8 +2347,11 @@ CHART_JS = """
                     tradeHtml =
                         `<div style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(148,163,184,.35)">` +
                         `<b style="color:${c2}">${t.hunt_id}</b> &nbsp;` +
+                        // net_pnl_pct is ALREADY a percentage (-5.2249 means
+                        // -5.22%), not a fraction. Multiplying by 100 here
+                        // printed +128% for a +1.28% trade.
                         `<span style="color:${c2}">${t.net_pnl_pct >= 0 ? '+' : ''}` +
-                        `${(t.net_pnl_pct * 100).toFixed(2)}%</span><br>` +
+                        `${t.net_pnl_pct.toFixed(2)}%</span><br>` +
                         `${t.exit_reason}<br>` +
                         `held ${held} &nbsp; FW ${t.framework || '?'}` +
                         `</div>`;
