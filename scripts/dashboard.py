@@ -779,7 +779,8 @@ def _trading_log_section(state: dict) -> str:
 
     open_row = _open_row(pos, order)
     paper_log = trade_log
-    # Live executor is unconfigured by design, so this is empty until it exists.
+    # Live trades are recorded separately from paper ones: the two ledgers
+    # must never be summed, because one is simulated money and one is not.
     live_log = state.get("live_trade_log", [])
     paper_total = len(paper_log)
     live_total = len(live_log)
