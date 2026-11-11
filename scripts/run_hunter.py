@@ -676,11 +676,27 @@ def tick(now: Optional[float] = None) -> dict:
         # the UI says LIVE would mean the operator watches simulated fills and
         # believes real money is at work - or worse, the reverse.
         if ctrl.get("exec") == "LIVE":
+            # Record the refusal so the dashboard can say BLOCKED instead of
+            # painting a green HUNTING badge while nothing happens. The message
+            # is the same one the operator needs to read.
+            try:
+                from control import set_blocked
+                set_blocked("LIVE is armed but this engine cannot place live "
+                            "orders in this build")
+            except Exception:                                # noqa: BLE001
+                pass
             return {"status": "EXECUTOR_UNAVAILABLE",
                     "message": (f"{dt_str}  [BLOCKED] LIVE is armed but this engine "
                                 f"cannot place live orders in this build. Set the "
                                 f"executor back to PAPER, or wait for the live "
                                 f"engine release.")}
+
+        # past the guards: this tick really runs, so any previous block is stale
+        try:
+            from control import clear_blocked
+            clear_blocked()
+        except Exception:                                    # noqa: BLE001
+            pass
 
         state = load_state()
 

@@ -676,12 +676,29 @@ def _cell(pass_fail, disp):
 def _trading_log_section(state: dict) -> str:
     """Render Trading Log panel with Live Mode / Paper Mode switcher."""
     phase = state.get("phase", "HUNTING")
+
+    # A blocked engine is not hunting. This badge is the biggest thing on the
+    # panel and it read "HUNTING" for days while every tick was refused, which
+    # is why the same question kept being asked: a WINNER that is never bought.
+    _blocked = None
+    try:
+        from control import load_control
+        _blocked = (load_control() or {}).get("blocked")
+    except Exception:                                        # noqa: BLE001
+        _blocked = None
     balance = state.get("balance_idr", 100_000.0)
     pos = state.get("position")
     order = state.get("order")
     trade_log = state.get("trade_log", [])
 
-    if pos:
+    if _blocked and not pos:
+        status_badge = '<span class="badge-status blocked">✕ NOT TRADING</span>'
+        status_detail = (
+            "Engine is refusing to run: <b>"
+            + str(_blocked.get("reason") or "blocked") + "</b>"
+            + " · no orders will be placed until this is resolved"
+        )
+    elif pos:
         status_badge = '<span class="badge-status holding">● HOLDING</span>'
         _lv = pos.get("exit_levels", {})
         status_detail = (
@@ -1208,12 +1225,30 @@ def _winner_card(winner, rows):
     mom = row["momentum_disp"]
     total = row["total"]
     vol_b = row["vol"] / 1e9
-    return f"""<div class="section winner-card">
+    # If the engine is not running, "WINNER" is a preview of a decision nobody
+    # makes. Say so on the card itself: this is the single element an operator
+    # looks at, and it read WINNER for days while every tick was refused.
+    _blk = None
+    try:
+        from control import load_control
+        _blk = (load_control() or {}).get("blocked")
+    except Exception:                                        # noqa: BLE001
+        _blk = None
+
+    _tag = ('<span class="winner-tag blocked">NOT TRADED — ENGINE OFF</span>'
+            if _blk else '<span class="winner-tag">WINNER</span>')
+    _note = (f'<div class="winner-blocked-note">The engine is refusing to run: '
+             f'<b>{_blk.get("reason", "blocked")}</b>. Nothing will be bought '
+             f'until this is resolved.</div>'
+             if _blk else '')
+
+    return f"""<div class="section winner-card{'' if not _blk else ' is-blocked'}">
     <h2>TARGET ACQUISITION</h2>
     <div class="winner-main">
         <span class="winner-name">{winner}</span>
-        <span class="winner-tag">WINNER</span>
+        {_tag}
     </div>
+    {_note}
     <div class="winner-grid">
         <div class="kv"><div class="k">Volume</div><div class="v">{vol_b:.2f}B IDR</div></div>
         <div class="kv"><div class="k">Candles</div><div class="v pass"> {c_disp}</div></div>
@@ -1480,6 +1515,33 @@ def _style():
         .ctrl-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 
         /* ---- live balance panel ------------------------------------------ */
+        .winner-tag.blocked {
+            background: rgba(239,68,68,0.18);
+            color: #ef4444;
+            border: 1px solid #ef4444;
+        }
+        .winner-card.is-blocked { border-color: #ef4444; }
+        .winner-blocked-note {
+            margin: 10px 0 4px;
+            padding: 9px 12px;
+            border-left: 3px solid #ef4444;
+            background: rgba(239,68,68,0.08);
+            color: #fca5a5;
+            font-size: 0.82em;
+            line-height: 1.45;
+        }
+
+        .badge-status.blocked {
+            background: rgba(239,68,68,0.15);
+            color: #ef4444;
+            border: 1px solid #ef4444;
+        }
+        .ctrl-switch.blocked {
+            background: #7f1d1d;
+            border-color: #ef4444;
+            color: #fff;
+        }
+
         .live-banner {
             display: flex;
             align-items: center;
@@ -2655,7 +2717,11 @@ CHART_JS = """
             sw.title = 'Running. Stop first - then START PAPER or START LIVE appears.';
             sw.classList.toggle('stopped', false);
             sw.classList.toggle('live', isLive);
-            lbl.textContent = isLive ? '■ STOP LIVE' : '■ STOP';
+            var blocked = ctrlState.blocked && ctrlState.blocked.reason;
+            sw.classList.toggle('blocked', !!blocked);
+            lbl.textContent = blocked
+                ? '■ STOP — ENGINE BLOCKED'
+                : (isLive ? '■ STOP LIVE' : '■ STOP');
         } else {
             sw.style.display = '';
             sw.classList.remove('live');
@@ -2664,12 +2730,15 @@ CHART_JS = """
             lbl.textContent = '▶ START PAPER';
         }
         if (hint) {
-            hint.textContent = running
-                ? ('framework ' + ctrlState.framework + ' · engine every 60s'
-                   + (isLive ? ' · LIVE' : ' · paper'))
-                : ('framework ' + ctrlState.framework + ' · stopped'
-                   + (ctrlState.position && ctrlState.position.symbol
-                      ? ' · position open' : ''));
+            var blk = ctrlState.blocked && ctrlState.blocked.reason;
+            hint.textContent = blk
+                ? ('NOT TRADING: ' + blk)
+                : (running
+                   ? ('framework ' + ctrlState.framework + ' · engine every 60s'
+                      + (isLive ? ' · LIVE' : ' · paper'))
+                   : ('framework ' + ctrlState.framework + ' · stopped'
+                      + (ctrlState.position && ctrlState.position.symbol
+                         ? ' · position open' : '')));
         }
     }
 
@@ -3918,6 +3987,7 @@ async def api_control_get():
         "changed_by": c.get("changed_by"),
         "phase": st.get("phase"),
         "position": _position_summary(),
+        "blocked": c.get("blocked"),
         "frameworks": list_frameworks(),
     }
 
@@ -4421,10 +4491,19 @@ async def dashboard():
         control = load_control()
     except Exception:
         control = {"mode": "RUNNING", "framework": "A"}
+    # A verdict is only meaningful if the engine would act on it. While the
+    # engine refuses to tick, "WINNER" is a preview of a decision nobody makes -
+    # and it reads as a promise. The word is withheld and the reason shown
+    # instead, so the row can never be mistaken for "the bot is buying this".
+    _funnel_blocked = (control or {}).get("blocked")
+
     board_html_rows = ""
     for i, r in enumerate(board_rows, 1):
         reason = _block_reason(r)
-        if r["pair"] == winner:
+        if _funnel_blocked and (r["pair"] == winner or r["eligible"]):
+            verdict = '<span class="badge-no" title="the engine is not running">✗ ENGINE OFF</span>'
+            tr_cls = ""
+        elif r["pair"] == winner:
             verdict = '<span class="badge-win">WINNER</span>'
             tr_cls = ' class="winner"'
         elif r["eligible"]:

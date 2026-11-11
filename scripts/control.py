@@ -174,6 +174,32 @@ def set_mode(mode: str, by: str = "dashboard", framework: str = None,
     return ctrl
 
 
+def set_blocked(reason: str, by: str = "engine", now: float = None) -> dict:
+    """Record that the engine refused to tick, and why.
+
+    Without this the dashboard can only see mode=RUNNING and paints "HUNTING",
+    which is how an operator ends up asking three times why a WINNER is not
+    being bought. The refusal is a fact about the machine and belongs in the
+    control file, not in a log file nobody reads.
+
+    Cleared by any successful tick via clear_blocked().
+    """
+    if now is None:
+        now = time.time()
+    ctrl = load_control()
+    ctrl["blocked"] = {"reason": str(reason)[:300], "at": now, "by": by}
+    save_control(ctrl)
+    return ctrl
+
+
+def clear_blocked(now: float = None) -> None:
+    """Clear the block marker after a tick that actually ran."""
+    ctrl = load_control()
+    if ctrl.get("blocked"):
+        ctrl["blocked"] = None
+        save_control(ctrl)
+
+
 def is_live(ctrl: dict = None) -> bool:
     """True only when the control file explicitly says LIVE.
 
