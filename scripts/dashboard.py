@@ -704,7 +704,8 @@ def _trading_log_section(state: dict) -> str:
     except Exception:                                        # noqa: BLE001
         _exch = None
 
-    if _exch and _exch.get("status") in ("RECOVER", "PHANTOM", "MISMATCH"):
+    if _exch and _exch.get("status") in ("RECOVER", "PHANTOM", "MISMATCH",
+                                         "PHANTOM_DUST"):
         _held = ", ".join(f"{v:g} {k}" for k, v in
                           list((_exch.get("exchange") or {}).items())[:3]) or "nothing"
         status_badge = '<span class="badge-status blocked">⚠ HOLDING ON EXCHANGE</span>'

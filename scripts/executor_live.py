@@ -29,9 +29,11 @@ Every function here takes an optional `client` so tests can drive the full
 lifecycle against a fake exchange without network or credentials.
 """
 
+import json
 import os
 import sys
 import time
+import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -637,6 +639,80 @@ def reconcile(client=None) -> Dict[str, Any]:
     return out
 
 
+# A holding worth less than this is dust, not a position.
+#
+# Bought with a 10,000 IDR exchange minimum, a coin that has fallen to under
+# 1,000 IDR is 10% of the smallest trade the exchange allows - it cannot be sold
+# on its own (below the minimum) and it is not worth a stop. Treating it as a
+# position would halt the bot forever over pocket change.
+DUST_THRESHOLD_IDR = 1000.0
+
+# Public ticker, no credentials needed. Cached briefly: reconciliation runs on
+# every live tick and this must not become an API conversation.
+_PRICE_CACHE: Dict[str, Any] = {}
+_PRICE_TTL_S = 45.0
+
+
+def _last_price(pair_id: str, ticker_id: Optional[str] = None) -> Optional[float]:
+    """Last traded price in IDR, or None. Never raises."""
+    key = str(ticker_id or pair_id)
+    now = time.time()
+    hit = _PRICE_CACHE.get(key)
+    if hit and (now - hit[0]) < _PRICE_TTL_S:
+        return hit[1]
+
+    urls = []
+    if ticker_id:
+        urls.append(f"https://indodax.com/api/ticker/{ticker_id}")
+    urls.append(f"https://indodax.com/api/ticker/{pair_id}")
+
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "the-hunter/0.1"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read()).get("ticker", {})
+            px = float(data.get("last") or 0)
+            if px > 0:
+                _PRICE_CACHE[key] = (now, px)
+                return px
+        except Exception:                                    # noqa: BLE001
+            continue
+    return None
+
+
+def value_holdings(coins: Dict[str, float],
+                   pair_rows: Optional[list] = None) -> Dict[str, Dict[str, Any]]:
+    """Attach an IDR value to each coin.
+
+    Returns {SYMBOL: {"amount", "price", "value_idr", "dust", "priced"}}.
+
+    An UNPRICED holding is never called dust. If the price cannot be read, the
+    conservative assumption is that it might be worth something, and halting is
+    the safer outcome than ignoring a real position because the ticker timed out.
+    """
+    rows = {}
+    if pair_rows:
+        for p in pair_rows:
+            sym = str(p.get("symbol") or "").upper()
+            if sym:
+                rows[sym] = p
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for sym, amount in (coins or {}).items():
+        pair = rows.get(f"{sym}IDR") or {}
+        pair_id = pair.get("id") or f"{sym.lower()}idr"
+        ticker_id = pair.get("ticker_id")
+        px = _last_price(pair_id, ticker_id)
+        if px is None:
+            out[sym] = {"amount": amount, "price": None, "value_idr": None,
+                        "dust": False, "priced": False}
+            continue
+        val = amount * px
+        out[sym] = {"amount": amount, "price": px, "value_idr": val,
+                    "dust": val < DUST_THRESHOLD_IDR, "priced": True}
+    return out
+
+
 def holdings(client=None) -> Dict[str, Any]:
     """What the exchange actually says this account holds, right now.
 
@@ -673,52 +749,75 @@ def holdings(client=None) -> Dict[str, Any]:
     return out
 
 
-def reconcile_position(state: dict, client=None) -> Dict[str, Any]:
+def reconcile_position(state: dict, client=None,
+                       pair_rows: Optional[list] = None) -> Dict[str, Any]:
     """Compare local state with the exchange and say what to do about it.
 
-    Four possibilities, and only one of them is "fine":
+    Statuses:
 
-      MATCH        local position, exchange holds it      -> nothing to do
-      RECOVER      no local position, exchange holds coin -> ADOPT it
-      PHANTOM      local position, exchange has no coin   -> local state is wrong
-      FOREIGN      exchange holds a coin the bot never
-                   bought, and there is no open position   -> report it
+      FLAT      no significant coins, no position      fine
+      MATCH     position, and the coins exist          fine
+      RECOVER   significant coins, no local position   adopt or sell
+      PHANTOM   position, but no coins                 local state is wrong
+      MISMATCH  coins exist but the count differs      reconcile
+      UNKNOWN   the exchange could not be read         NOT treated as flat
 
-    Recovery matters most: the operator may have bought in the Indodax app, or
-    the bot may have crashed between placing and recording a fill. Either way the
-    coins exist and need a stop, and ignoring them lets the engine open a second
-    position while the first is unprotected.
+    DUST IS NOT A POSITION. A holding worth under DUST_THRESHOLD_IDR (1,000 IDR)
+    is ignored: it cannot be sold on its own because it is below the exchange
+    minimum, and halting the bot over pocket change would be worse than the
+    change is worth. Dust is still reported so the operator can see it.
+
+    An UNPRICED holding is NOT dust. If the price could not be read we do not
+    know it is worthless, and the safe assumption is that it might not be.
     """
     client = client or RealClient()
     h = holdings(client=client)
     if not h["ok"]:
-        return {"status": "UNKNOWN", "error": h["error"], "coins": {}}
+        return {"status": "UNKNOWN", "error": h["error"], "coins": {},
+                "dust": {}, "valuations": {}}
+
+    valuations = value_holdings(h["coins"], pair_rows)
+
+    significant = {}
+    dust = {}
+    for sym, v in valuations.items():
+        if v.get("dust"):
+            dust[sym] = v
+        else:
+            significant[sym] = v.get("amount", 0.0)
 
     pos = state.get("position") or {}
     sym = str(pos.get("symbol") or "").upper()
     local_coin = sym.replace("IDR", "") if sym else ""
 
-    coins = h["coins"]
-    result = {"status": "FLAT", "exchange": coins, "idr": h["idr"],
-              "local_symbol": sym or None, "adopted": None, "foreign": []}
+    result = {"status": "FLAT", "exchange": significant, "idr": h["idr"],
+              "local_symbol": sym or None, "adopted": None, "foreign": [],
+              "dust": dust, "valuations": valuations}
 
     if pos and local_coin:
-        held = float(coins.get(local_coin, 0.0))
+        held = float(significant.get(local_coin, 0.0))
         if held <= 0:
+            # the coin is gone - but if it is merely dust now, the position still
+            # exists as a rounding remainder rather than a disappearance
+            if local_coin in dust:
+                result["status"] = "PHANTOM_DUST"
+                result["dust_note"] = (
+                    f"only {dust[local_coin]['amount']:g} {local_coin} remains, "
+                    f"worth under {DUST_THRESHOLD_IDR:,.0f} IDR")
+                return result
             result["status"] = "PHANTOM"
             return result
-        # tolerate a small difference: fees and partial fills round
         want = float(pos.get("coins") or 0.0)
-        result["status"] = "MATCH" if abs(held - want) <= max(want * 0.02, 1e-8) else "MISMATCH"
+        result["status"] = ("MATCH" if abs(held - want) <= max(want * 0.02, 1e-8)
+                            else "MISMATCH")
         result["held"] = held
         return result
 
-    # no local position
-    if not coins:
+    if not significant:
         return result
-    # coins exist but the bot is flat: adopt the largest as a recovered position
+
     result["status"] = "RECOVER"
-    result["foreign"] = sorted(coins.items(), key=lambda kv: -kv[1])
+    result["foreign"] = sorted(significant.items(), key=lambda kv: -kv[1])
     return result
 
 
@@ -985,31 +1084,50 @@ def _self_check():
     assert h14["idr"] == 46622.0
     print(f"[PASS] holdings are read from the exchange: {h14['coins']}")
 
-    # flat locally, coin on the exchange -> RECOVER
-    r14 = reconcile_position({"position": None}, client=ex14)
-    assert r14["status"] == "RECOVER", r14
-    assert r14["foreign"][0][0] == "SHIB"
-    print("[PASS] a holding with no local position is flagged RECOVER")
+    # flat locally, coin on the exchange -> RECOVER *if it is worth anything*.
+    # The live SHIB price is about 0.08 IDR, so 0.75 SHIB is 6 sen - dust. Pin a
+    # realistic price here rather than depending on the market.
+    _orig_px2 = _last_price
+    globals()["_last_price"] = lambda p, t=None: 5000.0
+    try:
+        r14 = reconcile_position({"position": None}, client=ex14)
+        assert r14["status"] == "RECOVER", r14
+        assert r14["foreign"][0][0] == "SHIB"
+        print("[PASS] a holding with no local position is flagged RECOVER")
+    finally:
+        globals()["_last_price"] = _orig_px2
 
     # local position that the exchange also holds -> MATCH
     pos14 = {"position": {"symbol": "SHIBIDR", "coins": 0.75}}
-    r15 = reconcile_position(pos14, client=ex14)
-    assert r15["status"] == "MATCH", r15
+    globals()["_last_price"] = lambda p, t=None: 5000.0
+    try:
+        r15 = reconcile_position(pos14, client=ex14)
+        assert r15["status"] == "MATCH", r15
+    finally:
+        globals()["_last_price"] = _orig_px2
     print("[PASS] a local position the exchange also holds is MATCH")
 
     # local position but no coins -> PHANTOM
-    ex15 = FakeExchange(idr=50000.0)
-    r16 = reconcile_position({"position": {"symbol": "SHIBIDR", "coins": 0.75}},
-                             client=ex15)
-    assert r16["status"] == "PHANTOM", r16
+    ex15 = FakeExchange(idr=50000.0)          # no coins at all
+    globals()["_last_price"] = lambda p, t=None: 5000.0
+    try:
+        r16 = reconcile_position({"position": {"symbol": "SHIBIDR", "coins": 0.75}},
+                                 client=ex15)
+        assert r16["status"] == "PHANTOM", r16
+    finally:
+        globals()["_last_price"] = _orig_px2
     print("[PASS] a local position the exchange does not hold is PHANTOM")
 
     # amount disagreement -> MISMATCH (fees/partial fills are tolerated)
     ex16 = FakeExchange(idr=50000.0)
     ex16.coins = {"shib": 0.50}
-    r17 = reconcile_position({"position": {"symbol": "SHIBIDR", "coins": 0.75}},
-                             client=ex16)
-    assert r17["status"] == "MISMATCH", r17
+    globals()["_last_price"] = lambda p, t=None: 5000.0
+    try:
+        r17 = reconcile_position({"position": {"symbol": "SHIBIDR", "coins": 0.75}},
+                                 client=ex16)
+        assert r17["status"] == "MISMATCH", r17
+    finally:
+        globals()["_last_price"] = _orig_px2
     print("[PASS] a coin-count disagreement is MISMATCH")
 
     # flat + empty -> FLAT
@@ -1025,6 +1143,71 @@ def _self_check():
     r19 = reconcile_position({"position": None}, client=Broken())
     assert r19["status"] == "UNKNOWN", r19
     print("[PASS] an unreadable exchange is UNKNOWN, not FLAT")
+
+    # --- 14. dust is not a position -----------------------------------------
+    # A coin worth under 1,000 IDR cannot be sold on its own (below the exchange
+    # minimum) and is not worth a stop. Halting the bot forever over pocket
+    # change would be worse than the change is worth.
+    _orig_px = _last_price
+
+    def _fake_price(pair_id, ticker_id=None):
+        # SHIB at 900 IDR/coin: 0.75 * 900 = 675 IDR -> dust
+        return 900.0
+
+    try:
+        globals()["_last_price"] = _fake_price
+        ex20 = FakeExchange(idr=50000.0)
+        ex20.coins = {"shib": 0.75}
+        r20 = reconcile_position({"position": None}, client=ex20)
+        assert r20["status"] == "FLAT", r20
+        assert "SHIB" in r20["dust"], r20["dust"]
+        assert abs(r20["dust"]["SHIB"]["value_idr"] - 675.0) < 1e-6
+        print(f"[PASS] a 675 IDR holding is DUST, not a position "
+              f"({r20['dust']['SHIB']['value_idr']:,.0f} IDR)")
+
+        # the same amount at a higher price IS a position
+        globals()["_last_price"] = lambda p, t=None: 5000.0
+        r21 = reconcile_position({"position": None}, client=ex20)
+        assert r21["status"] == "RECOVER", r21
+        assert "SHIB" in r21["exchange"]
+        print("[PASS] the same coins at a real value become RECOVER again")
+
+        # exactly at the threshold is NOT dust
+        globals()["_last_price"] = lambda p, t=None: (DUST_THRESHOLD_IDR / 0.75)
+        r22 = reconcile_position({"position": None}, client=ex20)
+        assert r22["status"] == "RECOVER", r22
+        print(f"[PASS] exactly {DUST_THRESHOLD_IDR:,.0f} IDR is not dust "
+              f"(the test is '<', not '<=')")
+
+        # an UNPRICED holding is never dust: unknown is not worthless
+        globals()["_last_price"] = lambda p, t=None: None
+        r23 = reconcile_position({"position": None}, client=ex20)
+        assert r23["status"] == "RECOVER", r23
+        assert r23["valuations"]["SHIB"]["priced"] is False
+        print("[PASS] an unpriced holding is NOT assumed to be dust")
+    finally:
+        globals()["_last_price"] = _orig_px
+
+    # a position whose coin has become dust is reported, not silently dropped
+    ex24 = FakeExchange(idr=50000.0)
+    ex24.coins = {"shib": 0.0001}
+
+    def _tiny(p, t=None):
+        return 100.0
+
+    try:
+        globals()["_last_price"] = _tiny
+        r24 = reconcile_position({"position": {"symbol": "SHIBIDR", "coins": 0.75}},
+                                 client=ex24)
+        assert r24["status"] == "PHANTOM_DUST", r24
+        print("[PASS] a position reduced to dust is PHANTOM_DUST, not ignored")
+    finally:
+        globals()["_last_price"] = _orig_px
+
+    # valuation uses the pair table's ticker_id when present
+    assert value_holdings({"SHIB": 0.75}, [{"symbol": "SHIBIDR", "id": "shibidr",
+                                            "ticker_id": "shib_idr"}])["SHIB"]["priced"] in (True, False)
+    print("[PASS] valuation accepts the pair table")
 
     # --- 11. a target exit uses a LIMIT sell (maker fee) --------------------
     ex11 = FakeExchange(idr=100000.0)

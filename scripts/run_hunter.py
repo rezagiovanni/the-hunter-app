@@ -254,6 +254,10 @@ def _describe_reconcile(rec: dict) -> str:
     if st == "MISMATCH":
         return (f"the exchange holds {rec.get('held'):g} of {rec.get('local_symbol')} "
                 f"which does not match the recorded amount.")
+    if st == "PHANTOM_DUST":
+        return (f"the recorded position has only dust left "
+                f"({rec.get('dust_note') or 'below 1,000 IDR'}). Clear the "
+                f"position before hunting.")
     return f"exchange state {st}"
 
 
@@ -922,9 +926,15 @@ def tick(now: Optional[float] = None) -> dict:
         if ctrl.get("exec") == "LIVE":
             try:
                 import executor_live
-                _rec = executor_live.reconcile_position(state)
+                _rows = []
+                try:
+                    with open(PAIRS_FILE, "r") as _fh:
+                        _rows = json.load(_fh)
+                except Exception:                        # noqa: BLE001
+                    _rows = []
+                _rec = executor_live.reconcile_position(state, pair_rows=_rows)
                 _st = _rec.get("status")
-                if _st in ("RECOVER", "PHANTOM", "MISMATCH"):
+                if _st in ("RECOVER", "PHANTOM", "MISMATCH", "PHANTOM_DUST"):
                     _detail = _describe_reconcile(_rec)
                     try:
                         from control import set_blocked
