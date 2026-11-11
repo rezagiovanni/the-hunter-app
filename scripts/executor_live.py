@@ -137,32 +137,54 @@ def preflight(client=None, trade_size_idr: float = 0.0,
         if not ok:
             problems.append(f"{name}: {detail}")
 
-    # 1. credentials load
+    # 1. credentials load. Everything else depends on this, so it is the only
+    # check that can short-circuit: without a key there is nothing to ask.
     try:
         client.creds_or_load()
         add("credentials", True, "key and secret loaded")
     except Exception as e:                                   # noqa: BLE001
         add("credentials", False, str(e))
-        return {"ok": False, "checks": checks, "problems": problems}
+        return {"ok": False, "checks": checks, "problems": problems,
+                "warnings": []}
 
-    # 2. the key actually signs and the account answers
+    # 2. the key actually signs and the account answers. Also fatal, because
+    # every remaining check reads the response.
     try:
         info = client.get_info()
         add("authentication", True, "getInfo accepted the signature")
     except Exception as e:                                   # noqa: BLE001
         add("authentication", False, str(e)[:400])
-        return {"ok": False, "checks": checks, "problems": problems}
+        return {"ok": False, "checks": checks, "problems": problems,
+                "warnings": []}
 
     ret = info.get("return") or {}
 
-    # 3. server time vs local clock - the single most common signing failure
+    # 3. server time vs local clock - the single most common signing failure.
+    #
+    # The units and the epoch have to be established before the comparison, and
+    # an earlier version of this check did neither. It read server_time as
+    # MILLISECONDS while the API reports SECONDS, so 1.79e9 seconds became
+    # 1.79e9 milliseconds - 1970 - and the "drift" came out as 1,792,574,065
+    # seconds, about 56 years. A real drift is single-digit seconds, so a value
+    # that large is never a clock problem, it is a units problem.
+    #
+    # Now: normalise by magnitude, and if the number cannot be a time at all,
+    # say that instead of blaming the operator's clock.
     try:
-        server_ms = int(ret.get("server_time", 0))
-        if server_ms > 0:
-            drift = abs(int(time.time() * 1000) - server_ms) / 1000.0
-            add("clock", drift < 5.0, f"local clock is {drift:.1f}s from the exchange")
+        raw_st = ret.get("server_time", 0)
+        server_s = _seconds(raw_st)
+        if server_s is None:
+            add("clock", True,
+                f"exchange did not report a usable server_time ({raw_st!r}); skipped")
+        elif server_s < 1_000_000_000:
+            add("clock", True,
+                f"exchange server_time looked like an uptime not a timestamp "
+                f"({raw_st!r}); skipped")
         else:
-            add("clock", True, "exchange did not report server_time; skipped")
+            drift = abs(time.time() - server_s)
+            add("clock", drift < 5.0,
+                f"local clock is {drift:.1f}s from the exchange "
+                f"(local {int(time.time())}, exchange {int(server_s)})")
     except Exception as e:                                   # noqa: BLE001
         add("clock", False, str(e))
 
@@ -299,6 +321,25 @@ def check_live_buy_fill(order: dict, live_price: float,
                                     partial=True)
 
     return False, None
+
+
+def _seconds(v) -> Optional[float]:
+    """Interpret a reported time as seconds, whatever unit it arrived in.
+
+    Indodax reports server_time in SECONDS. Milliseconds are tolerated because
+    a future endpoint may change, but the magnitude is measured rather than
+    assumed - assuming milliseconds is exactly what produced a fake 56-year
+    clock drift.
+    """
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    if n > 1e11:          # 1e11 seconds is year 5138; this must be ms
+        return n / 1000.0
+    return n
 
 
 def _f(v) -> float:
@@ -517,7 +558,10 @@ class FakeExchange:
         return {"success": 1, "return": {
             "balance": {"idr": f"{self.idr:.8f}", **self.coins},
             "balance_hold": {"idr": "0"},
-            "server_time": int(time.time() * 1000),
+            # Indodax reports server_time in SECONDS. The fake reports the same
+            # units as the real API on purpose: a fake that disagrees with the
+            # API hides exactly the bug this test exists to catch.
+            "server_time": int(time.time()),
             "frozen": "0",
         }}
 
@@ -659,6 +703,23 @@ def _self_check():
     assert pf8["ok"] is False
     assert any("frozen" in p for p in pf8["problems"])
     print("[PASS] preflight refuses a frozen account")
+
+    # --- 8b. the clock check must not invent a 56-year drift ----------------
+    # server_time arrives in seconds. Reading it as milliseconds put it in 1970
+    # and produced "local clock is 1792574065.0s from the exchange", which is a
+    # units bug wearing the costume of a clock problem.
+    assert _seconds(1792574065) == 1792574065, "seconds must stay seconds"
+    assert abs(_seconds(1792574065000) - 1792574065) < 0.001, "ms must convert"
+    assert _seconds(0) is None and _seconds("x") is None and _seconds(None) is None
+    print("[PASS] server_time is read as seconds; milliseconds are converted")
+
+    ex8b = FakeExchange(idr=200000.0)
+    pf8b = preflight(client=ex8b, trade_size_idr=32000.0, key_path="/tmp/none")
+    clock = [c for c in pf8b["checks"] if c[0] == "clock"][0]
+    assert clock[1] is True, clock
+    assert "56" not in clock[2] and "1792574065" not in clock[2], clock[2]
+    assert float(clock[2].split("is ")[1].split("s ")[0]) < 5.0, clock[2]
+    print(f"[PASS] a healthy clock reports real drift: {clock[2]}")
 
     # --- 9. STOP cancels resting orders first -------------------------------
     ex9 = FakeExchange(idr=100000.0, fill_mode="resting")
