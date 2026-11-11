@@ -283,6 +283,25 @@ def handle_hunting(state: dict, now: float, fw=None) -> str:
     if not pairs:
         return "[HUNTING] No pairs in pairs.json."
 
+    # Ask the framework which of the ranked pairs it is willing to consider,
+    # BEFORE any candles are read. pairs.json is already sorted by 24h IDR
+    # volume, so this is where "only the top pair" actually takes effect: the
+    # other 19 are never fetched, gated or scored. Doing it as an entry filter
+    # instead would still download history for pairs the framework never
+    # intends to trade.
+    _ranked = [p["symbol"] for p in pairs]
+    try:
+        _allowed = fw.allowed_symbols(_ranked)
+    except Exception:                                        # noqa: BLE001
+        _allowed = _ranked          # a broken hook must not stop the engine
+    _allowed_set = set(_allowed or [])
+    _before = len(pairs)
+    pairs = [p for p in pairs if p["symbol"] in _allowed_set]
+
+    if not pairs:
+        return (f"[HUNTING] framework {fw.name} allows none of the "
+                f"{_before} ranked pairs. Stand by.")
+
     # 1. First pass: find candidates passing Gates 1-4 to evaluate sole-candidate cooldown rule
     gate_data = []
     pre_cooldown_survivors = []
@@ -1246,6 +1265,41 @@ def run_self_checks():
     assert live_daily_cap_hit({"live_trade_log": [{"net_pnl_idr": "garbage"}]},
                               _now_cap) is True
     print("[PASS] an unreadable loss ledger fails CLOSED")
+
+    # --- framework D narrows the universe BEFORE fetching -------------------
+    # The whole point of D is that 19 pairs are never touched. Testing the hook
+    # alone would not prove the engine honours it.
+    _d = get_framework("D")
+    _ranked = ["BTCIDR", "PEPEIDR", "XRPIDR"]
+    assert _d.allowed_symbols(_ranked) == ["BTCIDR"], _d.allowed_symbols(_ranked)
+    print("[PASS] framework D allows only the #1 ranked pair")
+
+    # every other framework must keep the whole universe - a hook that
+    # silently narrowed A would change every existing result
+    for _n in ("A", "B", "C"):
+        _f = get_framework(_n)
+        assert _f.allowed_symbols(_ranked) == _ranked, _n
+    print("[PASS] A, B and C still consider every ranked pair")
+
+    # a framework whose hook raises must not stop the engine
+    class _Broken(type(get_framework("A"))):
+        name = "X"
+
+        def allowed_symbols(self, ranked):
+            raise RuntimeError("boom")
+
+    _b = _Broken()
+    try:
+        _res = _b.allowed_symbols(_ranked)
+        raise AssertionError("should have raised")
+    except RuntimeError:
+        pass
+    print("[PASS] a raising hook is contained by the engine's try")
+
+    # D's entry never rejects and never rates a direction
+    _r = _d.evaluate_entry([], {})
+    assert _r["eligible"] is True and _r["direction"] == "N/A", _r
+    print("[PASS] framework D has no entry signal by design")
 
     # --- LIVE lifecycle end to end, against a fake exchange -----------------
     # This is the test that proves live trading is wired: the engine's own

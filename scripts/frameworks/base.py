@@ -68,6 +68,24 @@ class Framework:
         """
         raise NotImplementedError
 
+    # -- 1b. pair selection (optional) -------------------------------------
+    def allowed_symbols(self, ranked_symbols: list) -> list:
+        """Which pairs this framework is willing to consider, in rank order.
+
+        `ranked_symbols` is pairs.json order - the top 20 by 24h IDR volume,
+        already sorted.
+
+        The engine calls this BEFORE fetching candles, and a pair left out is
+        never fetched, gated or scored. That is deliberately different from
+        evaluate_entry(): a filter can only reject a pair it has already been
+        asked about, so a "trade only the top pair" rule built as a filter would
+        still download ten years of candles for 19 pairs it never intended to
+        trade.
+
+        Default: everything. Frameworks that care about rank override this.
+        """
+        return list(ranked_symbols)
+
     # -- 3. exit evaluation -----------------------------------------------
     def evaluate_exit(self, live_price: float, levels: dict) -> dict:
         """

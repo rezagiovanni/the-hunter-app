@@ -23,10 +23,11 @@ from frameworks.base import Framework                  # noqa: F401  (re-export)
 from frameworks.framework_a import FrameworkA
 from frameworks.framework_b import FrameworkB
 from frameworks.framework_c import FrameworkC
+from frameworks.framework_d import FrameworkD
 
 DEFAULT_FRAMEWORK = "A"
 
-_INSTANCES = (FrameworkA(), FrameworkB(), FrameworkC())
+_INSTANCES = (FrameworkA(), FrameworkB(), FrameworkC(), FrameworkD())
 _REGISTRY = {f.name: f for f in _INSTANCES}
 
 
@@ -57,7 +58,7 @@ if __name__ == "__main__":
 
     # 1. Both frameworks registered
     names = all_names()
-    assert "A" in names and "B" in names and "C" in names, names
+    assert all(x in names for x in ("A", "B", "C", "D")), names
     print(f"[PASS] registry contains: {names}")
 
     # 2. Lookup works, case-insensitive
@@ -65,6 +66,7 @@ if __name__ == "__main__":
     assert get_framework("a").name == "A"
     assert get_framework("b").name == "B"
     assert get_framework("c").name == "C"
+    assert get_framework("d").name == "D"
     print("[PASS] lookup is case-insensitive: 'a'/'A'/'b'")
 
     # 3. Unknown -> falls back to A (never raises)
@@ -100,11 +102,11 @@ if __name__ == "__main__":
 
     # 7. list_frameworks() shape for the API
     listing = list_frameworks()
-    assert len(listing) == 3
+    assert len(listing) == 4
     for item in listing:
         for k in ("name", "label", "description", "version", "experimental"):
             assert k in item, (k, item)
-    assert sum(1 for x in listing if x["experimental"]) == 2, listing
+    assert sum(1 for x in listing if x["experimental"]) == 3, listing
     print(f"[PASS] list_frameworks() -> {[x['name'] for x in listing]} "
           f"({sum(1 for x in listing if x['experimental'])} experimental)")
 

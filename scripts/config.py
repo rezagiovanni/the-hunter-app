@@ -83,6 +83,16 @@ DEFAULTS = {
             "ratchet_trigger_pct": 0.0,
             "ratchet_stop_pct": 0.0,
         },
+        "D": {
+            # The benchmark rig: trades ONLY the #1 pair by 24h volume, with no
+            # entry signal. Exits are identical to A on purpose - the only
+            # variable is which pair gets bought.
+            "target_pct": 0.02,
+            "stop_pct": 0.04,
+            "ratchet_enabled": False,
+            "ratchet_trigger_pct": 0.0,
+            "ratchet_stop_pct": 0.0,
+        },
     },
     "data": {
         # Retention floor, in years. prune_data.py removes bars older than this.
