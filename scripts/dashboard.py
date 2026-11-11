@@ -694,7 +694,7 @@ def _trading_log_section(state: dict) -> str:
         )
     else:
         status_badge = f'<span class="badge-status hunting">● {phase}</span>'
-        status_detail = f"Scanning 20 IDR Pairs · Virtual Balance: <b>IDR {balance:,.0f}</b> · cron_a engine ready"
+        status_detail = f"Scanning 20 IDR Pairs · Virtual Balance: <b>IDR {balance:,.0f}</b> · engine ready"
 
     def _open_row(p, o):
         """Live position/order row (pinned above the paginated history).
@@ -1014,19 +1014,6 @@ def _settings_panel() -> str:
   </div>
 </div>
 
-<div class="panel" id="appearancePanel">
-  <h2>Appearance</h2>
-  <div class="theme-row">
-    <div>
-      <div class="theme-label">Theme</div>
-      <div class="su-dim">Applies to this browser only. Your trading settings are untouched.</div>
-    </div>
-    <div class="theme-switch" role="group" aria-label="Theme">
-      <button class="theme-opt" data-theme-opt="dark" type="button">DARK</button>
-      <button class="theme-opt" data-theme-opt="light" type="button">LIGHT</button>
-    </div>
-  </div>
-</div>
 {cron_html}
 """
 
@@ -1381,70 +1368,7 @@ def _style():
             --warn: #fbbf24;
         }
 
-        /* LIGHT. Set on <html data-theme="light"> by the Settings page; the
-           choice is stored in localStorage and re-applied before first paint,
-           so there is no flash of the wrong theme. */
-        /* ---- Appearance: theme switch ---- */
-        /* amber for "you missed this" values, distinct from green/red */
-        .kv .v.warn { color: var(--warn); }
 
-        /* manual exit: red, because it closes a trade the engine did not intend */
-        .sell-now {
-            font-family: inherit; font-size: 11px; letter-spacing: .06em;
-            font-weight: 700; padding: 4px 10px; cursor: pointer;
-            color: #fff; background: var(--accent-red);
-            border: 1px solid var(--accent-red); border-radius: 4px;
-        }
-        .sell-now:hover { filter: brightness(1.15); }
-        .sell-now:disabled { opacity: .5; cursor: default; }
-
-        .theme-row {
-            display: flex; align-items: center; justify-content: space-between;
-            gap: 16px; flex-wrap: wrap;
-        }
-        .theme-label { font-weight: 700; letter-spacing: .04em; }
-        .theme-switch {
-            display: inline-flex; border: 1px solid var(--border);
-            border-radius: 6px; overflow: hidden;
-        }
-        .theme-opt {
-            font-family: inherit; font-size: 12px; letter-spacing: .06em;
-            padding: 8px 18px; cursor: pointer;
-            background: transparent; color: var(--text-secondary);
-            border: 0; transition: background .15s, color .15s;
-        }
-        .theme-opt + .theme-opt { border-left: 1px solid var(--border); }
-        .theme-opt:hover { background: var(--row-hover); }
-        .theme-opt[aria-pressed="true"] {
-            background: var(--accent-green); color: #fff; font-weight: 700;
-        }
-
-        [data-theme="light"] {
-            --bg-primary: #f7f8fa;
-            --bg-deep: #eef1f5;
-            --bg-secondary: #ffffff;
-            --bg-card: #ffffff;
-            --bg-elevated: #f1f3f6;
-            --text-primary: #111827;
-            --text-secondary: #4b5563;
-            --text-muted: #6b7280;
-            --border: #d1d5db;
-            --border-strong: #9ca3af;
-            --border-color: #d1d5db;
-            --row-hover: rgba(0,0,0,0.03);
-            --shadow: 0 1px 3px rgba(0,0,0,.12);
-            --chart-grid: rgba(0,0,0,0.08);
-
-            /* The terminal green is legible on black and fails on white:
-               #22c55e over #ffffff measures 2.14:1, below the 4.5:1 floor for
-               body text. Darken the accents for light mode. Badges that FILL
-               with the accent keep white text, so a darker fill reads better. */
-            --accent-green: #15803d;
-            --terminal-green: #15803d;
-            --accent-red: #b91c1c;
-            --accent-blue: #1d4ed8;
-            --warn: #b45309;
-        }
         * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
         html, body {
             width: 100%;
@@ -2599,7 +2523,7 @@ CHART_JS = """
             : (ctrlState.mode === 'STOPPING' ? '… STOPPING' : '● STOPPED — CLICK TO START');
         if (hint) {
             hint.textContent = running
-                ? ('framework ' + ctrlState.framework + ' · cron_a every 60s')
+                ? ('framework ' + ctrlState.framework + ' · engine every 60s')
                 : ('framework ' + ctrlState.framework + ' · switch framework below');
         }
     }
@@ -3358,37 +3282,6 @@ CHART_JS = """
 # Keeping them in their own constant makes the scoping explicit.
 # ---------------------------------------------------------------------------
 PAGE_JS = """
-    // ---- Theme (dark/light) ----
-    // The choice lives in localStorage and is applied to <html data-theme> by an
-    // inline script in <head> before first paint, so a light-mode user never
-    // sees a flash of dark. Defined here, at page level, because the switch is
-    // on the Settings page.
-    function currentTheme() {
-        try { return localStorage.getItem('hunter-theme') === 'light' ? 'light' : 'dark'; }
-        catch (e) { return 'dark'; }
-    }
-
-    function applyTheme(name) {
-        var root = document.documentElement;
-        if (name === 'light') {
-            root.setAttribute('data-theme', 'light');
-        } else {
-            root.removeAttribute('data-theme');
-        }
-        document.querySelectorAll('.theme-opt').forEach(function (b) {
-            b.setAttribute('aria-pressed',
-                b.getAttribute('data-theme-opt') === name ? 'true' : 'false');
-        });
-        if (typeof drawChart === 'function') {
-            try { drawChart(); } catch (e) {}
-        }
-    }
-
-    function setTheme(name) {
-        try { localStorage.setItem('hunter-theme', name); } catch (e) {}
-        applyTheme(name);
-    }
-
     // ---- Manual market exit ----
     // Sells the open position at the best bid and keeps hunting. NOT the same as
     // STOP: STOP liquidates and parks the engine. A confirmation is deliberate -
@@ -3425,14 +3318,7 @@ PAGE_JS = """
     }
 
     // wire the switch once the document is ready
-    document.addEventListener('DOMContentLoaded', function () {
-        document.querySelectorAll('.theme-opt').forEach(function (b) {
-            b.addEventListener('click', function () {
-                setTheme(b.getAttribute('data-theme-opt'));
-            });
-        });
-        applyTheme(currentTheme());
-    });
+
 """
 
 
@@ -3634,8 +3520,11 @@ async def favicon():
 # money or public exposure. See the vault note "hunter control plane".
 # ---------------------------------------------------------------------------
 
-HERMES_BIN = shutil.which("hermes")
-CRON_A_JOB_ID = "75a5da3dafb6"      # cron_a: The Hunter
+# The engine's schedule is the app's own crontab job "scanning", not a Hermes
+# cron entry. The old hardcoded Hermes job id did NOTHING on an installed app:
+# pause/resume silently failed, so STOP only worked through the control file and
+# the scanning job kept firing every minute for nothing.
+SCAN_JOB = "scanning"
 STOP_SCRIPT = BASE_DIR / "scripts" / "run_hunter.py"
 
 
@@ -3644,7 +3533,7 @@ def _resolve_engine_python() -> str:
     Find an interpreter that can actually run run_hunter.py.
 
     The dashboard service runs under .venv (fastapi/uvicorn only); the engine
-    needs `requests`, which lives in the system python that cron_a uses via
+    needs `requests`, which lives in the system python the engine job uses via
     hunter.sh. Using sys.executable here fails with ModuleNotFoundError, so
     probe candidates once and cache the first that can import requests.
     Override with HUNTER_PYTHON if the layout ever changes.
@@ -3682,24 +3571,35 @@ ENGINE_PYTHON = _resolve_engine_python()
 
 
 def _run_cron(action: str) -> tuple:
-    """
-    Best-effort pause/resume of cron_a.
+    """Best-effort pause/resume of the engine's own scheduled job.
 
-    The control file is authoritative: if this fails, the engine still stops
-    or starts correctly. Cron pause only avoids spawning pointless processes.
-    Returns (ok, detail) — never raises.
+    The engine runs from the app's crontab job "scanning" (crontab_manager), not
+    from a Hermes cron entry. An earlier version called
+    `hermes cron pause 75a5da3dafb6` - a hardcoded id that only ever existed on
+    the developer's machine. On a real install that call failed and the job kept
+    firing every minute; the control file still stopped trading, so the app
+    looked correct while spawning pointless work forever.
+
+    The control file remains authoritative: if this fails, the engine still
+    stops or starts correctly. Returns (ok, detail) - never raises.
     """
-    if not HERMES_BIN:
-        return False, "hermes binary not on PATH — engine control file still applies"
     try:
-        proc = subprocess.run(
-            [HERMES_BIN, "cron", action, CRON_A_JOB_ID],
-            capture_output=True, text=True, timeout=20,
-        )
-        detail = (proc.stdout or proc.stderr or "").strip().splitlines()
-        return (proc.returncode == 0), (detail[-1] if detail else f"exit {proc.returncode}")
-    except (subprocess.TimeoutExpired, OSError) as e:
+        import crontab_manager as cm
+    except Exception as e:                                  # noqa: BLE001
+        return False, f"crontab_manager unavailable: {e}"
+
+    enable = (action == "resume")
+    try:
+        res = cm.set_job(SCAN_JOB, enable)
+    except Exception as e:                                  # noqa: BLE001
         return False, f"{type(e).__name__}: {e}"
+    # set_job returns the full job->enabled map on success and raises on failure,
+    # so the only thing worth reporting is whether THIS job ended up as asked.
+    if isinstance(res, dict) and SCAN_JOB in res:
+        if bool(res[SCAN_JOB]) == enable:
+            return True, ("enabled" if enable else "disabled")
+        return False, f"{SCAN_JOB} did not change state"
+    return True, ("enabled" if enable else "disabled")
 
 
 @app.get("/api/control")
@@ -3719,7 +3619,7 @@ async def api_control_get():
 
 @app.post("/api/control/start")
 async def api_control_start():
-    """Resume hunting: unpause cron_a and set mode RUNNING."""
+    """Resume hunting: re-enable the engine job and set mode RUNNING."""
     from control import MODE_RUNNING, set_mode
     set_mode(MODE_RUNNING, by="dashboard")
     cron_ok, cron_detail = _run_cron("resume")
@@ -3774,7 +3674,7 @@ async def api_position_sell():
 @app.post("/api/control/stop")
 async def api_control_stop():
     """
-    Stop hunting: liquidate anything open, park the engine, pause cron_a.
+    Stop hunting: liquidate anything open, park the engine, pause the engine job.
 
     Runs scripts/run_hunter.py --stop-now as a subprocess so the stop takes
     the engine's own flock and reuses its money-math. Exit code 2 means a tick
@@ -3987,15 +3887,7 @@ async def dashboard():
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon-192.png">
     <link rel="apple-touch-icon" href="/static/favicon-180.png">
-    <script>
-        /* Runs BEFORE the stylesheet paints, so a light-mode user never sees a
-           flash of dark. Inline on purpose: a fetched file arrives too late. */
-        try {{
-          if (localStorage.getItem('hunter-theme') === 'light') {{
-            document.documentElement.setAttribute('data-theme', 'light');
-          }}
-        }} catch (e) {{}}
-    </script>
+    
     <style>{_style()}</style>
 </head>
 <body>
@@ -4055,7 +3947,7 @@ async def dashboard():
         </div>
         <div class="drawer-bottom">
             <div><b>The Hunter Trading Engine</b></div>
-            <div>cron_a (Hermes) · Paper Mode</div>
+            <div>Hunting engine · Paper Mode</div>
             <div>ZeroTier: 10.36.20.175:8082</div>
         </div>
     </div>
