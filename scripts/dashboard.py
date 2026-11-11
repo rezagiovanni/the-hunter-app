@@ -865,13 +865,16 @@ def _trading_log_section(state: dict) -> str:
                      while real orders were live, or vice versa. The executor is
                      now shown from the control file, and changing it requires
                      STOPPED plus a typed confirmation. -->
-                <div class="mode-btn-group" id="execGroup">
-                    <button class="mode-btn active" id="btnPaperMode" type="button" disabled>
-                        <span class="dot paper"></span> PAPER
-                    </button>
-                    <button class="mode-btn" id="btnLiveMode" type="button" disabled>
-                        <span class="dot live"></span> LIVE
-                    </button>
+                <!-- A single read-only badge. The previous two-chip PAPER |
+                     LIVE control looked exactly like a segmented switch, so it
+                     invited exactly the question "why can't I click it?". It
+                     was never clickable: the executor is changed by START LIVE
+                     while stopped, never by poking this. One badge cannot be
+                     mistaken for a control. -->
+                <div class="exec-badge" id="execBadge" role="status"
+                     aria-live="polite">
+                    <span class="dot paper" id="execDot"></span>
+                    <span id="execLabel">EXECUTOR: PAPER</span>
                 </div>
             </div>
         </div>
@@ -1939,22 +1942,29 @@ def _style():
         .badge-status.open { background: rgba(251,191,36,0.15); color: var(--warn); border: 1px solid #fbbf24; }
 
         .mode-control-wrap { display: flex; align-items: center; }
-        .mode-btn-group {
-            display: flex; border: 1px solid var(--border); background: var(--bg-card);
+        /* A read-only badge, deliberately not shaped like a switch: no border
+           between halves, no hover state, cursor stays default. */
+        .exec-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 14px;
+            border-radius: 6px;
+            font-size: 0.78em;
+            font-weight: 700;
+            letter-spacing: 0.10em;
+            border: 1px solid var(--border);
+            background: var(--panel-2);
+            color: var(--text-dim);
+            cursor: default;
+            user-select: none;
         }
-        .mode-btn {
-            background: transparent; border: none; color: var(--text-secondary);
-            padding: 8px 14px; font-family: inherit; font-size: 0.8em;
-            font-weight: bold; cursor: pointer; display: flex; align-items: center;
-            gap: 6px; transition: all 0.2s; min-height: 42px;
-        }
-        .mode-btn.active { background: var(--bg-elevated); color: var(--text-primary); }
-        .mode-btn#btnLiveMode.active {
-            color: var(--terminal-green); box-shadow: inset 0 -2px 0 #22c55e;
-        }
-        .mode-btn#btnPaperMode.active {
-            color: var(--accent-blue); box-shadow: inset 0 -2px 0 #60a5fa;
-        }
+        .exec-badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+        .exec-badge .dot.paper { background: #60a5fa; }
+        .exec-badge .dot.live  { background: #ef4444; }
+        .exec-badge.is-paper { color: var(--accent-blue); border-color: #2563eb; }
+        .exec-badge.is-live  { color: #ef4444; border-color: #ef4444;
+                               background: rgba(239,68,68,0.10); }
         .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
         .dot.live { background: var(--accent-green); }
         .dot.paper { background: #60a5fa; }
@@ -2051,10 +2061,7 @@ def _style():
             .winner-actions { flex-direction: column; gap: 8px; }
             .toggle-board { width: 100%; margin-top: 0; padding: 11px; font-size: 0.85em; }
             .trade-header { flex-direction: column; align-items: stretch; gap: 8px; }
-            .mode-control-wrap { width: 100%; }
-            .mode-btn-group { width: 100%; display: flex; }
-            .mode-btn { flex: 1; justify-content: center; padding: 11px 6px; font-size: 0.82em; min-height: 44px; }
-            .live-standby-banner { flex-direction: column; align-items: flex-start; gap: 6px; padding: 10px; }
+            .mode-control-wrap { width: 100%; }            .live-standby-banner { flex-direction: column; align-items: flex-start; gap: 6px; padding: 10px; }
             .chart-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
             .ctrl-group select, .ctrl-group input[type="date"] {
                 width: 100%; font-size: 16px; height: 46px; padding: 0 8px;
@@ -2545,6 +2552,7 @@ CHART_JS = """
         if (running) {
             sw.style.display = '';
             if (liveBtn) liveBtn.style.display = 'none';
+            sw.title = 'Running. Stop first - then START PAPER or START LIVE appears.';
             sw.classList.toggle('stopped', false);
             sw.classList.toggle('live', isLive);
             lbl.textContent = isLive ? '■ STOP LIVE' : '■ STOP';
@@ -2559,7 +2567,9 @@ CHART_JS = """
             hint.textContent = running
                 ? ('framework ' + ctrlState.framework + ' · engine every 60s'
                    + (isLive ? ' · LIVE' : ' · paper'))
-                : ('framework ' + ctrlState.framework + ' · switch framework below');
+                : ('framework ' + ctrlState.framework + ' · stopped'
+                   + (ctrlState.position && ctrlState.position.symbol
+                      ? ' · position open' : ''));
         }
     }
 
@@ -2571,17 +2581,28 @@ CHART_JS = """
     }
 
     function paintExec() {
-        // The executor is a fact from the control file, never a UI preference.
+        // The executor is a FACT from the control file. It is rendered as a
+        // badge, never as a switch - there is nothing here to click, and it
+        // should not look like there is.
         var isLive = (ctrlState.exec === 'LIVE');
-        var bp = document.getElementById('btnPaperMode');
-        var bl = document.getElementById('btnLiveMode');
-        if (bp) { bp.classList.toggle('active', !isLive); }
-        if (bl) { bl.classList.toggle('active', isLive); }
-        document.body.classList.toggle('live-armed', isLive);
-        var badge = document.getElementById('liveBadge');
+        var badge = document.getElementById('execBadge');
+        var label = document.getElementById('execLabel');
+        var dot = document.getElementById('execDot');
         if (badge) {
-            badge.innerHTML = isLive
-                ? '<span class="live-badge">\u25CF LIVE \u00b7 REAL MONEY</span>'
+            badge.classList.toggle('is-live', isLive);
+            badge.classList.toggle('is-paper', !isLive);
+        }
+        if (label) {
+            label.textContent = isLive ? 'EXECUTOR: LIVE' : 'EXECUTOR: PAPER';
+        }
+        if (dot) {
+            dot.className = 'dot ' + (isLive ? 'live' : 'paper');
+        }
+        document.body.classList.toggle('live-armed', isLive);
+        var lb = document.getElementById('liveBadge');
+        if (lb) {
+            lb.innerHTML = isLive
+                ? '<span class="live-badge">\u25CF LIVE \u00B7 REAL MONEY</span>'
                 : '';
         }
     }
