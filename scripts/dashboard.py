@@ -2798,11 +2798,16 @@ CHART_JS = """
         var blocked = ctrlState.blocked && ctrlState.blocked.reason;
         var thisOneRuns = running && (isLive === wantLive);
 
-        // the page carries the live treatment regardless of which tab is open
-        document.body.classList.toggle('live-armed', isLive);
+        // "LIVE - REAL MONEY" appears only when live is ARMED AND RUNNING.
+        // The control file keeps exec=LIVE after a stop (that is deliberate: it
+        // records what you were last doing), so warning on the flag alone left
+        // the pill on screen while viewing the paper ledger with nothing armed.
+        // A warning that never turns off stops being a warning.
+        var liveActive = isLive && running;
+        document.body.classList.toggle('live-armed', liveActive);
         var lb = document.getElementById('liveBadge');
         if (lb) {
-            lb.innerHTML = isLive
+            lb.innerHTML = liveActive
                 ? '<span class="live-badge">\u25CF LIVE \u00B7 REAL MONEY</span>' : '';
         }
 
@@ -4369,11 +4374,33 @@ async def api_control_start_live(request: Request):
 
 @app.post("/api/control/start")
 async def api_control_start():
-    """Resume hunting: re-enable the engine job and set mode RUNNING."""
-    from control import MODE_RUNNING, set_mode
-    set_mode(MODE_RUNNING, by="dashboard")
+    """Start the PAPER engine.
+
+    This ALWAYS sets the executor to PAPER, and that is a security fix, not a
+    convenience. It used to only set mode=RUNNING and leave `exec` untouched -
+    so on a box armed LIVE, pressing START PAPER produced RUNNING + LIVE: real
+    orders, started from the paper button, with no confirmation and no typed
+    word. The button said PAPER and the bot spent real money.
+
+    set_mode() refuses to change the executor unless the engine is STOPPED, so
+    this can only ever be a transition from stopped to running.
+    """
+    from control import MODE_RUNNING, EXEC_PAPER, set_mode, load_control
+
+    ctrl = load_control()
+    if ctrl.get("mode") == "RUNNING" and ctrl.get("exec") == "LIVE":
+        return JSONResponse(
+            {"ok": False,
+             "error": "a LIVE engine is running - stop it before starting paper"},
+            status_code=409)
+
+    try:
+        set_mode(MODE_RUNNING, by="dashboard", exec_mode=EXEC_PAPER)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
     cron_ok, cron_detail = _run_cron("resume")
-    return {"ok": True, "mode": MODE_RUNNING,
+    return {"ok": True, "mode": MODE_RUNNING, "exec": EXEC_PAPER,
             "cron_ok": cron_ok, "cron_detail": cron_detail}
 
 

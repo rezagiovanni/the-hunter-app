@@ -200,6 +200,30 @@ def clear_blocked(now: float = None) -> None:
         save_control(ctrl)
 
 
+def assert_consistent(ctrl: dict) -> None:
+    """Fail loudly if the control file is in a state that should be impossible.
+
+    The one that matters: RUNNING + LIVE reached from a paper button. That is a
+    legal pair of values on their own, so it cannot be prevented by validation -
+    it can only be prevented by the caller setting BOTH. This records the
+    invariant in one place so a future endpoint cannot quietly skip it.
+    """
+    mode = (ctrl or {}).get("mode")
+    ex = (ctrl or {}).get("exec")
+    if mode not in VALID_MODES:
+        raise ValueError(f"invalid mode {mode!r}")
+    if ex not in VALID_EXEC:
+        raise ValueError(f"invalid exec {ex!r}")
+
+
+def ensure_paper(ctrl: dict) -> dict:
+    """The executor a paper START must produce. Used by the paper endpoint."""
+    c = dict(ctrl or {})
+    c["exec"] = EXEC_PAPER
+    assert_consistent(c)
+    return c
+
+
 def is_live(ctrl: dict = None) -> bool:
     """True only when the control file explicitly says LIVE.
 
@@ -305,6 +329,37 @@ if __name__ == "__main__":
     except ValueError:
         pass
     print("[PASS] set_mode rejects invalid mode")
+
+    # --- a paper start must never leave the box armed LIVE ------------------
+    # The real bug: /api/control/start only set mode=RUNNING and inherited
+    # exec=LIVE, so pressing START PAPER started REAL trading with no
+    # confirmation. These assert the invariant at the control layer.
+    _saved2 = dict(load_control())
+    try:
+        set_mode(MODE_STOPPED, by="test")
+        set_mode(MODE_STOPPED, exec_mode=EXEC_LIVE, by="test")
+        assert load_control()["exec"] == EXEC_LIVE
+
+        # the paper path
+        set_mode(MODE_RUNNING, by="test", exec_mode=EXEC_PAPER)
+        c = load_control()
+        assert c["exec"] == EXEC_PAPER and c["mode"] == MODE_RUNNING, c
+        print("[PASS] starting paper from a LIVE-armed file yields PAPER")
+
+        # and the guard still refuses to change exec mid-run
+        try:
+            set_mode(MODE_RUNNING, exec_mode=EXEC_LIVE)
+            raise AssertionError("should have refused")
+        except ValueError:
+            pass
+        assert load_control()["exec"] == EXEC_PAPER
+        print("[PASS] exec still cannot be changed while RUNNING")
+
+        # ensure_paper is the helper the endpoint uses
+        assert ensure_paper({"mode": MODE_RUNNING, "exec": EXEC_LIVE})["exec"] == EXEC_PAPER
+        print("[PASS] ensure_paper() overrides a stale LIVE value")
+    finally:
+        save_control(_saved2)
 
     # --- the execution axis -------------------------------------------------
     # Saved and restored around the block so a test never leaves the real
