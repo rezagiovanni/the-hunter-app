@@ -80,26 +80,69 @@ def _redact(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_credentials(path: Optional[str] = None) -> Tuple[str, str]:
-    """Read a two-line key/secret file.
+    """Read the Indodax key and secret.
 
-    Returns (api_key, secret). Raises LiveApiError with a message that never
-    contains either value.
+    There is ONE source of truth, and it is config.yaml under `api:`. That is
+    what `hunter setup` writes, what `onboarding.has_credentials()` checks, and
+    what the rest of the app treats as "configured". An earlier version of this
+    module read a separate two-line indodax_api.txt, which meant a user could
+    finish setup, see "keys saved", and still be told "no credentials" by every
+    live action. A second credential store is a bug factory: it cannot be kept
+    in sync and it makes "configured" mean two different things.
 
-    The file is deliberately a plain two-line file rather than config.yaml so a
-    backup of config.yaml can be shared without leaking trading credentials,
-    and so the installer can leave both files out of the release tree.
+    A two-line file is still accepted if it is pointed at explicitly (HUNTER_API_KEY_FILE
+    or an argument), because that is useful for tests and for a secrets manager
+    that mounts a file. It is never preferred over config.yaml.
     """
-    if path is None:
-        path = os.environ.get("HUNTER_API_KEY_FILE")
-    if path is None:
-        from paths import config_root            # local import: avoids a cycle
-        path = os.path.join(str(config_root()), "indodax_api.txt")
+    explicit = path or os.environ.get("HUNTER_API_KEY_FILE")
 
+    if explicit:
+        return _load_two_line_file(explicit)
+
+    # --- primary: config.yaml, the same file onboarding writes ---------------
+    try:
+        import config as cfgmod
+        cfg_path = cfgmod.config_path()
+    except Exception as e:                                   # noqa: BLE001
+        raise LiveApiError(f"cannot locate config.yaml: {e}")
+
+    if not os.path.exists(cfg_path):
+        raise LiveApiError(
+            f"no credentials yet\n"
+            f"  expected: {cfg_path}\n"
+            f"  run:      hunter setup")
+
+    try:
+        import yaml
+        with open(cfg_path) as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception as e:                                   # noqa: BLE001
+        raise LiveApiError(f"cannot read {cfg_path}: {type(e).__name__}")
+
+    api = data.get("api") or {}
+    key = str(api.get("key") or "").strip()
+    secret = str(api.get("secret") or "").strip()
+
+    if not key or not secret:
+        raise LiveApiError(
+            f"no API key in {cfg_path}\n"
+            f"  run: hunter setup\n"
+            f"  then enable Trade permission on the key in the Indodax API settings")
+
+    if len(key) < 20 or len(secret) < 20:
+        raise LiveApiError(
+            f"the key or secret in {cfg_path} looks too short "
+            f"({len(key)} and {len(secret)} characters)")
+
+    return key, secret
+
+
+def _load_two_line_file(path: str) -> Tuple[str, str]:
+    """Two-line key/secret file: line 1 key, line 2 secret. Explicit use only."""
     path = os.path.expanduser(str(path))
     if not os.path.exists(path):
         raise LiveApiError(
-            f"no API credentials at {path}. Create it with the Indodax API key "
-            f"on line 1 and the secret on line 2.")
+            f"no API credentials at {path}. One line key, one line secret.")
     try:
         lines = [ln.strip() for ln in open(path).read().splitlines() if ln.strip()]
     except OSError as e:
@@ -115,16 +158,6 @@ def load_credentials(path: Optional[str] = None) -> Tuple[str, str]:
         raise LiveApiError(
             f"{path}: the key or secret looks too short "
             f"({len(key)} and {len(secret)} characters).")
-
-    # readability of the key file matters: an accidentally world-readable file
-    # with trading permissions is a real risk on a shared machine
-    try:
-        mode = os.stat(path).st_mode & 0o777
-        if mode & 0o077:
-            pass                                  # reported by preflight, not fatal
-    except OSError:
-        pass
-
     return key, secret
 
 
@@ -403,6 +436,35 @@ def _self_check():
     except LiveApiError as e:
         assert "/nonexistent/path/xyz" in str(e)
     print("[PASS] a missing credential file names the path and nothing else")
+
+    # --- ONE source of truth: config.yaml, the file hunts setup writes -------
+    # A user who runs `hunter setup` must not then be told there are no
+    # credentials by a live action. That bug existed because this module read a
+    # separate file that nothing else knew about.
+    import tempfile as _tf, yaml as _yaml
+    _d = _tf.mkdtemp()
+    _cfg = os.path.join(_d, "config.yaml")
+    with open(_cfg, "w") as _f:
+        _yaml.dump({"api": {"key": "k" * 40, "secret": "s" * 60}}, _f)
+    import config as _cfgmod
+    _orig = _cfgmod.config_path
+    try:
+        _cfgmod.config_path = lambda: _cfg
+        _k, _s = load_credentials()
+        assert _k == "k" * 40 and _s == "s" * 60, (_k[:4], _s[:4])
+        print("[PASS] credentials are read from config.yaml (the hunter setup file)")
+
+        # a config with no api block names the command to fix it
+        with open(_cfg, "w") as _f:
+            _yaml.dump({"trading": {"sizing_fraction": 0.4}}, _f)
+        try:
+            load_credentials()
+            raise AssertionError("should have raised")
+        except LiveApiError as e:
+            assert "hunter setup" in str(e), str(e)
+        print("[PASS] a config with no key tells the user to run 'hunter setup'")
+    finally:
+        _cfgmod.config_path = _orig
 
     # redaction
     assert "hunter_secret_value" not in _redact("failed secret hunter_secret_value")
