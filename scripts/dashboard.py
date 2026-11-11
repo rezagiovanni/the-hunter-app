@@ -1384,6 +1384,9 @@ def _style():
            choice is stored in localStorage and re-applied before first paint,
            so there is no flash of the wrong theme. */
         /* ---- Appearance: theme switch ---- */
+        /* amber for "you missed this" values, distinct from green/red */
+        .kv .v.warn { color: var(--warn); }
+
         .theme-row {
             display: flex; align-items: center; justify-content: space-between;
             gap: 16px; flex-wrap: wrap;
@@ -3002,6 +3005,28 @@ CHART_JS = """
         if (d.stop_trigger_price) add('Stop', Number(d.stop_trigger_price).toLocaleString('en-US'));
         add('Ticks', (d.ticks || []).length);
 
+        // How long until price reached +5% above entry. Measured from the 15m
+        // candles, because the tick log ends at exit and cannot see anything
+        // after the bot sold - which is exactly the interesting part.
+        if (d.t5) {
+            const t5 = d.t5;
+            if (t5.reached) {
+                const mins = Math.round((t5.duration_s || 0) / 60);
+                const dur = mins >= 60
+                    ? Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm'
+                    : mins + 'm';
+                const cls = t5.during_hold ? 'pos' : 'warn';
+                const label = t5.during_hold ? 'during hold' : 'after exit';
+                const extra = (!t5.during_hold && t5.after_exit_s != null)
+                    ? ' (+' + Math.round(t5.after_exit_s / 60) + 'm late)'
+                    : '';
+                add('Time to +5%', dur + '  ' + label + extra, cls);
+            } else {
+                const peak = t5.last_high_pct != null ? 'peak ' + t5.last_high_pct.toFixed(2) + '%' : '';
+                add('Time to +5%', 'never — ' + peak, 'neg');
+            }
+        }
+
         const pnl = d.net_pnl_pct;
         if (pnl != null) {
             const s = pnl >= 0 ? '+' : '';
@@ -3371,6 +3396,79 @@ def _tf_options():
     return "".join(options)
 
 
+def _first_touch(symbol: str, entry_ts: float, entry_price: float,
+                 pct: float, exit_ts: float = None,
+                 lookahead_s: float = 24 * 3600):
+    """When did `symbol` first reach entry_price * (1 + pct) at or after entry?
+
+    Read from the stored 15m candles, which continue past the trade, so this can
+    answer questions the tick log cannot: the tick log ENDS at exit, so anything
+    that happened after the bot sold has no tick row at all.
+
+    Accuracy is one candle (15m): the high of a bar is the best resolution we
+    store. The bar CONTAINING entry is excluded - its high may have printed
+    before the entry - so a hit is never credited to a candle that started
+    earlier than the position did.
+
+    Returns a dict:
+        reached        True if the price met the level at any point after entry
+        at_ts          the candle timestamp that first met it
+        duration_s     entry -> that candle
+        during_hold    reached at or before exit (only if exit_ts is given)
+        after_exit_s   seconds after exit (None if during hold or no exit_ts)
+        last_high      highest high seen after entry, for context
+    """
+    path = OHLCV_DIR / f"{symbol.upper()}.csv"
+    if not path.exists() or not entry_price:
+        return {"reached": False, "reason": "no candles for this pair"}
+
+    level = entry_price * (1.0 + pct)
+    # A hit four days after the bot sold is not actionable, and would make the
+    # "peak" figure meaningless. Bound the look-ahead: from entry while holding,
+    # then a fixed window after exit.
+    horizon_end = (float(exit_ts) + lookahead_s) if exit_ts else (entry_ts + lookahead_s)
+    reached_ts = None
+    last_high = 0.0
+    try:
+        with open(path, newline="") as fh:
+            for line in fh:
+                parts = line.strip().split(",")
+                if not parts or parts[0] == "timestamp":
+                    continue
+                try:
+                    ts = int(parts[0])
+                    high = float(parts[2])
+                except (ValueError, IndexError):
+                    continue
+                if ts < entry_ts or ts > horizon_end:
+                    continue
+                if high > last_high:
+                    last_high = high
+                if reached_ts is None and high >= level:
+                    reached_ts = ts
+    except OSError:
+        return {"reached": False, "reason": "cannot read candles"}
+
+    out = {
+        "reached": reached_ts is not None,
+        "level": round(level, 8),
+        "pct": pct,
+        "at_ts": reached_ts,
+        "last_high": last_high,
+        "last_high_pct": (round((last_high - entry_price) / entry_price * 100, 4)
+                          if last_high else None),
+        "horizon_end": int(horizon_end),
+        "lookahead_h": round(lookahead_s / 3600, 1),
+    }
+    if reached_ts is not None:
+        out["duration_s"] = int(reached_ts - entry_ts)
+        if exit_ts:
+            out["during_hold"] = reached_ts <= exit_ts
+            out["after_exit_s"] = (int(reached_ts - exit_ts)
+                                   if reached_ts > exit_ts else None)
+    return out
+
+
 @app.get("/api/hunt/{hunt_id}")
 async def api_hunt(hunt_id: str):
     """
@@ -3425,6 +3523,8 @@ async def api_hunt(hunt_id: str):
     coins = (trade or {}).get("quantity")
     target = ticks[0].get("target") if ticks else None
     stop = ticks[0].get("stop") if ticks else None
+    _entry_ts = (ticks[0].get("t") if ticks
+                 else (trade or {}).get("entry_time"))
 
     return JSONResponse({
         "hunt_id": hid,
@@ -3441,6 +3541,17 @@ async def api_hunt(hunt_id: str):
         # every recorded tick: t, last, bid, ask, pct  (pct = gross % from entry)
         "ticks": [{k: r.get(k) for k in ("t", "last", "bid", "ask", "pct")}
                   for r in ticks],
+        # How long until price reached +5% above entry, from the 15m candles (the
+        # tick log STOPS at exit, so it cannot answer this once the bot has sold).
+        # Reported whether or not the trade hit its own TP: the point is to expose
+        # targets the bot abandoned early.
+        "t5": _first_touch(
+            symbol,
+            float(_entry_ts) if _entry_ts else 0.0,
+            float(entry_price or 0),
+            0.05,
+            (trade or {}).get("exit_time"),
+        ),
     })
 
 
