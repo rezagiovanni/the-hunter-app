@@ -482,9 +482,22 @@ def handle_holding(state: dict, now: float) -> str:
             fee_pct = None                                # taker fee
             reason = EXIT_BE_RATCHET
         else:
-            # Market sell: the trigger is -4% but the fill lands lower.
-            # Apply the measured gap-through rather than pretending -4%.
-            exit_price = pos["entry_price"] * (1.0 - STOP_PCT - STOP_SLIP_FRACTION)
+            # Market sell: the position was TRIGGERED at its own stop level and
+            # the fill lands lower. Price off the stored trigger, never off the
+            # current STOP_PCT constant.
+            #
+            # This used to read  entry * (1 - STOP_PCT - SLIP)  which silently
+            # re-derived the stop from whatever framework was active NOW. A
+            # position opened under A (-4%) that lived through a switch to C
+            # (-10%) recorded its loss as -10%, and one opened under C and
+            # stopped after a switch to A recorded -4%. The trigger level is a
+            # property of the POSITION - it was written into exit_levels at
+            # entry and the ratchet may have moved it since. In live mode the
+            # same mistake would place the sell at the wrong price with real
+            # money on it.
+            trigger = float(levels.get("stop_trigger_price")
+                            or pos["entry_price"] * (1.0 - float(levels.get("stop_pct", STOP_PCT))))
+            exit_price = trigger * (1.0 - STOP_SLIP_FRACTION)
             fee_pct = None                                # use position taker fee
             reason = EXIT_HARD_SL
 
@@ -656,6 +669,19 @@ def tick(now: Optional[float] = None) -> dict:
             return {"status": "STOPPED",
                     "message": f"{dt_str}  [STOPPED] Hunting stopped by user."}
 
+        # --- executor guard -------------------------------------------------
+        # The dashboard can arm LIVE, but this engine has no live execution path
+        # in this build (executor_live is used by the dashboard's own actions).
+        # Refusing loudly is the only honest option: silently paper-trading while
+        # the UI says LIVE would mean the operator watches simulated fills and
+        # believes real money is at work - or worse, the reverse.
+        if ctrl.get("exec") == "LIVE":
+            return {"status": "EXECUTOR_UNAVAILABLE",
+                    "message": (f"{dt_str}  [BLOCKED] LIVE is armed but this engine "
+                                f"cannot place live orders in this build. Set the "
+                                f"executor back to PAPER, or wait for the live "
+                                f"engine release.")}
+
         state = load_state()
 
         if ctrl["mode"] == MODE_STOPPING:
@@ -817,6 +843,52 @@ def run_self_checks():
     print(f"[PASS] STOP path: trigger at {lv2['stop_trigger_price']}, "
           f"fill modelled at {expected_stop_fill:.2f} "
           f"(-{STOP_PCT*100:.0f}% less {STOP_SLIP_FRACTION*100:.2f}% measured slippage)")
+
+    # --- the stop must price off the POSITION, not the active framework ------
+    # This drives handle_holding() end to end, with the ticker stubbed, because
+    # the bug lived in that function's exit branch - not in execute_paper_sell.
+    # A test that calls the executor directly passes with the bug present and is
+    # therefore worthless.
+    #
+    # Scenario: a position opened under C (-10% stop, trigger 900) while the
+    # ACTIVE framework is A (-4%). Only the stored trigger gives -10%.
+    _orig_ticker = globals()["fetch_live_ticker"]
+    try:
+        def _stub_ticker(pair_id, depth_fallback=None):
+            return {"last": 899.0, "buy": 899.0, "sell": 901.0}
+
+        globals()["fetch_live_ticker"] = _stub_ticker
+        _st = {
+            "phase": "HOLDING",
+            "balance_idr": 100000.0,
+            "order": None,
+            "cooldowns": {},
+            "trade_log": [],
+            "position": {
+                "hunt_id": "H-STOPX", "symbol": "TESTIDR", "pair_id": "testidr",
+                "entry_price": 1000.0, "coins": 10.0, "entry_time": now,
+                "fees_paid_idr": 30.0,
+                "maker_fee_pct": 0.1, "taker_fee_pct": 0.3,
+                "framework": "C", "framework_version": "1",
+                "exit_levels": {
+                    "target_price": 1050.0, "stop_trigger_price": 900.0,
+                    "stop_pct": 0.10, "target_pct": 0.05,
+                    "ratchet_stop_price": 997.0, "ratchet_armed": False,
+                },
+            },
+        }
+        _msg = handle_holding(_st, now=now)
+        _rec = _st["trade_log"][-1]
+        # 900 * (1 - 0.0094) = 891.54 ; a -4% reconstruction would give ~954.
+        assert abs(_rec["exit_price"] - 900.0 * (1.0 - STOP_SLIP_FRACTION)) < 0.01, \
+            f"exit priced off the constant, not the position: {_rec['exit_price']}"
+        assert _rec["stop_pct"] == 0.10 and _rec["framework"] == "C", _rec
+        assert _rec["net_pnl_pct"] < -10.0, _rec["net_pnl_pct"]
+        print(f"[PASS] a C (-10%) position stops on ITS OWN trigger: exit "
+              f"{_rec['exit_price']:.2f}, {_rec['net_pnl_pct']:+.2f}% - not -4%")
+    finally:
+        globals()["fetch_live_ticker"] = _orig_ticker
+
 
     # Step G: The Breakeven Ratchet path
     lv_ratchet = initialize_exit_levels(1000.0, 1.0)

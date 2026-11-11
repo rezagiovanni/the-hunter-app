@@ -49,6 +49,19 @@ MODE_STOPPED = "STOPPED"
 
 VALID_MODES = (MODE_RUNNING, MODE_STOPPING, MODE_STOPPED)
 
+# ---------------------------------------------------------------------------
+# Execution axis - WHICH executor places the order
+# ---------------------------------------------------------------------------
+# Deliberately a SECOND axis, independent of mode. "RUNNING" alone does not say
+# whether the bot is spending simulated money or real money. A control file that
+# cannot tell those apart is one bad default away from trading live by accident,
+# so every money-touching code path reads this explicitly instead of inferring.
+EXEC_PAPER = "PAPER"
+EXEC_LIVE = "LIVE"
+VALID_EXEC = (EXEC_PAPER, EXEC_LIVE)
+
+DEFAULT_EXEC = EXEC_PAPER
+
 DEFAULT_FRAMEWORK = "A"
 
 
@@ -58,6 +71,7 @@ DEFAULT_FRAMEWORK = "A"
 def _default_control() -> dict:
     return {
         "mode": MODE_RUNNING,
+        "exec": DEFAULT_EXEC,
         "framework": DEFAULT_FRAMEWORK,
         "changed_at": None,
         "changed_by": None,
@@ -89,6 +103,14 @@ def load_control() -> dict:
         ctrl.update(data)
     if ctrl.get("mode") not in VALID_MODES:
         ctrl["mode"] = MODE_RUNNING
+
+    # The execution axis fails SAFE, unlike mode. A control file written by an
+    # older version has no "exec" key at all; treating that as LIVE would arm
+    # real trading because of a missing field. Anything unrecognised - absent,
+    # misspelled, hand-edited to "REAL" - resolves to PAPER.
+    if ctrl.get("exec") not in VALID_EXEC:
+        ctrl["exec"] = EXEC_PAPER
+
     if not ctrl.get("framework"):
         ctrl["framework"] = DEFAULT_FRAMEWORK
     return ctrl
@@ -118,14 +140,31 @@ def save_control(ctrl: dict) -> None:
 # Convenience helpers
 # ---------------------------------------------------------------------------
 def set_mode(mode: str, by: str = "dashboard", framework: str = None,
-             now: float = None) -> dict:
-    """Set the control mode (and optionally the framework) and persist it."""
+             now: float = None, exec_mode: str = None) -> dict:
+    """Set the control mode (and optionally the execution mode / framework).
+
+    exec_mode is the SECOND axis. It is only meaningful to change it while
+    STOPPED, so switching executor mid-trade is impossible by construction
+    rather than by remembering to check. The engine refuses to start in a mode
+    that does not match its executor, and this refuses to change executor while
+    RUNNING.
+    """
     if mode not in VALID_MODES:
         raise ValueError(f"invalid mode {mode!r}; expected one of {VALID_MODES}")
+    if exec_mode is not None and exec_mode not in VALID_EXEC:
+        raise ValueError(f"invalid exec {exec_mode!r}; expected one of {VALID_EXEC}")
     if now is None:
         now = time.time()
 
     ctrl = load_control()
+
+    if exec_mode is not None and exec_mode != ctrl.get("exec"):
+        if ctrl.get("mode") != MODE_STOPPED:
+            raise ValueError(
+                "the execution mode can only change while STOPPED - "
+                "stop the engine first so no position is mid-trade")
+        ctrl["exec"] = exec_mode
+
     ctrl["mode"] = mode
     ctrl["changed_at"] = now
     ctrl["changed_by"] = by
@@ -133,6 +172,16 @@ def set_mode(mode: str, by: str = "dashboard", framework: str = None,
         ctrl["framework"] = framework
     save_control(ctrl)
     return ctrl
+
+
+def is_live(ctrl: dict = None) -> bool:
+    """True only when the control file explicitly says LIVE.
+
+    Deliberately strict: anything else, including a corrupt or absent file,
+    is paper. This is the one predicate that decides whether money moves.
+    """
+    c = load_control() if ctrl is None else ctrl
+    return c.get("exec") == EXEC_LIVE
 
 
 def set_framework(name: str, by: str = "dashboard", now: float = None) -> dict:
@@ -230,6 +279,63 @@ if __name__ == "__main__":
     except ValueError:
         pass
     print("[PASS] set_mode rejects invalid mode")
+
+    # --- the execution axis -------------------------------------------------
+    # Saved and restored around the block so a test never leaves the real
+    # control file on LIVE.
+    _saved = dict(load_control())
+    try:
+        set_mode(MODE_STOPPED)
+        r = set_mode(MODE_STOPPED, exec_mode=EXEC_LIVE)
+        assert r["exec"] == EXEC_LIVE, r
+        assert is_live() is True
+        r = set_mode(MODE_STOPPED, exec_mode=EXEC_PAPER)
+        assert r["exec"] == EXEC_PAPER and is_live() is False
+        print("[PASS] exec survives a round-trip (PAPER <-> LIVE) while stopped")
+
+        # changing executor while RUNNING is refused
+        set_mode(MODE_RUNNING, exec_mode=EXEC_PAPER)
+        try:
+            set_mode(MODE_RUNNING, exec_mode=EXEC_LIVE)
+            raise AssertionError("should have refused to arm LIVE while running")
+        except ValueError as e:
+            assert "STOPPED" in str(e), e
+        assert is_live() is False, "a refused switch must not half-apply"
+        print("[PASS] arming LIVE while RUNNING is refused, and leaves PAPER")
+
+        # an unknown exec value is rejected outright
+        try:
+            set_mode(MODE_STOPPED, exec_mode="REAL")
+            raise AssertionError("should have rejected exec='REAL'")
+        except ValueError as e:
+            assert "exec" in str(e)
+        print("[PASS] an unknown execution mode is rejected")
+
+        # FAIL-SAFE: a control file with no exec key is PAPER, never LIVE
+        import json as _json
+        with open(CONTROL_FILE, "w") as _f:
+            _json.dump({"mode": MODE_STOPPED, "framework": "A"}, _f)
+        c = load_control()
+        assert c["exec"] == EXEC_PAPER, c
+        assert is_live() is False
+        print("[PASS] a control file with no exec key resolves to PAPER")
+
+        # FAIL-SAFE: a corrupt exec value resolves to PAPER
+        for _bad in ("LIVE ", "live", "LIVEX", 1, None, ["LIVE"]):
+            with open(CONTROL_FILE, "w") as _f:
+                _json.dump({"mode": MODE_STOPPED, "exec": _bad}, _f)
+            c = load_control()
+            assert c["exec"] == EXEC_PAPER, f"{_bad!r} -> {c['exec']}"
+        print("[PASS] any unrecognised exec value resolves to PAPER, including 'live'")
+
+        # a missing file is PAPER
+        import os as _os
+        _os.remove(CONTROL_FILE)
+        assert load_control()["exec"] == EXEC_PAPER
+        assert is_live() is False
+        print("[PASS] a missing control file is PAPER")
+    finally:
+        save_control(_saved)
 
     # 9. Live control file untouched
     assert CONTROL_FILE != _LIVE_CONTROL, "sandbox escaped into the live path"

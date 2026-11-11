@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -858,23 +858,42 @@ def _trading_log_section(state: dict) -> str:
                 <div class="trade-sub">{status_badge} {status_detail}</div>
             </div>
             <div class="mode-control-wrap">
-                <div class="mode-btn-group">
-                    <button class="mode-btn active" id="btnPaperMode" type="button" onclick="setTradingMode('paper')">
-                        <span class="dot paper"></span> PAPER MODE
+                <!-- These were previously view toggles that only swapped which
+                     trade TABLE was displayed, while looking exactly like a
+                     paper/live switch. That is the most dangerous UI the app
+                     could have: an operator could believe they were on paper
+                     while real orders were live, or vice versa. The executor is
+                     now shown from the control file, and changing it requires
+                     STOPPED plus a typed confirmation. -->
+                <div class="mode-btn-group" id="execGroup">
+                    <button class="mode-btn active" id="btnPaperMode" type="button" disabled>
+                        <span class="dot paper"></span> PAPER
                     </button>
-                    <button class="mode-btn" id="btnLiveMode" type="button" onclick="setTradingMode('live')">
-                        <span class="dot live"></span> LIVE MODE
+                    <button class="mode-btn" id="btnLiveMode" type="button" disabled>
+                        <span class="dot live"></span> LIVE
                     </button>
                 </div>
             </div>
         </div>
 
-        <!-- Hunt control: START / STOP -->
-        <div class="ctrl-wrap">
+        <!-- Hunt control.
+             STOPPED shows two START buttons: paper and live. They are separate
+             elements with separate endpoints rather than one button with a
+             flag, because a flag can be wrong - a stale config, a leftover
+             value, a typo - and the consequence of reading it wrong is that
+             real money trades. A separate endpoint cannot be reached by
+             accident. While RUNNING only STOP is offered, labelled with what is
+             actually running. -->
+        <div class="ctrl-wrap" id="ctrlWrap">
             <button class="ctrl-switch" id="ctrlSwitch" type="button" onclick="onControlSwitch()">
                 <span class="led"></span><span id="ctrlLabel">● HUNTING</span>
             </button>
+            <button class="ctrl-switch ctrl-live" id="ctrlStartLive" type="button"
+                    style="display:none" onclick="onStartLive()">
+                <span class="led"></span> START LIVE
+            </button>
             <span id="ctrlHint" style="font-size:0.72em; color:#6b7280;"></span>
+            <span id="liveBadge"></span>
         </div>
 
         <!-- Paper Mode Trade Log (DEFAULT view while paper validation is active) -->
@@ -1436,6 +1455,40 @@ def _style():
 
         /* Control plane: START / STOP switch + framework picker */
         .ctrl-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+        /* ---- LIVE execution ----------------------------------------------
+           LIVE must never look like paper. A separate button colour, a red
+           banner across the top and a bordered page edge: if a screenshot of
+           this dashboard exists, "real money" should be unmissable in it. */
+        .ctrl-wrap .ctrl-switch.ctrl-live {
+            background: transparent;
+            border: 1px solid #ef4444;
+            color: #ef4444;
+        }
+        .ctrl-wrap .ctrl-switch.ctrl-live:hover { background: rgba(239,68,68,0.12); }
+        .ctrl-wrap .ctrl-switch.live {
+            background: #ef4444;
+            border-color: #ef4444;
+            color: #fff;
+        }
+        .live-badge {
+            display: inline-block;
+            margin-left: 10px;
+            padding: 2px 8px;
+            border-radius: 3px;
+            background: #ef4444;
+            color: #fff;
+            font-size: 0.68em;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            animation: livePulse 2s ease-in-out infinite;
+        }
+        @keyframes livePulse {
+            0%, 100% { opacity: 1; }
+            50%      { opacity: 0.45; }
+        }
+        body.live-armed { box-shadow: inset 0 0 0 3px #ef4444; }
+
         .ctrl-switch {
             display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
             font-family: "Courier New", Courier, monospace; font-size: 0.82em;
@@ -2469,42 +2522,6 @@ CHART_JS = """
         }
     }
 
-    function setTradingMode(mode) {
-        const btnLive = document.getElementById('btnLiveMode');
-        const btnPaper = document.getElementById('btnPaperMode');
-        const liveWrap = document.getElementById('liveTradeWrap');
-        const paperWrap = document.getElementById('paperTradeWrap');
-
-        if (mode === 'live') {
-            if (btnLive) btnLive.classList.add('active');
-            if (btnPaper) btnPaper.classList.remove('active');
-            if (liveWrap) liveWrap.style.display = 'block';
-            if (paperWrap) paperWrap.style.display = 'none';
-        } else {
-            if (btnPaper) btnPaper.classList.add('active');
-            if (btnLive) btnLive.classList.remove('active');
-            if (liveWrap) liveWrap.style.display = 'none';
-            if (paperWrap) paperWrap.style.display = 'block';
-        }
-        // Remember the choice so a reload keeps it. Paper is the default
-        // while paper validation is active, so this only records an
-        // explicit switch to Live.
-        try {
-            if (mode === 'live') {
-                localStorage.setItem('hunterTradingMode', 'live');
-            } else {
-                localStorage.removeItem('hunterTradingMode');
-            }
-        } catch (e) { /* storage blocked — markup default still applies */ }
-    }
-
-    // Default view = PAPER MODE (paper validation phase). A remembered choice
-    // wins, so switching to Live survives a reload until switched back.
-    (function restoreTradingMode() {
-        let saved = null;
-        try { saved = localStorage.getItem('hunterTradingMode'); } catch (e) {}
-        setTradingMode(saved === 'live' ? 'live' : 'paper');
-    })();
 
     // ----------------------------------------------------------------------
     // Control plane: START / STOP hunting
@@ -2517,13 +2534,31 @@ CHART_JS = """
         const hint = document.getElementById('ctrlHint');
         if (!sw || !lbl) return;
         const running = (ctrlState.mode === 'RUNNING');
-        sw.classList.toggle('stopped', !running);
-        lbl.textContent = running
-            ? '● HUNTING — CLICK TO STOP'
-            : (ctrlState.mode === 'STOPPING' ? '… STOPPING' : '● STOPPED — CLICK TO START');
+        const isLive = (ctrlState.exec === 'LIVE');
+        const liveBtn = document.getElementById('ctrlStartLive');
+
+        paintExec();
+
+        // While RUNNING there is exactly one action - STOP - and it says which
+        // executor it is stopping. While STOPPED there are two ways to start,
+        // and they are different buttons hitting different endpoints.
+        if (running) {
+            sw.style.display = '';
+            if (liveBtn) liveBtn.style.display = 'none';
+            sw.classList.toggle('stopped', false);
+            sw.classList.toggle('live', isLive);
+            lbl.textContent = isLive ? '■ STOP LIVE' : '■ STOP';
+        } else {
+            sw.style.display = '';
+            sw.classList.remove('live');
+            if (liveBtn) liveBtn.style.display = '';
+            sw.classList.toggle('stopped', true);
+            lbl.textContent = '▶ START PAPER';
+        }
         if (hint) {
             hint.textContent = running
-                ? ('framework ' + ctrlState.framework + ' · engine every 60s')
+                ? ('framework ' + ctrlState.framework + ' · engine every 60s'
+                   + (isLive ? ' · LIVE' : ' · paper'))
                 : ('framework ' + ctrlState.framework + ' · switch framework below');
         }
     }
@@ -2535,19 +2570,111 @@ CHART_JS = """
             .catch(() => {});
     }
 
+    function paintExec() {
+        // The executor is a fact from the control file, never a UI preference.
+        var isLive = (ctrlState.exec === 'LIVE');
+        var bp = document.getElementById('btnPaperMode');
+        var bl = document.getElementById('btnLiveMode');
+        if (bp) { bp.classList.toggle('active', !isLive); }
+        if (bl) { bl.classList.toggle('active', isLive); }
+        document.body.classList.toggle('live-armed', isLive);
+        var badge = document.getElementById('liveBadge');
+        if (badge) {
+            badge.innerHTML = isLive
+                ? '<span class="live-badge">\u25CF LIVE \u00b7 REAL MONEY</span>'
+                : '';
+        }
+    }
+
+    function onStartLive() {
+        // Two stages: fetch the preflight, show exactly what will happen, then
+        // require the word LIVE. A single confirm() is too easy to click through
+        // when the thing behind it spends real money.
+        var NL = String.fromCharCode(10);
+        fetch('/api/live/preflight', { cache: 'no-store' })
+            .then(function (r) { return r.json(); })
+            .then(function (pf) {
+                if (!pf.ok) {
+                    var problems = (pf.problems || []).join(NL);
+                    window.alert('Cannot arm LIVE:' + NL + NL + problems + NL + NL
+                                 + 'Fix these, then try again.');
+                    return;
+                }
+                var size = pf.trade_size_idr || 0;
+                var msg = 'ARM LIVE TRADING?' + NL + NL;
+                msg += 'Executor:  REAL ORDERS on Indodax' + NL;
+                msg += 'Per trade: IDR ' + size.toLocaleString(undefined, {maximumFractionDigits: 0}) + NL;
+                msg += 'Balance:   verified' + NL;
+                msg += 'Clock:     verified' + NL;
+                (pf.warnings || []).forEach(function (w) { msg += NL + 'WARNING: ' + w; });
+                msg += NL + NL + 'Type the word LIVE to confirm.';
+                var typed = window.prompt(msg, '');
+                if (typed === null) return;
+                if (String(typed).trim().toUpperCase() !== 'LIVE') {
+                    window.alert('Not armed: you must type LIVE exactly.');
+                    return;
+                }
+                fetch('/api/control/start-live', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({confirm: 'LIVE'})
+                })
+                .then(function (r) { return r.json().then(function (d) {
+                    return {status: r.status, d: d}; }); })
+                .then(function (res) {
+                    if (!res.d.ok) {
+                        window.alert('Not armed: ' + (res.d.error || 'unknown'));
+                        refreshControl();
+                        return;
+                    }
+                    window.alert(res.d.message || 'LIVE armed.');
+                    refreshDashboard();
+                })
+                .catch(function (e) {
+                    window.alert('Live start failed: ' + e);
+                });
+            })
+            .catch(function (e) { window.alert('Preflight failed: ' + e); });
+    }
+
+    function stopLiveWithChoice() {
+        // "C": never decide for the operator what happens to an open position.
+        var NL = String.fromCharCode(10);
+        var p = (ctrlState.position || {});
+        var label = p.symbol
+            ? (p.symbol + ' - ' + (p.coins || 0) + ' coins - entry ' + p.entry_price)
+            : 'an open position';
+        var sell = window.confirm(
+            'STOP LIVE' + NL + NL + 'There is ' + label + '.' + NL + NL
+            + 'OK     = sell it now at market, then stop' + NL
+            + 'Cancel = stop and LEAVE IT OPEN on the exchange');
+        return sell ? 'sell' : 'leave';
+    }
+
     function onControlSwitch() {
         const sw = document.getElementById('ctrlSwitch');
         const goingDown = (ctrlState.mode === 'RUNNING');
+        var stopChoice = null;
         if (goingDown) {
-            const pos = document.querySelector('tr.open-trade');
-            const warn = pos
-                ? 'STOP will market-sell the open position NOW, then pause hunting.'
-                : 'Stop and Pause Hunting?';
-            if (!window.confirm(warn)) return;
+            if (ctrlState.exec === 'LIVE') {
+                stopChoice = stopLiveWithChoice();
+                if (stopChoice === null) return;
+            } else {
+                const pos = document.querySelector('tr.open-trade');
+                const warn = pos
+                    ? 'STOP will market-sell the open position NOW, then pause hunting.'
+                    : 'Stop and Pause Hunting?';
+                if (!window.confirm(warn)) return;
+            }
         }
         if (sw) sw.classList.add('busy');
         const url = goingDown ? '/api/control/stop' : '/api/control/start';
-        fetch(url, { method: 'POST' })
+        const init = { method: 'POST' };
+        if (stopChoice) {
+            init.headers = {'Content-Type': 'application/json'};
+            init.body = JSON.stringify({position: stopChoice});
+        }
+        fetch(url, init)
             .then(r => r.json().then(d => ({ status: r.status, d })))
             .then(({ status, d }) => {
                 if (sw) sw.classList.remove('busy');
@@ -2774,12 +2901,11 @@ CHART_JS = """
         if (btn) btn.classList.add('spinning');
 
         // Remember where the user was, so the reload lands back on it.
-        let mode = 'paper';
-        try { mode = localStorage.getItem('hunterTradingMode') === 'live' ? 'live' : 'paper'; } catch (e) {}
+        // NOT the executor: that is a fact from the control file, and storing
+        // it here is what made the old view-toggle look like a real switch.
         try {
             sessionStorage.setItem('hunterRestore', JSON.stringify({
                 page: currentPage(),
-                mode: mode,
                 scrollY: window.scrollY || 0
             }));
         } catch (e) {}
@@ -2805,9 +2931,6 @@ CHART_JS = """
             switchPage('settings', false);
         } else {
             switchPage('home', false);
-        }
-        if (st.mode === 'live') {
-            setTradingMode('live');
         }
         if (st.scrollY) {
             // let layout settle before restoring scroll
@@ -3608,13 +3731,170 @@ async def api_control_get():
     from control import load_control
     from frameworks import list_frameworks
     c = load_control()
+    st = _dash_state()
     return {
         "mode": c["mode"],
+        # the executor is part of the control state, not a UI preference - the
+        # buttons paint from this and nothing else
+        "exec": c.get("exec", "PAPER"),
         "framework": c.get("framework", "A"),
         "changed_at": c.get("changed_at"),
         "changed_by": c.get("changed_by"),
+        "phase": st.get("phase"),
+        "position": _position_summary(),
         "frameworks": list_frameworks(),
     }
+
+
+def _dash_state():
+    """The engine state, or {} if it cannot be read. Never raises."""
+    try:
+        import state as _state
+        return _state.load_state() or {}
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
+def _open_position() -> bool:
+    """True if a position is currently held. Blocks arming or switching LIVE."""
+    st = _dash_state()
+    return st.get("phase") == "HOLDING" and bool(st.get("position"))
+
+
+def _open_order() -> bool:
+    """True if a resting order is working. Also blocks a live switch: the order
+    was placed by one executor and would be filled against another's accounting."""
+    st = _dash_state()
+    return st.get("phase") == "ORDER_OPEN" and bool(st.get("order"))
+
+
+def _position_summary() -> dict:
+    """The open position as the confirmation dialog needs to show it."""
+    st = _dash_state()
+    p = st.get("position") or {}
+    if not p:
+        return {}
+    try:
+        px = float(p.get("entry_price") or 0)
+        qty = float(p.get("coins") or 0)
+        return {"symbol": p.get("symbol"), "coins": qty,
+                "entry_price": px, "value_idr": round(px * qty, 2),
+                "hunt_id": p.get("hunt_id")}
+    except Exception:                                        # noqa: BLE001
+        return {"symbol": p.get("symbol")}
+
+
+def _trade_size() -> float:
+    """The IDR amount one trade would use right now, matching the engine.
+
+    Read from the same config key and sizing fraction the engine uses, so the
+    number quoted in the START LIVE confirmation is the number that will be
+    spent - not an estimate computed differently in the UI.
+    """
+    try:
+        import config as cfgmod
+        cfg = cfgmod.load_config() or {}
+        frac = float(cfg.get("trading", {}).get("sizing_fraction", 0.40))
+    except Exception:                                        # noqa: BLE001
+        frac = 0.40
+    try:
+        st = _dash_state()
+        bal = float(st.get("balance_idr") or 0)
+    except Exception:                                        # noqa: BLE001
+        bal = 0.0
+    if not bal:
+        try:
+            import executor_live
+            bal = executor_live.read_balance_idr()
+        except Exception:                                    # noqa: BLE001
+            bal = 0.0
+    return round(bal * frac, 2)
+
+
+@app.get("/api/live/preflight")
+async def api_live_preflight():
+    """Everything that must be true before START LIVE is allowed.
+
+    Read-only: it authenticates and reads balances, and places no order.
+    """
+    try:
+        import executor_live
+        import config as cfgmod
+        size = 0.0
+        try:
+            size = float((cfgmod.load_config() or {}).get("trade_size_idr") or 0)
+        except Exception:
+            pass
+        if not size:
+            try:
+                bal = executor_live.read_balance_idr()
+                size = bal * 0.40
+            except Exception:
+                size = 0.0
+        pf = executor_live.preflight(trade_size_idr=size)
+        return {"ok": pf["ok"], "checks": pf["checks"],
+                "problems": pf["problems"], "warnings": pf.get("warnings", []),
+                "trade_size_idr": size}
+    except Exception as e:                                   # noqa: BLE001
+        return {"ok": False, "checks": [], "trade_size_idr": 0.0,
+                "problems": [f"{type(e).__name__}: {str(e)[:300]}"], "warnings": []}
+
+
+@app.post("/api/control/start-live")
+async def api_control_start_live(request: Request):
+    """Arm LIVE and start hunting.
+
+    Deliberately a SEPARATE endpoint from /api/control/start. A single endpoint
+    with an {exec: "live"} body can be reached by a stale flag or a bug; this
+    one cannot. It also requires the literal word LIVE in the body, so no
+    accidental click or replayed request can arm it.
+    """
+    from control import MODE_RUNNING, EXEC_LIVE, set_mode, load_control
+    import executor_live
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if str(body.get("confirm", "")).strip().upper() != "LIVE":
+        return JSONResponse({"ok": False,
+                             "error": "type LIVE to confirm"}, status_code=400)
+
+    ctrl = load_control()
+    if ctrl.get("mode") == "RUNNING":
+        return JSONResponse({"ok": False,
+                             "error": "already running - stop first"},
+                            status_code=409)
+
+    # never arm LIVE while a position or resting order exists: the position
+    # would have been opened by a different executor than the one that closes it
+    if _open_position() or _open_order():
+        return JSONResponse({"ok": False,
+                             "error": "a position or order is open - close it before switching to LIVE"},
+                            status_code=409)
+
+    try:
+        pf = executor_live.preflight(trade_size_idr=_trade_size())
+    except Exception as e:                                   # noqa: BLE001
+        return JSONResponse({"ok": False,
+                             "error": f"preflight failed: {str(e)[:300]}"},
+                            status_code=400)
+    if not pf["ok"]:
+        return JSONResponse({"ok": False, "error": "; ".join(pf["problems"])[:500],
+                             "problems": pf["problems"]}, status_code=400)
+
+    try:
+        set_mode(MODE_RUNNING, by="dashboard", exec_mode=EXEC_LIVE)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    cron_ok, cron_detail = _run_cron("resume")
+    warn = ("; ".join(pf.get("warnings") or []))
+    return {"ok": True,
+            "message": ("LIVE trading is armed. Real orders will be placed."
+                        + (f"\n\nNote: {warn}" if warn else "")),
+            "exec": "LIVE", "cron": cron_detail}
 
 
 @app.post("/api/control/start")
@@ -3672,14 +3952,77 @@ async def api_position_sell():
 
 
 @app.post("/api/control/stop")
-async def api_control_stop():
+async def api_control_stop(request: Request):
     """
     Stop hunting: liquidate anything open, park the engine, pause the engine job.
 
     Runs scripts/run_hunter.py --stop-now as a subprocess so the stop takes
     the engine's own flock and reuses its money-math. Exit code 2 means a tick
     is in flight; the UI should retry.
+
+    LIVE stops are different in two ways, both requested explicitly:
+
+      * resting orders are CANCELLED first. An order left on the book after the
+        process stops is a position you do not know you own.
+      * an open position is not closed silently. The caller must say what to do
+        with it: sell it, or leave it open on the exchange. Guessing either way
+        is wrong - one force-sells at market, the other strands real money.
     """
+    # which executor is running decides what "stop" means
+    try:
+        from control import load_control, is_live, MODE_STOPPED, set_mode
+        ctrl = load_control()
+        live = is_live(ctrl)
+    except Exception as e:                                   # noqa: BLE001
+        return JSONResponse({"ok": False,
+                             "error": f"cannot read control: {e}"},
+                            status_code=500)
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if live and _open_position():
+        # "C": ask. The UI sends either "sell" or "leave" after the operator
+        # chooses; without one of those, refuse rather than pick for them.
+        choice = str(body.get("position") or "").strip().lower()
+        if choice not in ("sell", "leave"):
+            return JSONResponse(
+                {"ok": False, "needs_choice": True,
+                 "error": "a live position is open - choose 'sell' or 'leave'",
+                 "position": _position_summary()},
+                status_code=409)
+        if choice == "leave":
+            import control as _ctl
+            _ctl.set_mode(MODE_STOPPED, by="dashboard")
+            cron_ok, cron_detail = _run_cron("pause")
+            try:
+                import executor_live
+                exs = executor_live.cancel_all_open_orders()
+                note = (f"cancelled {len(exs['cancelled'])} order(s)"
+                        if exs["ok"] else
+                        f"WARNING: could not cancel {len(exs['failed'])} order(s)")
+            except Exception as e:                           # noqa: BLE001
+                note = f"WARNING: could not cancel open orders: {str(e)[:120]}"
+            return {"ok": True, "exec": "LIVE",
+                    "message": (f"Stopped. THE POSITION IS STILL OPEN on the "
+                                f"exchange - you must sell it yourself. {note}."),
+                    "cron": cron_detail}
+
+    cancel_note = ""
+    if live:
+        # an orphaned resting order is a position you don't know you own
+        try:
+            import executor_live
+            exs = executor_live.cancel_all_open_orders()
+            cancel_note = (f"cancelled {len(exs['cancelled'])} order(s)"
+                           if exs["ok"] else
+                           f"WARNING: {len(exs['failed'])} order(s) could not be cancelled")
+        except Exception as e:                               # noqa: BLE001
+            cancel_note = f"WARNING: cancel failed: {str(e)[:120]}"
+
     try:
         proc = subprocess.run(
             [ENGINE_PYTHON, str(STOP_SCRIPT), "--stop-now"],
@@ -3709,6 +4052,9 @@ async def api_control_stop():
         cron_ok, cron_detail = _run_cron("pause")
         result["cron_ok"] = cron_ok
         result["cron_detail"] = cron_detail
+        if cancel_note:
+            result["message"] = ((result.get("message") or "")
+                                 + f" {cancel_note}.")
     return result
 
 
