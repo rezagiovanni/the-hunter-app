@@ -65,6 +65,16 @@ DEFAULTS = {
             "ratchet_trigger_pct": 0.012,
             "ratchet_stop_pct": -0.003,
         },
+        "C": {
+            # A's entry with the exits stretched: same 0.5:1 payoff, far more
+            # noise tolerance. No ratchet, deliberately - ratcheting to
+            # breakeven at +1.2% would turn C back into A with a worse target.
+            "target_pct": 0.05,
+            "stop_pct": 0.10,
+            "ratchet_enabled": False,
+            "ratchet_trigger_pct": 0.0,
+            "ratchet_stop_pct": 0.0,
+        },
     },
     "data": {
         # Retention floor, in years. prune_data.py removes bars older than this.

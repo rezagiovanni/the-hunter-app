@@ -747,7 +747,8 @@ def _trading_log_section(state: dict) -> str:
                 f"<td class='num'>{target_txt}</td>"
                 f"<td class='num'>{coins}</td>"
                 f"{pnl_cells}"
-                f"<td style='color:#60a5fa;'>IN FLIGHT</td></tr>"
+                f"<td><button class='sell-now' type='button'"
+                f" onclick=\"sellNow('{p.get('symbol','')}', this)\">SELL NOW</button></td></tr>"
             )
         if o:
             return (
@@ -1386,6 +1387,16 @@ def _style():
         /* ---- Appearance: theme switch ---- */
         /* amber for "you missed this" values, distinct from green/red */
         .kv .v.warn { color: var(--warn); }
+
+        /* manual exit: red, because it closes a trade the engine did not intend */
+        .sell-now {
+            font-family: inherit; font-size: 11px; letter-spacing: .06em;
+            font-weight: 700; padding: 4px 10px; cursor: pointer;
+            color: #fff; background: var(--accent-red);
+            border: 1px solid var(--accent-red); border-radius: 4px;
+        }
+        .sell-now:hover { filter: brightness(1.15); }
+        .sell-now:disabled { opacity: .5; cursor: default; }
 
         .theme-row {
             display: flex; align-items: center; justify-content: space-between;
@@ -2456,42 +2467,6 @@ CHART_JS = """
                 window.scrollTo(0, Math.max(0, y));
             }
         }
-        // ---- Theme (dark/light) ----
-        // The choice lives in localStorage so it survives a reload, and is
-        // applied to <html data-theme> BEFORE first paint by an inline script in
-        // <head>, so a light-mode user never sees a flash of dark.
-        function currentTheme() {
-            try { return localStorage.getItem('hunter-theme') === 'light' ? 'light' : 'dark'; }
-            catch (e) { return 'dark'; }
-        }
-
-        function applyTheme(name) {
-            const root = document.documentElement;
-            if (name === 'light') {
-                root.setAttribute('data-theme', 'light');
-            } else {
-                root.removeAttribute('data-theme');
-            }
-            document.querySelectorAll('.theme-opt').forEach(b => {
-                b.setAttribute('aria-pressed',
-                    b.getAttribute('data-theme-opt') === name ? 'true' : 'false');
-            });
-            // the candlestick canvas paints with literal colours; redraw it so
-            // the grid and axis match the new background
-            if (typeof drawChart === 'function') {
-                try { drawChart(); } catch (e) {}
-            }
-        }
-
-        function setTheme(name) {
-            try { localStorage.setItem('hunter-theme', name); } catch (e) {}
-            applyTheme(name);
-        }
-
-        document.querySelectorAll('.theme-opt').forEach(b => {
-            b.addEventListener('click', () => setTheme(b.getAttribute('data-theme-opt')));
-        });
-        applyTheme(currentTheme());
 
         bindToggle('toggleBoard', 'boardSection', '[+] Show Filter Board', '[-] Hide Filter Board');
 
@@ -3374,6 +3349,92 @@ CHART_JS = """
     });
 """
 
+# ---------------------------------------------------------------------------
+# Page-level actions that must work on EVERY page, not just Analytics.
+#
+# These used to sit inside CHART_JS, which is emitted only on the Analytics
+# page and - worse - inside initChart(). Anything defined there is invisible to
+# the Home page, which is where the SELL NOW button and the theme switch live.
+# Keeping them in their own constant makes the scoping explicit.
+# ---------------------------------------------------------------------------
+PAGE_JS = """
+    // ---- Theme (dark/light) ----
+    // The choice lives in localStorage and is applied to <html data-theme> by an
+    // inline script in <head> before first paint, so a light-mode user never
+    // sees a flash of dark. Defined here, at page level, because the switch is
+    // on the Settings page.
+    function currentTheme() {
+        try { return localStorage.getItem('hunter-theme') === 'light' ? 'light' : 'dark'; }
+        catch (e) { return 'dark'; }
+    }
+
+    function applyTheme(name) {
+        var root = document.documentElement;
+        if (name === 'light') {
+            root.setAttribute('data-theme', 'light');
+        } else {
+            root.removeAttribute('data-theme');
+        }
+        document.querySelectorAll('.theme-opt').forEach(function (b) {
+            b.setAttribute('aria-pressed',
+                b.getAttribute('data-theme-opt') === name ? 'true' : 'false');
+        });
+        if (typeof drawChart === 'function') {
+            try { drawChart(); } catch (e) {}
+        }
+    }
+
+    function setTheme(name) {
+        try { localStorage.setItem('hunter-theme', name); } catch (e) {}
+        applyTheme(name);
+    }
+
+    // ---- Manual market exit ----
+    // Sells the open position at the best bid and keeps hunting. NOT the same as
+    // STOP: STOP liquidates and parks the engine. A confirmation is deliberate -
+    // there is no undo on a market sell.
+    function sellNow(symbol, btn) {
+        var msg = 'Market sell ' + symbol + ' now?';
+        msg += String.fromCharCode(10, 10);
+        msg += 'This exits at the best bid, records the trade and sets a cooldown on the pair. ';
+        msg += 'Hunting continues.';
+        if (!confirm(msg)) return;
+        if (btn) { btn.disabled = true; btn.textContent = 'SELLING...'; }
+        fetch('/api/position/sell', { method: 'POST' })
+            .then(function (r) { return r.json().then(function (d) {
+                return { status: r.status, d: d }; }); })
+            .then(function (res) {
+                var status = res.status, d = res.d;
+                if (status === 409 && d.busy) {
+                    setTimeout(function () { sellNow(symbol, btn); }, 2500);
+                    return;
+                }
+                if (!d.ok) {
+                    window.alert('Sell failed: ' + (d.error || 'unknown'));
+                    if (btn) { btn.disabled = false; btn.textContent = 'SELL NOW'; }
+                    refreshDashboard();
+                    return;
+                }
+                window.alert(d.message || 'sold');
+                refreshDashboard();
+            })
+            .catch(function (e) {
+                window.alert('Sell request failed: ' + e);
+                if (btn) { btn.disabled = false; btn.textContent = 'SELL NOW'; }
+            });
+    }
+
+    // wire the switch once the document is ready
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('.theme-opt').forEach(function (b) {
+            b.addEventListener('click', function () {
+                setTheme(b.getAttribute('data-theme-opt'));
+            });
+        });
+        applyTheme(currentTheme());
+    });
+"""
+
 
 def _pair_options():
     """Build dropdown options with DEFAULT_PAIR selected."""
@@ -3664,6 +3725,50 @@ async def api_control_start():
     cron_ok, cron_detail = _run_cron("resume")
     return {"ok": True, "mode": MODE_RUNNING,
             "cron_ok": cron_ok, "cron_detail": cron_detail}
+
+
+@app.post("/api/position/sell")
+async def api_position_sell():
+    """Market-sell the open position and keep hunting.
+
+    Different from /api/control/stop, which liquidates AND parks the engine.
+    This is the "get me out of this one trade" action: the engine sells at the
+    best bid, records the trade, sets a cooldown on that pair and stays RUNNING.
+
+    Runs scripts/run_hunter.py --sell-now as a subprocess so the sell takes the
+    engine's own flock and reuses its fee/PnL arithmetic. Re-implementing the
+    sell here would let the dashboard and the engine disagree about the same
+    fill. Exit code 2 means a tick is in flight; the UI should retry.
+    """
+    try:
+        proc = subprocess.run(
+            [ENGINE_PYTHON, str(STOP_SCRIPT), "--sell-now"],
+            capture_output=True, text=True, timeout=60,
+            cwd=str(BASE_DIR),
+        )
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"ok": False, "error": "sell timed out"}, status_code=504)
+    except OSError as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"},
+                            status_code=500)
+
+    if proc.returncode == 2:
+        return JSONResponse(
+            {"ok": False, "busy": True,
+             "error": "engine tick in progress — retry in a moment"},
+            status_code=409)
+    if proc.returncode == 3:
+        # nothing to sell: not an error, the position closed on its own
+        return JSONResponse({"ok": False, "nothing_to_sell": True,
+                             "error": "no open position"}, status_code=409)
+
+    try:
+        result = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse(
+            {"ok": False, "error": (proc.stderr or proc.stdout or "no output").strip()[:400]},
+            status_code=500)
+    return result
 
 
 @app.post("/api/control/stop")
@@ -4094,6 +4199,7 @@ async def dashboard():
     <div class="footer">The Hunter Dashboard · built {time.strftime("%Y-%m-%d %H:%M:%S WIB", time.gmtime(time.time() + WIB_OFFSET))}</div>
 
     <script>{CHART_JS.replace("__PAGE_SIZE__", str(TRADES_PER_PAGE))}</script>
+    <script>{PAGE_JS}</script>
 </body>
 </html>"""
     return HTMLResponse(content=html_content)

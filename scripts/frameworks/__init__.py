@@ -22,10 +22,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from frameworks.base import Framework                  # noqa: F401  (re-export)
 from frameworks.framework_a import FrameworkA
 from frameworks.framework_b import FrameworkB
+from frameworks.framework_c import FrameworkC
 
 DEFAULT_FRAMEWORK = "A"
 
-_INSTANCES = (FrameworkA(), FrameworkB())
+_INSTANCES = (FrameworkA(), FrameworkB(), FrameworkC())
 _REGISTRY = {f.name: f for f in _INSTANCES}
 
 
@@ -56,13 +57,14 @@ if __name__ == "__main__":
 
     # 1. Both frameworks registered
     names = all_names()
-    assert "A" in names and "B" in names, names
+    assert "A" in names and "B" in names and "C" in names, names
     print(f"[PASS] registry contains: {names}")
 
     # 2. Lookup works, case-insensitive
     assert get_framework("A").name == "A"
     assert get_framework("a").name == "A"
     assert get_framework("b").name == "B"
+    assert get_framework("c").name == "C"
     print("[PASS] lookup is case-insensitive: 'a'/'A'/'b'")
 
     # 3. Unknown -> falls back to A (never raises)
@@ -73,7 +75,7 @@ if __name__ == "__main__":
 
     # 4. framework_exists()
     assert framework_exists("A") and framework_exists("b")
-    assert not framework_exists("C")
+    assert not framework_exists("Z")
     print("[PASS] framework_exists() distinguishes real from unknown")
 
     # 5. Every framework implements the full interface
@@ -91,16 +93,18 @@ if __name__ == "__main__":
     b = get_framework("B").initialize_exit(1000.0, 1.0)
     assert a["target_pct"] != b["target_pct"], (a, b)
     assert a["stop_pct"] != b["stop_pct"], (a, b)
+    c = get_framework("C").initialize_exit(1000.0, 1.0)
+    assert c["target_pct"] == 0.05 and c["stop_pct"] == 0.10, c
     print(f"[PASS] A and B differ: A {a['target_pct']:+.3f}/{a['stop_pct']:+.3f} "
           f"vs B {b['target_pct']:+.3f}/{b['stop_pct']:+.3f}")
 
     # 7. list_frameworks() shape for the API
     listing = list_frameworks()
-    assert len(listing) == 2
+    assert len(listing) == 3
     for item in listing:
         for k in ("name", "label", "description", "version", "experimental"):
             assert k in item, (k, item)
-    assert sum(1 for x in listing if x["experimental"]) == 1, listing
+    assert sum(1 for x in listing if x["experimental"]) == 2, listing
     print(f"[PASS] list_frameworks() -> {[x['name'] for x in listing]} "
           f"({sum(1 for x in listing if x['experimental'])} experimental)")
 

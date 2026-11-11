@@ -68,6 +68,7 @@ from gates import (
 from exit_strategy import (
     EXIT_BE_RATCHET,
     EXIT_HARD_SL,
+    EXIT_MANUAL_MARKET,
     EXIT_TARGET,
     EXIT_USER_STOP,
     STOP_PCT,
@@ -962,6 +963,8 @@ def main():
         run_self_checks()
         return
 
+    if "--sell-now" in sys.argv:
+        run_sell_now()
     if "--stop-now" in sys.argv:
         run_stop_now()
         return
@@ -972,6 +975,112 @@ def main():
         print(f"  {res['summary']}")
     else:
         print(res.get("message", res))
+
+
+def run_sell_now():
+    """Market-sell the open position and RETURN TO HUNTING.
+
+    Deliberately different from --stop-now, which liquidates AND parks. This is
+    the "get me out of this one trade" button: it sells, records the trade with
+    EXIT_MANUAL_MARKET, sets a cooldown on the pair so the engine does not
+    immediately buy the same coin back, and leaves the mode RUNNING.
+
+    Takes the engine flock so the sell cannot interleave with a tick that is
+    mid-decision. Exit codes: 0 = sold, 2 = a tick holds the lock (retry),
+    1 = unexpected failure, 3 = nothing to sell.
+
+    The sell itself reuses execute_paper_sell, the same call the engine uses for
+    a hard stop. Duplicating the fee/PnL arithmetic here would be the worst
+    thing to duplicate: the dashboard would then report different numbers from
+    the engine for the same fill.
+    """
+    now = time.time()
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "error": "engine tick in progress, retry"}))
+        sys.exit(2)
+
+    try:
+        check_kill_switch()
+        ctrl = load_control()
+        state = load_state()
+
+        if state.get("phase") != "HOLDING" or not state.get("position"):
+            print(json.dumps({
+                "ok": False,
+                "error": "no open position to sell",
+                "phase": state.get("phase"),
+            }))
+            sys.exit(3)
+
+        pos = state["position"]
+        symbol = pos.get("symbol")
+        pair_id = pos.get("pair_id", (symbol or "").lower())
+        depth = load_depth(pair_id)
+        ticker = fetch_live_ticker(pair_id, depth_fallback=depth)
+        best_bid = ticker.get("buy") or ticker.get("last") or pos["entry_price"]
+        best_ask = ticker.get("sell") or best_bid
+
+        trade_rec, delta = execute_paper_sell(
+            pos,
+            exit_price=best_bid,
+            exit_reason=EXIT_MANUAL_MARKET,
+            now=now,
+            fee_override_pct=pos.get("taker_fee_pct", 0.2),
+            exit_bid=best_bid,
+            exit_ask=best_ask,
+        )
+        # --- the same config stamping the engine applies on any exit ----------
+        trade_rec["framework"] = pos.get("framework", "A")
+        trade_rec["framework_version"] = pos.get("framework_version", "?")
+        levels = pos.get("exit_levels") or {}
+        trade_rec["target_pct"] = levels.get("target_pct")
+        trade_rec["stop_pct"] = levels.get("stop_pct")
+        trade_rec["ratchet_armed"] = bool(levels.get("ratchet_armed"))
+
+        state.setdefault("trade_log", []).append(trade_rec)
+        state["balance_idr"] = state.get("balance_idr", 0) + delta["net_proceeds"]
+        state["position"] = None
+        state["phase"] = "HUNTING"
+
+        # A manual exit must apply the same cooldown as any other exit, or the
+        # engine buys the identical pair on the very next tick.
+        hours = float(_config.get(_C, "trading.cooldown_hours", 4))
+        state.setdefault("cooldowns", {})[symbol.upper()] = now + hours * 3600
+
+        save_state(state)
+        try:
+            record_hunt_event(symbol, "MANUAL_MARKET_EXIT", {
+                "hunt_id": trade_rec.get("hunt_id"),
+                "exit_price": best_bid,
+                "net_pnl_idr": trade_rec.get("net_pnl_idr"),
+                "net_pnl_pct": trade_rec.get("net_pnl_pct"),
+            })
+        except Exception:
+            pass
+
+        print(json.dumps({
+            "ok": True,
+            "message": (f"sold {symbol} at {best_bid:,.0f} "
+                        f"({trade_rec.get('net_pnl_pct', 0):+.2f}%)"),
+            "hunt_id": trade_rec.get("hunt_id"),
+            "symbol": symbol,
+            "exit_price": best_bid,
+            "net_pnl_idr": trade_rec.get("net_pnl_idr"),
+            "net_pnl_pct": trade_rec.get("net_pnl_pct"),
+            "balance": state.get("balance_idr"),
+            "phase": state.get("phase"),
+            "mode": ctrl.get("mode"),
+        }, indent=2))
+    except HaltSignal as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
+    except Exception as e:                                  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        sys.exit(1)
+    finally:
+        release_lock(lock_fd)
+    sys.exit(0)
 
 
 def run_stop_now():
