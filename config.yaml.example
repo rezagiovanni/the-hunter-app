@@ -8,6 +8,21 @@
 #
 # Percentages are fractions: 0.02 means 2%, not 20%.
 
+# LIVE TRADING LIMITS
+#
+# Used only when the executor is LIVE. Enforced in the engine, not the dashboard,
+# so they hold no matter what calls it. Start small: these are hard stops, and a
+# cap set too high is the same as no cap.
+live:
+  # Hard ceiling on one live trade, in IDR. The 40% sizing above is clamped to
+  # this, so a large balance cannot commit a large amount by accident.
+  max_per_trade_idr: 20000
+
+  # When the day's REALISED live losses reach this, no new positions are opened
+  # until the next day. Paper losses never count toward it - different money.
+  max_daily_loss_idr: 5000
+
+
 trading:
   # Fraction of current balance committed per trade. 0.40 = 40%.
   sizing_fraction: 0.40

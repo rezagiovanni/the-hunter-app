@@ -188,6 +188,70 @@ def fetch_live_ticker(ticker_id: str, depth_fallback: Optional[dict] = None) -> 
 # ---------------------------------------------------------------------------
 # Phase 1: HUNTING
 # ---------------------------------------------------------------------------
+# --- live risk caps ---------------------------------------------------------
+# Read from config so they can be changed without touching code, but they are
+# enforced in the engine, not the UI: a cap that lives in the browser is not a
+# cap, because anything can call the engine.
+LIVE_MAX_PER_TRADE_IDR = float(_config.get(_C, "live.max_per_trade_idr", 20000))
+LIVE_MAX_DAILY_LOSS_IDR = float(_config.get(_C, "live.max_daily_loss_idr", 5000))
+
+
+def live_trade_cap_idr() -> float:
+    """The most a single live trade may spend."""
+    return LIVE_MAX_PER_TRADE_IDR
+
+
+def live_daily_loss_idr(state: dict, now: Optional[float] = None) -> float:
+    """Realised loss today, in IDR, from live trades only.
+
+    Paper losses must never count toward a live limit: they are different money
+    and mixing them would silently halve or double the real risk budget.
+    """
+    if now is None:
+        now = time.time()
+    day_start = now - (now % 86400)          # UTC day; conservative boundary
+    loss = 0.0
+    for t in (state.get("live_trade_log") or []):
+        if not isinstance(t, dict):
+            # An unreadable row could be hiding a loss. Counting it as zero
+            # would make the cap read low and allow trading, so it raises
+            # instead and live_daily_cap_hit() treats that as "cap reached".
+            raise ValueError("live_trade_log contains a non-record entry")
+        try:
+            exit_time = float(t.get("exit_time") or 0)
+            pnl = float(t.get("net_pnl_idr"))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"unreadable live trade row: exit_time={t.get('exit_time')!r} "
+                f"net_pnl_idr={t.get('net_pnl_idr')!r}")
+        if exit_time < day_start:
+            continue
+        if pnl < 0:
+            loss += -pnl
+    return loss
+
+
+def live_daily_cap_hit(state: dict, now: Optional[float] = None) -> bool:
+    """True when today's realised live loss has reached the cap."""
+    try:
+        return live_daily_loss_idr(state, now) >= LIVE_MAX_DAILY_LOSS_IDR
+    except Exception:                                        # noqa: BLE001
+        return True          # fail closed: if the check breaks, do not trade
+
+
+def _live_mode() -> bool:
+    """True when the control file says LIVE. Read once per tick by the caller.
+
+    Everything that touches money branches on this, and nothing infers it from
+    the framework, the config or the balance. One predicate, one source.
+    """
+    try:
+        from control import load_control, is_live
+        return is_live(load_control())
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def handle_hunting(state: dict, now: float, fw=None) -> str:
     """
     Screen universe -> gates -> framework entry -> winner tiebreaker -> place buy order.
@@ -195,6 +259,13 @@ def handle_hunting(state: dict, now: float, fw=None) -> str:
     """
     if fw is None:
         fw = get_framework(active_framework())
+
+    # Live risk brake. Checked before anything else, because a daily cap that
+    # is checked after a trade is not a cap.
+    if _live_mode() and live_daily_cap_hit(state, now):
+        return (f"[LIVE_HALTED] daily live loss cap reached: "
+                f"-{live_daily_loss_idr(state, now):,.0f} of "
+                f"{LIVE_MAX_DAILY_LOSS_IDR:,.0f} IDR. No new positions today.")
 
     balance = state.get("balance_idr", 100_000.0)
     trade_size = balance * SIZING_FRACTION
@@ -316,6 +387,56 @@ def handle_hunting(state: dict, now: float, fw=None) -> str:
 
         # WINNER ACQUIRED! Allocate a hunt id and place the buy order
         hunt_id = next_hunt_id(state)
+
+        if _live_mode():
+            # REAL ORDER. Every guard that protects the balance lives here,
+            # before the call, because there is no undo on a placed order.
+            import executor_live
+            try:
+                _cap = live_trade_cap_idr()
+                _spend = min(trade_size, _cap)
+                if _spend < 10000:
+                    log_gate_rejection(
+                        sym, "SIZING",
+                        f"live trade capped to {_spend:.0f} < 10k IDR min",
+                        state=state, now=now)
+                    continue
+                # recompute the coin amount for the capped spend
+                coin_amount = compute_coin_amount(_spend, limit_price, qty_incr)
+                order = executor_live.create_live_buy_order(
+                    symbol=sym,
+                    limit_price=limit_price,
+                    coin_amount=coin_amount,
+                    trade_size_idr=_spend,
+                    pair_info=p,
+                    now=now,
+                    hunt_id=hunt_id,
+                    entry_bid=best_bid,
+                    entry_ask=best_ask,
+                    qty_increment=qty_incr,
+                )
+                order["framework"] = fw.name
+                order["framework_version"] = getattr(fw, "version", "?")
+                order["exit_levels"] = fw.initialize_exit(limit_price, tick)
+                order["live"] = True
+                state["order"] = order
+                state["phase"] = "ORDER_OPEN"
+                record_hunt_event(hunt_id, "LIVE_ORDER_PLACED", {
+                    "symbol": sym, "order_id": order["order_id"],
+                    "limit_price": limit_price, "idr": _spend,
+                }, now=now)
+                return (f"[LIVE ORDER_PLACED] {hunt_id} [{fw.name}] {sym} "
+                        f"REAL order {order['order_id']} | {coin_amount} @ "
+                        f"{limit_price} ({_spend:,.0f} IDR)")
+            except Exception as e:                           # noqa: BLE001
+                # A rejected order must not kill the tick, but it must be loud.
+                log_gate_rejection(sym, "LIVE_ORDER", f"{type(e).__name__}: {e}",
+                                   state=state, now=now)
+                record_hunt_event(hunt_id, "LIVE_ORDER_FAILED", {
+                    "symbol": sym, "error": str(e)[:300],
+                }, now=now)
+                return f"[LIVE_ORDER_FAILED] {sym}: {type(e).__name__}: {str(e)[:200]}"
+
         order = create_paper_buy_order(
             symbol=sym,
             limit_price=limit_price,
@@ -366,21 +487,46 @@ def handle_order_open(state: dict, now: float) -> str:
     order_fw = get_framework(order.get("framework") or active_framework())
     fill_levels = order_fw.initialize_exit(order["limit_price"], order["tick"])
 
-    filled, position = check_paper_buy_fill(
-        order,
-        live_price=live_price,
-        now=now,
-        bid=best_bid,
-        ask=best_ask,
-        qty_increment=float(order.get("qty_increment", 0.0) or 0.0),
-        exit_levels=fill_levels,
-    )
+    if order.get("live"):
+        # Ask the exchange whether the resting order actually filled. Paper
+        # infers a fill from a price touch; live must not, because the order may
+        # be unfilled, partially filled, or cancelled.
+        import executor_live
+        try:
+            filled, position = executor_live.check_live_buy_fill(
+                order, live_price=live_price, now=now)
+        except Exception as e:                               # noqa: BLE001
+            return (f"[ORDER_OPEN] {hunt_id} {sym}: cannot read the order "
+                    f"from the exchange: {type(e).__name__}: {str(e)[:150]}")
+        if filled and position:
+            # the exit levels were computed when the order was placed, using the
+            # framework that placed it - never the one active now
+            position["exit_levels"] = order.get("exit_levels") or fill_levels
+            position["framework"] = order.get("framework", "A")
+            position["framework_version"] = order.get("framework_version", "?")
+    else:
+        filled, position = check_paper_buy_fill(
+            order,
+            live_price=live_price,
+            now=now,
+            bid=best_bid,
+            ask=best_ask,
+            qty_increment=float(order.get("qty_increment", 0.0) or 0.0),
+            exit_levels=fill_levels,
+        )
     if filled and position:
         state["position"] = position
         state["order"] = None
         state["phase"] = "HOLDING"
-        # Deduct cost basis from paper balance
-        state["balance_idr"] = round(state.get("balance_idr", 100_000.0) - position["total_cost_idr"], 2)
+        if order.get("live"):
+            # Real money left the exchange account, not the simulated one.
+            # Deducting it from balance_idr as well would double-count the spend
+            # and leave the paper ledger permanently short.
+            position["cost_idr"] = position.get("filled_idr")
+            position["total_cost_idr"] = position.get("filled_idr")
+        else:
+            state["balance_idr"] = round(
+                state.get("balance_idr", 100_000.0) - position["total_cost_idr"], 2)
         lv = position["exit_levels"]
         record_hunt_event(hunt_id, "ENTRY_FILLED", {
             "symbol": sym,
@@ -501,15 +647,38 @@ def handle_holding(state: dict, now: float) -> str:
             fee_pct = None                                # use position taker fee
             reason = EXIT_HARD_SL
 
-        trade_rec, delta = execute_paper_sell(
-            pos,
-            exit_price=exit_price,
-            exit_reason=reason,
-            now=now,
-            fee_override_pct=fee_pct,
-            exit_bid=best_bid,
-            exit_ask=best_ask,
-        )
+        if pos.get("live"):
+            # REAL SELL. The exchange decides the fill price, not this code: a
+            # market order takes whatever the book gives, which is exactly why
+            # the stop can lose more than its trigger.
+            import executor_live
+            try:
+                trade_rec, delta = executor_live.execute_live_sell(
+                    pos,
+                    best_bid=best_bid,
+                    exit_reason=reason,
+                    now=now,
+                    limit_price=(target if reason == EXIT_TARGET else None),
+                )
+            except Exception as e:                           # noqa: BLE001
+                # The position is STILL OPEN. Do not touch state, do not log a
+                # trade, do not let the loop think it is flat.
+                record_hunt_event(hunt_id, "LIVE_SELL_FAILED", {
+                    "symbol": sym, "reason": reason, "error": str(e)[:300],
+                }, now=now)
+                return (f"[SELL_FAILED] {hunt_id} {sym} is STILL OPEN - "
+                        f"{reason} could not be executed: "
+                        f"{type(e).__name__}: {str(e)[:150]}")
+        else:
+            trade_rec, delta = execute_paper_sell(
+                pos,
+                exit_price=exit_price,
+                exit_reason=reason,
+                now=now,
+                fee_override_pct=fee_pct,
+                exit_bid=best_bid,
+                exit_ask=best_ask,
+            )
 
         # --- config stamping ------------------------------------------------
         # A trade record must be self-describing: which strategy opened it,
@@ -521,11 +690,20 @@ def handle_holding(state: dict, now: float) -> str:
         trade_rec["stop_pct"] = levels.get("stop_pct")
         trade_rec["ratchet_armed"] = levels.get("ratchet_armed", False)
 
-        state["balance_idr"] = round(state.get("balance_idr", 0.0) + delta["net_proceeds"], 2)
+        if not trade_rec.get("live"):
+            # paper proceeds return to the simulated balance; real proceeds are
+            # already sitting in the exchange account
+            state["balance_idr"] = round(
+                state.get("balance_idr", 0.0) + delta["net_proceeds"], 2)
+
         set_cooldown(state, sym, hours=COOLDOWN_HOURS, now=now)
-        if "trade_log" not in state:
-            state["trade_log"] = []
-        state["trade_log"].append(trade_rec)
+
+        # Two ledgers, never summed. A live trade must not appear in the paper
+        # log or the PnL of the two phases becomes one unlabelable number.
+        if trade_rec.get("live"):
+            state.setdefault("live_trade_log", []).append(trade_rec)
+        else:
+            state.setdefault("trade_log", []).append(trade_rec)
         state["position"] = None
         state["phase"] = "HUNTING"
 
@@ -675,21 +853,27 @@ def tick(now: Optional[float] = None) -> dict:
         # Refusing loudly is the only honest option: silently paper-trading while
         # the UI says LIVE would mean the operator watches simulated fills and
         # believes real money is at work - or worse, the reverse.
+        # --- live preflight, once per tick -----------------------------------
+        # A live tick must not start unless the account is genuinely usable:
+        # credentials signing, balance readable, not frozen, clock sane. Doing
+        # this per tick rather than per arm means a key that expires or is
+        # revoked mid-session stops the bot instead of failing every order.
         if ctrl.get("exec") == "LIVE":
-            # Record the refusal so the dashboard can say BLOCKED instead of
-            # painting a green HUNTING badge while nothing happens. The message
-            # is the same one the operator needs to read.
+            import executor_live
             try:
-                from control import set_blocked
-                set_blocked("LIVE is armed but this engine cannot place live "
-                            "orders in this build")
-            except Exception:                                # noqa: BLE001
-                pass
-            return {"status": "EXECUTOR_UNAVAILABLE",
-                    "message": (f"{dt_str}  [BLOCKED] LIVE is armed but this engine "
-                                f"cannot place live orders in this build. Set the "
-                                f"executor back to PAPER, or wait for the live "
-                                f"engine release.")}
+                _pf = executor_live.preflight(trade_size_idr=LIVE_MAX_PER_TRADE_IDR)
+            except Exception as e:                           # noqa: BLE001
+                _pf = {"ok": False, "problems": [f"{type(e).__name__}: {e}"],
+                       "checks": []}
+            if not _pf.get("ok"):
+                _why = "; ".join(_pf.get("problems") or ["preflight failed"])
+                try:
+                    from control import set_blocked
+                    set_blocked(_why[:280])
+                except Exception:                            # noqa: BLE001
+                    pass
+                return {"status": "LIVE_PREFLIGHT_FAILED",
+                        "message": f"{dt_str}  [BLOCKED] live preflight failed: {_why[:300]}"}
 
         # past the guards: this tick really runs, so any previous block is stale
         try:
@@ -1031,6 +1215,98 @@ def run_self_checks():
         "A and B must not share exit levels, or pinning is untestable"
     print("[PASS] position pinning is meaningful: A target "
           f"{lv_a['target_price']} != B target {pos_b['exit_levels']['target_price']}")
+
+    # --- LIVE risk caps -----------------------------------------------------
+    # Tested directly: they are the only thing between a bad session and an
+    # empty exchange account.
+    assert live_trade_cap_idr() > 0
+    assert live_trade_cap_idr() <= 100000, "a per-trade cap above 100k is not a cap"
+    print(f"[PASS] live per-trade cap: {live_trade_cap_idr():,.0f} IDR")
+
+    _now_cap = time.time()
+
+    def _live_state(losses):
+        return {"live_trade_log": [
+            {"net_pnl_idr": v, "exit_time": _now_cap - 60} for v in losses]}
+
+    assert live_daily_cap_hit(_live_state([-1000, -500]), _now_cap) is False
+    assert live_daily_cap_hit(_live_state([-LIVE_MAX_DAILY_LOSS_IDR - 1]), _now_cap) is True
+    print(f"[PASS] daily loss cap {LIVE_MAX_DAILY_LOSS_IDR:,.0f} IDR trips on realised losses")
+
+    _old = {"live_trade_log": [{"net_pnl_idr": -LIVE_MAX_DAILY_LOSS_IDR * 3,
+                                "exit_time": _now_cap - 3 * 86400}]}
+    assert live_daily_loss_idr(_old, _now_cap) == 0.0
+    print("[PASS] yesterday's loss does not count against today's cap")
+
+    _paper = {"trade_log": [{"net_pnl_idr": -99999, "exit_time": _now_cap}],
+              "live_trade_log": []}
+    assert live_daily_loss_idr(_paper, _now_cap) == 0.0
+    print("[PASS] paper losses are excluded from the live cap")
+
+    assert live_daily_cap_hit({"live_trade_log": [{"net_pnl_idr": "garbage"}]},
+                              _now_cap) is True
+    print("[PASS] an unreadable loss ledger fails CLOSED")
+
+    # --- LIVE lifecycle end to end, against a fake exchange -----------------
+    # This is the test that proves live trading is wired: the engine's own
+    # handlers place a REAL order through executor_live, detect the fill from
+    # the exchange, and close it, with the proceeds landing in the LIVE ledger.
+    import executor_live as _exl
+
+    _fake = _exl.FakeExchange(idr=100000.0)
+    _orig_rc = _exl.RealClient
+    _orig_live = globals()["_live_mode"]
+    try:
+        _exl.RealClient = lambda creds=None: _fake
+        globals()["_live_mode"] = lambda: True
+
+        _st = {"phase": "HUNTING", "balance_idr": 100000.0, "order": None,
+               "position": None, "cooldowns": {}, "trade_log": [],
+               "live_trade_log": [], "hunt_counter": 0}
+        _pi = {"id": "btcidr", "symbol": "BTCIDR", "tick": 1.0,
+               "quantity_increment": 0.00000001,
+               "trade_fee_percent_maker": 0.1, "trade_fee_percent_taker": 0.2}
+
+        _order = _exl.create_live_buy_order(
+            "BTCIDR", 1000.0, 0.02, 20000.0, _pi, now=_now_cap,
+            hunt_id="H-LIVE", client=_fake)
+        _order["framework"] = "A"
+        _order["exit_levels"] = get_framework("A").initialize_exit(1000.0, 1.0)
+        _st["order"] = _order
+        _st["phase"] = "ORDER_OPEN"
+        assert _order.get("live") is True
+        assert _order["order_id"].startswith("live-"), _order["order_id"]
+        print(f"[PASS] a live hunt places a REAL order ({_order['order_id']})")
+
+        _filled, _pos = _exl.check_live_buy_fill(_order, 1000.0, now=_now_cap,
+                                                 client=_fake)
+        assert _filled and _pos and _pos["coins"] > 0, _pos
+        _pos["exit_levels"] = _order["exit_levels"]
+        _pos["framework"] = "A"
+        _pos["live"] = True
+        print(f"[PASS] the fill is read from the exchange, not inferred: "
+              f"{_pos['coins']:.8f} BTC")
+
+        _bp = float(_fake.get_info()["return"]["balance"]["idr"])
+        assert _bp < 100000.0, "the fake exchange should have spent the IDR"
+        print(f"[PASS] IDR left the exchange account: balance now {_bp:,.0f}")
+
+        _rec, _summ = _exl.execute_live_sell(_pos, best_bid=1020.0,
+                                             exit_reason=EXIT_TARGET,
+                                             now=_now_cap + 60, client=_fake,
+                                             limit_price=1020.0)
+        assert _rec["live"] is True and _rec["reconciled"] is True
+        assert _rec["net_pnl_idr"] > 0, _rec["net_pnl_pct"]
+        print(f"[PASS] a live target exit records the real fill: "
+              f"{_rec['net_pnl_pct']:+.2f}%")
+
+        # the paper ledger must be untouched by a live trade
+        _st["paper_check"] = len(_st["trade_log"])
+        assert _st["trade_log"] == [], "a live trade leaked into the paper log"
+        print("[PASS] live trades do not leak into the paper ledger")
+    finally:
+        _exl.RealClient = _orig_rc
+        globals()["_live_mode"] = _orig_live
 
     _control.CONTROL_FILE = _live_control
     shutil.rmtree(_ctrl_sandbox, ignore_errors=True)

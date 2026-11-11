@@ -4501,7 +4501,7 @@ async def dashboard():
     for i, r in enumerate(board_rows, 1):
         reason = _block_reason(r)
         if _funnel_blocked and (r["pair"] == winner or r["eligible"]):
-            verdict = '<span class="badge-no" title="the engine is not running">✗ ENGINE OFF</span>'
+            verdict = '<span class="badge-no" title="the engine is not running">✗ BLOCKED</span>'
             tr_cls = ""
         elif r["pair"] == winner:
             verdict = '<span class="badge-win">WINNER</span>'

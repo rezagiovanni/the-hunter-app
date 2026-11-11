@@ -43,6 +43,14 @@ import sys
 # These are the single source of truth when no config file says otherwise.
 # ---------------------------------------------------------------------------
 DEFAULTS = {
+    # Live trading limits. These are enforced in the ENGINE, not the UI - a cap
+    # that lives in a browser is not a cap. Defaults are deliberately small:
+    # 20,000 IDR per trade and 5,000 IDR of realised loss per day, so a bad
+    # session on a small account stops itself instead of emptying it.
+    "live": {
+        "max_per_trade_idr": 20000.0,
+        "max_daily_loss_idr": 5000.0,
+    },
     "trading": {
         "sizing_fraction": 0.40,        # 40% of current balance per trade
         "min_trade_balance_idr": 10000.0,
