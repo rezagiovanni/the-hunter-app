@@ -406,38 +406,74 @@ def create_live_market_buy(symbol: str, idr: float, pair_info: dict,
 
 def check_live_buy_fill(order: dict, live_price: float,
                         now: Optional[float] = None,
-                        client=None) -> Tuple[bool, Optional[dict]]:
-    """Ask the exchange whether the resting buy filled.
+                        client=None) -> Tuple[str, Optional[dict]]:
+    """Ask the exchange what happened to the resting buy.
 
-    Returns (filled, position).
+    Returns (outcome, position), outcome being one of:
 
-    Unlike paper, a partial fill is a real state: the position is opened with
-    the coins actually received. If the order is still open and nothing has
-    filled, it is not a position yet.
+      "FILLED"     fully filled, position ready
+      "PARTIAL"    partially filled, position opened with what was received
+      "OPEN"       still working, nothing filled yet
+      "CANCELLED"  cancelled/expired/refunded, or no longer at the exchange
+      "ERROR"      could not determine; the caller must not assume anything
+
+    FIELD NAMES ARE THE EXCHANGE'S OWN. The documented getOrder response is:
+
+        {"order": {"order_id", "price", "type", "order_rp", "remain_rp",
+                   "submit_time", "finish_time", "status", "receive_idr"}}
+
+    An earlier version read "filled_coin" and "filled_idr", which do not exist
+    there. It saw zero coins on every poll, so no fill was ever detected - and
+    because the check counter was also never incremented, a real resting order
+    sat at "0/6" indefinitely. Two bugs that together looked like one frozen
+    screen.
+
+    For a BUY, Indodax reports IDR, not coin:
+        order_rp    the IDR value of the order
+        remain_rp   the IDR value still unfilled
+    so filled = order_rp - remain_rp, and coins are derived from the LIMIT
+    price, which is exact: a limit order only trades at its own price.
     """
     client = client or RealClient()
     if now is None:
         now = time.time()
 
-    detail = client.get_order(order["pair_id"], order["order_id"])
+    try:
+        detail = client.get_order(order["pair_id"], order["order_id"])
+    except Exception as e:                                   # noqa: BLE001
+        msg = str(e).lower()
+        if "invalid order" in msg or "not found" in msg:
+            return "CANCELLED", None
+        return "ERROR", None
+
     ret = detail.get("return") or {}
     order_ret = ret.get("order") or ret
+    if not isinstance(order_ret, dict) or not order_ret:
+        return "ERROR", None
 
-    status = str(order_ret.get("status") or "").lower()
-    # Indodax reports filled amounts in several shapes depending on the endpoint
-    filled_coins = _f(order_ret.get("filled_coin") or order_ret.get("coin_received"))
-    filled_idr = _f(order_ret.get("filled_idr") or order_ret.get("idr_spent")
-                    or order_ret.get("price"))
+    status = str(order_ret.get("status") or "").strip().lower()
 
-    if status in ("filled", "closed") and filled_coins > 0:
-        return True, _make_position(order, filled_coins, filled_idr, now)
+    order_rp = _f(order_ret.get("order_rp"))
+    remain_rp = _f(order_ret.get("remain_rp"))
+    if order_rp <= 0:
+        order_rp = _f(order.get("trade_size_idr"))
+    filled_idr = max(order_rp - remain_rp, 0.0)
 
-    if filled_coins > 0 and status in ("open", "partially_filled", ""):
-        # A partial fill is a live position with fewer coins than planned.
-        return True, _make_position(order, filled_coins, filled_idr, now,
-                                    partial=True)
+    if status in ("cancelled", "canceled", "expired", "refunded", "rejected"):
+        return "CANCELLED", None
 
-    return False, None
+    if status in ("filled", "closed", "done"):
+        if filled_idr <= 0:
+            filled_idr = order_rp
+        return "FILLED", _make_position(order, filled_idr, now)
+
+    if filled_idr > 0:
+        return "PARTIAL", _make_position(order, filled_idr, now, partial=True)
+
+    if status in ("open", "pending", "partially_filled", "partial", ""):
+        return "OPEN", None
+
+    return "ERROR", None
 
 
 def _seconds(v) -> Optional[float]:
@@ -466,10 +502,26 @@ def _f(v) -> float:
         return 0.0
 
 
-def _make_position(order: dict, coins: float, idr_spent: float,
+def _make_position(order: dict, idr_spent: float,
                    now: float, partial: bool = False) -> dict:
-    """Build the position dict the engine expects, with the coins actually held."""
-    entry = (idr_spent / coins) if coins > 0 and idr_spent > 0 else order["limit_price"]
+    """Build the position dict from the IDR actually filled.
+
+    Coins are derived from the order's LIMIT price, which is exact for a limit
+    fill: the order only ever trades at its own price. Deriving them from a
+    market price midpoint would put the entry price somewhere the fill never was.
+    """
+    limit_price = float(order.get("limit_price") or 0.0)
+    if limit_price <= 0:
+        # nothing sensible to derive from; refuse rather than divide by zero
+        limit_price = float(order.get("coin_amount") and
+                            (idr_spent / order["coin_amount"]) or 0.0)
+    coins = (idr_spent / limit_price) if limit_price > 0 else 0.0
+    # never claim more coin than was ordered - a rounding artefact must not
+    # create a position larger than the exchange could have filled
+    planned = float(order.get("coin_amount") or 0.0)
+    if planned > 0:
+        coins = min(coins, planned)
+    entry = limit_price if limit_price > 0 else 0.0
     return {
         "hunt_id": order.get("hunt_id"),
         "symbol": order["symbol"],
@@ -749,6 +801,56 @@ def holdings(client=None) -> Dict[str, Any]:
     return out
 
 
+def reconcile_order(state: dict, client=None) -> Dict[str, Any]:
+    """Check whether a locally-recorded resting order still exists at the exchange.
+
+    The dashboard trusts hunter_state.json, which only changes when the engine
+    ticks. An order cancelled in the Indodax app therefore kept showing
+    "Resting Limit Buy ... 0/6" until the next tick noticed - and with the check
+    counter broken, that was never.
+
+    Statuses:
+      MATCH        the order is still working at the exchange
+      GONE         the order is not there any more (cancelled, filled, expired)
+      UNKNOWN      could not ask; leave the UI alone rather than guess
+    """
+    client = client or RealClient()
+    order = (state or {}).get("order") or {}
+    if not order:
+        return {"status": "NONE"}
+    if not order.get("live"):
+        return {"status": "MATCH", "note": "paper order"}
+
+    try:
+        open_orders = client.open_orders(pair=order.get("pair_id"))
+    except Exception as e:                                   # noqa: BLE001
+        return {"status": "UNKNOWN", "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    ret = open_orders.get("return") or {}
+    rows = ret.get("orders") or []
+    if isinstance(rows, dict):
+        flat = []
+        for pair, lst in rows.items():
+            for o in (lst or []):
+                if isinstance(o, dict):
+                    flat.append(dict(o, pair=pair))
+        rows = flat
+
+    target = str(order.get("order_id") or "")
+    for o in rows:
+        if str(o.get("order_id") or o.get("id") or "") == target:
+            return {"status": "MATCH", "order": o}
+
+    detail = {}
+    try:
+        d = client.get_order(order.get("pair_id"), target)
+        detail = (d.get("return") or {}).get("order") or {}
+    except Exception:                                        # noqa: BLE001
+        detail = {}
+    return {"status": "GONE", "detail": detail,
+            "reason": str(detail.get("status") or "not on the book")}
+
+
 def reconcile_position(state: dict, client=None,
                        pair_rows: Optional[list] = None) -> Dict[str, Any]:
     """Compare local state with the exchange and say what to do about it.
@@ -883,12 +985,19 @@ class FakeExchange:
         ]}}
 
     def get_order(self, pair, order_id):
-        o = self.orders[order_id]
+        o = self.orders.get(order_id)
+        if o is None:
+            raise live_api.LiveApiError("invalid order.")
+        # the REAL Indodax shape: order_rp is the order value, remain_rp the
+        # part still unfilled. filled = order_rp - remain_rp.
+        total = float(o.get("order_rp") or 0.0)
+        remain = float(o.get("remain_rp") if o.get("remain_rp") is not None else total)
         return {"success": 1, "return": {"order": {
             "order_id": order_id,
             "status": o["status"],
-            "filled_coin": f"{o.get('filled_coin', 0):.8f}",
-            "filled_idr": f"{o.get('filled_idr', 0):.8f}",
+            "price": f"{o.get('price', 1000):.0f}",
+            "order_rp": f"{total:.8f}",
+            "remain_rp": f"{remain:.8f}",
         }}}
 
     def trade(self, pair, side, idr=None, coin=None, price=None,
@@ -925,11 +1034,15 @@ class FakeExchange:
             if self.fill_mode == "full":
                 self.coins[_base(pair)] = self.coins.get(_base(pair), 0) + got
                 self.orders[oid] = {"pair": pair, "status": "filled",
+                                    "price": float(price or 1000),
+                                    "order_rp": spend, "remain_rp": 0.0,
                                     "filled_coin": got, "filled_idr": spend}
                 return {"success": 1, "return": {"order_id": oid,
                                                  "receive_coin": f"{got:.8f}",
                                                  "spend_rp": f"{spend:.8f}"}}
             self.orders[oid] = {"pair": pair, "status": "open",
+                                "price": float(price or 1000),
+                                "order_rp": spend, "remain_rp": spend,
                                 "filled_coin": 0, "filled_idr": 0}
             return {"success": 1, "return": {"order_id": oid}}
         # sell
@@ -958,16 +1071,16 @@ def _self_check():
     order = create_live_buy_order("BTCIDR", 1000.0, 0.1, 100.0, pair_info,
                                   now=1.0, hunt_id="H-L1", client=ex)
     assert order["live"] is True and order["order_id"].startswith("live-"), order
-    filled, pos = check_live_buy_fill(order, 1000.0, now=2.0, client=ex)
-    assert filled and pos and pos["coins"] > 0, pos
+    outcome, pos = check_live_buy_fill(order, 1000.0, now=2.0, client=ex)
+    assert outcome == "FILLED" and pos and pos["coins"] > 0, (outcome, pos)
     print(f"[PASS] a real buy returns an exchange order id ({order['order_id']})")
 
     # --- 2. a resting order that has not filled is NOT a position -----------
     ex2 = FakeExchange(idr=100000.0, fill_mode="resting")
     o2 = create_live_buy_order("BTCIDR", 1000.0, 0.1, 100.0, pair_info,
                                now=1.0, hunt_id="H-L2", client=ex2)
-    filled2, pos2 = check_live_buy_fill(o2, 1000.0, now=2.0, client=ex2)
-    assert filled2 is False and pos2 is None, (filled2, pos2)
+    outcome2, pos2 = check_live_buy_fill(o2, 1000.0, now=2.0, client=ex2)
+    assert outcome2 == "OPEN" and pos2 is None, (outcome2, pos2)
     print("[PASS] an unfilled resting order is not treated as a position")
 
     # --- 3. a PARTIAL fill opens a position with fewer coins ----------------
@@ -977,9 +1090,10 @@ def _self_check():
     o3 = create_live_buy_order("BTCIDR", 1000.0, 0.1, 100.0, pair_info,
                                now=1.0, hunt_id="H-L3", client=ex3)
     ex3.orders[o3["order_id"]].update(status="partially_filled",
-                                      filled_coin=0.04, filled_idr=40.0)
-    filled3, pos3 = check_live_buy_fill(o3, 1000.0, now=2.0, client=ex3)
-    assert filled3 and pos3["partial_fill"] is True, pos3
+                                      filled_coin=0.04, filled_idr=40.0,
+                                      remain_rp=float(o3["trade_size_idr"]) - 40.0)
+    outcome3, pos3 = check_live_buy_fill(o3, 1000.0, now=2.0, client=ex3)
+    assert outcome3 == "PARTIAL" and pos3["partial_fill"] is True, (outcome3, pos3)
     assert abs(pos3["coins"] - 0.04) < 1e-9, pos3["coins"]
     assert abs(pos3["entry_price"] - 1000.0) < 1e-6, pos3["entry_price"]
     print("[PASS] a partial fill becomes a position with the actual coin amount")
@@ -1256,6 +1370,53 @@ def _self_check():
     assert f14["reconciled"] is False and f14["coins"] == 0.0, f14
     assert o14["reconciled"] is False
     print("[PASS] an unreported fill is flagged, not guessed")
+
+    # --- 15. a cancelled order is GONE, not forever "open" ------------------
+    # Reported: the operator cancelled in the Indodax app and the dashboard kept
+    # showing "Resting Limit Buy ... 0/6". Two causes: the dashboard trusted
+    # local state, and the check counter never advanced.
+    ex25 = FakeExchange(idr=100000.0, fill_mode="resting")
+    o25 = create_live_buy_order("BTCIDR", 1000.0, 0.1, 100.0, pair_info,
+                                now=1.0, hunt_id="H25", client=ex25)
+    out25, pos25 = check_live_buy_fill(o25, 1000.0, now=2.0, client=ex25)
+    assert out25 == "OPEN" and pos25 is None, (out25, pos25)
+    print("[PASS] a working order reports OPEN")
+
+    rec25 = reconcile_order({"order": o25}, client=ex25)
+    assert rec25["status"] == "MATCH", rec25
+    print("[PASS] reconcile_order finds the order on the book")
+
+    # cancel it the way the operator would in the app
+    ex25.cancel_order(o25["pair_id"], o25["order_id"])
+    out26, pos26 = check_live_buy_fill(o25, 1000.0, now=3.0, client=ex25)
+    assert out26 == "CANCELLED" and pos26 is None, (out26, pos26)
+    print("[PASS] a cancelled order reports CANCELLED, not OPEN")
+
+    rec26 = reconcile_order({"order": o25}, client=ex25)
+    assert rec26["status"] == "GONE", rec26
+    assert rec26.get("reason"), "the reason must be reported"
+    print(f"[PASS] reconcile_order reports GONE (reason: {rec26['reason']})")
+
+    # an unreadable exchange must not be reported as GONE
+    class NoOrders(FakeExchange):
+        def open_orders(self, pair=None):
+            raise live_api.LiveApiError("network down")
+
+    rec27 = reconcile_order({"order": o25}, client=NoOrders())
+    assert rec27["status"] == "UNKNOWN", rec27
+    print("[PASS] an unreadable exchange is UNKNOWN, never GONE")
+
+    # an order id the exchange has never heard of is CANCELLED, not OPEN
+    ghost = dict(o25, order_id="does-not-exist")
+    out28, _ = check_live_buy_fill(ghost, 1000.0, now=4.0, client=ex25)
+    assert out28 == "CANCELLED", out28
+    print("[PASS] an unknown order id is CANCELLED, not OPEN forever")
+
+    # a paper order never consults the exchange
+    rec29 = reconcile_order({"order": {"live": False, "order_id": "paper-1"}},
+                            client=NoOrders())
+    assert rec29["status"] == "MATCH", rec29
+    print("[PASS] a paper order is left alone by reconciliation")
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 

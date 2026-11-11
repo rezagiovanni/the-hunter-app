@@ -111,6 +111,11 @@ _C = _config.current()
 MIN_TRADE_BALANCE_IDR = float(_config.get(_C, "trading.min_trade_balance_idr", 10_000.0))
 SIZING_FRACTION = float(_config.get(_C, "trading.sizing_fraction", 0.40))
 ORDER_TIMEOUT_CHECKS = int(_config.get(_C, "trading.order_timeout_checks", 6))
+
+# Wall-clock backstop. Six checks is six minutes only if the engine ticks every
+# minute; a paused job or a slow exchange changes what "6" means. Both bounds
+# apply and whichever comes first wins.
+ORDER_TIMEOUT_MINUTES = float(_config.get(_C, "trading.order_timeout_minutes", 15))
 STOP_SLIP_FRACTION = float(_config.get(_C, "trading.stop_slip_fraction", 0.0094))
 COOLDOWN_HOURS = float(_config.get(_C, "trading.cooldown_hours", 4.0))
 
@@ -531,20 +536,52 @@ def handle_order_open(state: dict, now: float) -> str:
     if order.get("live"):
         # Ask the exchange whether the resting order actually filled. Paper
         # infers a fill from a price touch; live must not, because the order may
-        # be unfilled, partially filled, or cancelled.
+        # be unfilled, partially filled, or cancelled by the operator.
         import executor_live
+
+        # Count the attempt BEFORE anything can fail, so the timeout works even
+        # if the exchange is unreachable. This counter was read but never
+        # written, which is why a real order sat at "0/6" for ten minutes and
+        # the timeout never fired.
+        order["checks_elapsed"] = int(order.get("checks_elapsed", 0)) + 1
+        order["last_checked_at"] = now
+        state["order"] = order          # persist the counter
+
         try:
-            filled, position = executor_live.check_live_buy_fill(
+            outcome, position = executor_live.check_live_buy_fill(
                 order, live_price=live_price, now=now)
         except Exception as e:                               # noqa: BLE001
             return (f"[ORDER_OPEN] {hunt_id} {sym}: cannot read the order "
                     f"from the exchange: {type(e).__name__}: {str(e)[:150]}")
-        if filled and position:
+
+        if outcome == "CANCELLED":
+            # the operator cancelled it in the Indodax app, or it expired.
+            # Drop it: a cancelled order is not a position and must not sit in
+            # the dashboard as though it were still working.
+            state["order"] = None
+            state["phase"] = "HUNTING"
+            record_hunt_event(hunt_id, "ORDER_CANCELLED_EXTERNALLY", {
+                "symbol": sym, "order_id": order.get("order_id"),
+            }, now=now)
+            return (f"[ORDER_GONE] {hunt_id} {sym}: the exchange reports the "
+                    f"order as cancelled or expired. Back to HUNTING.")
+
+        if outcome == "ERROR":
+            return (f"[ORDER_OPEN] {hunt_id} {sym}: the exchange returned an "
+                    f"unrecognised order state. Not guessing - check Indodax.")
+
+        if outcome in ("FILLED", "PARTIAL") and position:
             # the exit levels were computed when the order was placed, using the
             # framework that placed it - never the one active now
             position["exit_levels"] = order.get("exit_levels") or fill_levels
             position["framework"] = order.get("framework", "A")
             position["framework_version"] = order.get("framework_version", "?")
+            if outcome == "PARTIAL":
+                record_hunt_event(hunt_id, "PARTIAL_FILL", {
+                    "symbol": sym, "coins": position.get("coins"),
+                    "idr": position.get("filled_idr"),
+                }, now=now)
+        # outcome == "OPEN" falls through to the timeout check below
     else:
         filled, position = check_paper_buy_fill(
             order,
@@ -555,6 +592,13 @@ def handle_order_open(state: dict, now: float) -> str:
             qty_increment=float(order.get("qty_increment", 0.0) or 0.0),
             exit_levels=fill_levels,
         )
+    # `filled` comes from the paper check; live reports an `outcome`. Normalise
+    # here so the rest of the function has one thing to test - and so the live
+    # path cannot silently fall through to "not filled" because a variable was
+    # never assigned.
+    if order.get("live"):
+        filled = bool(outcome in ("FILLED", "PARTIAL") and position)
+
     if filled and position:
         state["position"] = position
         state["order"] = None
@@ -586,14 +630,47 @@ def handle_order_open(state: dict, now: float) -> str:
                 f"Stop: {lv['stop_trigger_price']:,.0f} -> HOLDING")
 
     # Check timeout
-    checks = order.get("checks_elapsed", 1)
-    if checks >= ORDER_TIMEOUT_CHECKS:
+    checks = int(order.get("checks_elapsed", 0))
+
+    # Time is a better timeout than a count. Six checks is six minutes only if
+    # the engine ticks every minute; a paused job or a slow exchange would
+    # change what "6" means. Both are enforced: whichever comes first.
+    placed = float(order.get("placed_at") or now)
+    age_min = (now - placed) / 60.0
+    timed_out = (checks >= ORDER_TIMEOUT_CHECKS) or \
+                (age_min >= ORDER_TIMEOUT_MINUTES)
+
+    if timed_out:
+        cancel_note = ""
+        if order.get("live"):
+            # A real resting order MUST be cancelled at the exchange, not just
+            # forgotten locally. Dropping it from state while it still works on
+            # the book leaves an order nobody is watching.
+            import executor_live
+            try:
+                executor_live.RealClient().cancel_order(
+                    pair=order["pair_id"], order_id=order["order_id"]
+                )
+                cancel_note = "cancelled on the exchange"
+            except Exception as e:                           # noqa: BLE001
+                cancel_note = (f"COULD NOT CANCEL on the exchange: "
+                               f"{type(e).__name__}: {str(e)[:120]}")
+                record_hunt_event(hunt_id, "ORDER_CANCEL_FAILED", {
+                    "symbol": sym, "order_id": order.get("order_id"),
+                    "error": str(e)[:300],
+                }, now=now)
+                # keep the order in state: it is still live at the exchange
+                return (f"[ORDER_TIMEOUT] {hunt_id} {sym} {cancel_note}. "
+                        f"The order is still working - cancel it in Indodax.")
+
         state["order"] = None
         state["phase"] = "HUNTING"
         record_hunt_event(hunt_id, "ORDER_TIMEOUT", {
-            "symbol": sym, "checks": checks, "limit_price": order["limit_price"],
+            "symbol": sym, "checks": checks, "age_min": round(age_min, 1),
+            "limit_price": order.get("limit_price"), "cancel": cancel_note,
         }, now=now)
-        return f"[ORDER_TIMEOUT] {hunt_id} {sym} unfilled after {checks} checks. Cancelled -> HUNTING."
+        return (f"[ORDER_TIMEOUT] {hunt_id} {sym} unfilled after {checks} checks "
+                f"({age_min:.0f}m). {cancel_note or 'cancelled'} -> HUNTING.")
 
     return (f"[ORDER_PENDING] {hunt_id} {sym} limit {order['limit_price']} | "
             f"Live: {live_price} | Checks: {checks}/{ORDER_TIMEOUT_CHECKS}")
@@ -1189,6 +1266,118 @@ def run_self_checks():
     assert mock_state["order"] is None
     assert "ORDER_TIMEOUT" in s_timeout
     print(f"[PASS] ORDER_OPEN timeout: {s_timeout}")
+
+    # --- the live check counter must advance ---------------------------------
+    # Reported: a real resting order showed "Checks: 0/6" after ten minutes and
+    # never timed out. checks_elapsed was read in the timeout branch and never
+    # written anywhere.
+    import executor_live as _exl2
+    _now_cap = time.time()
+
+    _open_ex = None
+
+    class _OpenEx(_exl2.FakeExchange):
+        def get_order(self, pair, order_id):
+            if order_id not in self.orders:
+                raise _exl2.live_api.LiveApiError("invalid order.")
+            o = self.orders[order_id]
+            return {"success": 1, "return": {"order": {
+                "order_id": order_id, "status": o.get("status", "open"),
+                "order_rp": f"{o.get('order_rp', 100.0):.8f}",
+                "remain_rp": f"{o.get('remain_rp', 100.0):.8f}"}}}
+
+    _orig_rc2 = _exl2.RealClient
+    try:
+        _open_ex = _OpenEx(idr=100000.0)
+        _exl2.RealClient = lambda creds=None: _open_ex
+        _st2 = {"phase": "ORDER_OPEN", "balance_idr": 100000.0,
+                "cooldowns": {}, "trade_log": [], "live_trade_log": [],
+                "hunt_counter": 0, "gate_stats": {},
+                "order": {"order_id": "live-x", "live": True,
+                          "symbol": "TESTIDR", "pair_id": "test_idr",
+                          "limit_price": 1000.0, "coin_amount": 0.1,
+                          "trade_size_idr": 100.0, "placed_at": _now_cap,
+                          "tick": 1.0, "checks_elapsed": 0,
+                          "framework": "C",
+                          "exit_levels": globals()["get_framework"]("C").initialize_exit(1000.0, 1.0)}}
+
+        _open_ex.orders["live-x"] = {"pair": "test_idr", "status": "open",
+                                     "order_rp": 100.0, "remain_rp": 100.0}
+        _m1 = handle_order_open(_st2, now=_now_cap + 60)
+        assert _st2["order"]["checks_elapsed"] == 1, _st2["order"]["checks_elapsed"]
+        _m2 = handle_order_open(_st2, now=_now_cap + 120)
+        assert _st2["order"]["checks_elapsed"] == 2, _st2["order"]["checks_elapsed"]
+        assert "Checks: 2/6" in _m2 or "2/6" in _m2, _m2
+        print(f"[PASS] the live check counter advances: "
+              f"{_st2['order']['checks_elapsed']}/6")
+
+        # wall-clock backstop must fire even if the tick count has not.
+        # The order must exist at the fake so the cancel can succeed - if the
+        # cancel fails the engine is SUPPOSED to keep the order in state, which
+        # is asserted separately below.
+        _st2["order"]["checks_elapsed"] = 0
+        _st2["order"]["order_id"] = "live-x"
+        _open_ex.orders["live-x"] = {"pair": "test_idr", "status": "open",
+                                     "order_rp": 100.0, "remain_rp": 100.0}
+        _m3 = handle_order_open(_st2, now=_now_cap + ORDER_TIMEOUT_MINUTES * 60 + 5)
+        assert _st2["phase"] == "HUNTING", (_st2["phase"], _m3)
+        assert "ORDER_TIMEOUT" in _m3, _m3
+        print(f"[PASS] the wall-clock timeout fires at {ORDER_TIMEOUT_MINUTES:.0f}m "
+              f"without waiting for 6 ticks")
+
+        # and if the cancel FAILS, the order is kept: it is still live at the
+        # exchange, and forgetting it would leave an order nobody watches
+        class _NoCancel(_OpenEx):
+            def cancel_order(self, **kw):
+                raise RuntimeError("exchange refused the cancel")
+
+        _nocancel_ex = _NoCancel(idr=100000.0)
+        _nocancel_ex.orders["live-z"] = {"pair": "test_idr", "status": "open",
+                                         "order_rp": 100.0, "remain_rp": 100.0}
+        _exl2.RealClient = lambda creds=None: _nocancel_ex
+        _st4 = {"phase": "ORDER_OPEN", "balance_idr": 100000.0,
+                "cooldowns": {}, "trade_log": [], "live_trade_log": [],
+                "hunt_counter": 0, "gate_stats": {},
+                "order": {"order_id": "live-z", "live": True,
+                          "symbol": "TESTIDR", "pair_id": "test_idr",
+                          "limit_price": 1000.0, "coin_amount": 0.1,
+                          "trade_size_idr": 100.0, "placed_at": _now_cap,
+                          "tick": 1.0, "checks_elapsed": 99,
+                          "framework": "C",
+                          "exit_levels": globals()["get_framework"]("C").initialize_exit(1000.0, 1.0)}}
+        _m5 = handle_order_open(_st4, now=_now_cap + 60)
+        assert _st4["order"] is not None, "a live order must not be dropped"
+        assert _st4["phase"] == "ORDER_OPEN", _st4["phase"]
+        assert "COULD NOT CANCEL" in _m5, _m5
+        print("[PASS] a failed cancel keeps the order and says so")
+    finally:
+        _exl2.RealClient = _orig_rc2
+
+    # an externally cancelled order must be dropped, not left in state
+    class _CancelledEx(_exl2.FakeExchange):
+        def get_order(self, pair, order_id):
+            return {"success": 1, "return": {"order": {
+                "order_id": order_id, "status": "cancelled",
+                "order_rp": "100.0", "remain_rp": "100.0"}}}
+
+    try:
+        _exl2.RealClient = lambda creds=None: _CancelledEx(idr=100000.0)
+        _st3 = {"phase": "ORDER_OPEN", "balance_idr": 100000.0,
+                "cooldowns": {}, "trade_log": [], "live_trade_log": [],
+                "hunt_counter": 0, "gate_stats": {},
+                "order": {"order_id": "live-y", "live": True,
+                          "symbol": "TESTIDR", "pair_id": "test_idr",
+                          "limit_price": 1000.0, "coin_amount": 0.1,
+                          "trade_size_idr": 100.0, "placed_at": _now_cap,
+                          "tick": 1.0, "checks_elapsed": 0,
+                          "framework": "C",
+                          "exit_levels": globals()["get_framework"]("C").initialize_exit(1000.0, 1.0)}}
+        _m4 = handle_order_open(_st3, now=_now_cap + 60)
+        assert _st3["order"] is None and _st3["phase"] == "HUNTING", _st3
+        assert "ORDER_GONE" in _m4, _m4
+        print("[PASS] an externally cancelled order is dropped back to HUNTING")
+    finally:
+        _exl2.RealClient = _orig_rc2
 
     # 5. perform_stop(): HOLDING -> market sell, then STOPPED
     import control as _control

@@ -729,6 +729,17 @@ def _trading_log_section(state: dict) -> str:
             f"Target: <b>{_lv.get('target_price', 0):,} IDR</b> (+{_lv.get('target_pct', 0)*100:.0f}%) · "
             f"Stop: <b>{_lv.get('stop_trigger_price', 0):,} IDR</b> (-{_lv.get('stop_pct', 0)*100:.0f}%)"
         )
+    elif order and order.get("live") and _order_gone(order):
+        # The order is no longer on the book (cancelled in the app, filled, or
+        # expired) but the engine has not ticked yet. Say so instead of showing
+        # a resting order that does not exist.
+        status_badge = '<span class="badge-status blocked">✕ ORDER NO LONGER OPEN</span>'
+        status_detail = (
+            f"<b>{order.get('symbol')}</b> limit buy "
+            f"<b>{order.get('limit_price', 0):,.0f} IDR</b> is not on the "
+            f"exchange any more - it was cancelled, filled or expired. "
+            f"The engine will settle this on its next tick."
+        )
     elif order:
         status_badge = '<span class="badge-status open">● ORDER OPEN</span>'
         status_detail = (
@@ -4182,6 +4193,20 @@ def _open_order() -> bool:
     was placed by one executor and would be filled against another's accounting."""
     st = _dash_state()
     return st.get("phase") == "ORDER_OPEN" and bool(st.get("order"))
+
+
+def _order_gone(order: dict) -> bool:
+    """True only if the exchange POSITIVELY says the order is not on the book.
+
+    Fails closed: an unreadable exchange returns False, because hiding a real
+    resting order would be worse than showing a stale one.
+    """
+    try:
+        import executor_live
+        rec = executor_live.reconcile_order({"order": order})
+        return rec.get("status") == "GONE"
+    except Exception:                                        # noqa: BLE001
+        return False
 
 
 def _exchange_summary(state: dict) -> dict:
