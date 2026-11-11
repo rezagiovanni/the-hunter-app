@@ -1521,6 +1521,31 @@ def _style():
         /* Control plane: START / STOP switch + framework picker */
         .ctrl-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 
+        .row-buy {
+            display: none;
+            padding: 4px 10px;
+            border: 1px solid #ef4444;
+            border-radius: 4px;
+            background: transparent;
+            color: #ef4444;
+            font-family: inherit;
+            font-size: 0.72em;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .row-buy:hover { background: #ef4444; color: #fff; }
+        .row-buy:disabled { opacity: 0.5; cursor: wait; }
+        .board td.act { text-align: center; min-width: 62px; }
+        .action-note {
+            display: block;
+            margin: 8px 0 0;
+            font-size: 0.72em;
+            color: var(--text-dim);
+            line-height: 1.5;
+        }
+
         /* ---- live balance panel ------------------------------------------ */
         .buy-now {
             display: inline-flex;
@@ -2868,18 +2893,35 @@ CHART_JS = """
     }
 
     function refreshBuyButton() {
-        // The button only exists meaningfully in LIVE with nothing open: a
-        // manual buy in paper would be a simulated order dressed as a real one,
-        // and a second position is refused by the engine anyway.
-        var b = document.getElementById('buyNow');
-        if (!b) return;
+        // A manual buy only exists meaningfully in LIVE with nothing open: in
+        // paper it would be a simulated order dressed as a real one, and a
+        // second position is refused by the engine anyway.
         var can = (ctrlState.exec === 'LIVE')
                   && (ctrlState.mode === 'RUNNING')
                   && !(ctrlState.position && ctrlState.position.symbol)
                   && !ctrlState.blocked;
-        b.style.display = can ? 'inline-flex' : 'none';
-        if (!can) return;
-        b.title = 'Market buy at the best ask. Real money.';
+
+        var b = document.getElementById('buyNow');
+        if (b) {
+            b.style.display = can ? 'inline-flex' : 'none';
+            if (can) b.title = 'Market buy at the best ask. Real money.';
+        }
+
+        // One BUY per row in the filter board, same rule. Shown for EVERY pair,
+        // not just the eligible ones - choosing a pair the funnel rejected is
+        // the operator's decision to make, and the engine re-checks the caps
+        // regardless of what the table thinks.
+        Array.from(document.querySelectorAll('.row-buy')).forEach(function (rb) {
+            rb.style.display = can ? 'inline-block' : 'none';
+            if (can && !rb.title) {
+                rb.title = 'Market buy ' + rb.getAttribute('data-sym')
+                           + ' at the best ask. Real money.';
+            }
+        });
+        var note = document.getElementById('actionNote');
+        if (note) {
+            note.style.display = can ? 'none' : 'block';
+        }
     }
 
     function buyNow(symbol) {
@@ -4693,7 +4735,13 @@ async def dashboard():
             + _cell(*r["trend"])
             + f"<td>{r['momentum_disp']}</td>"
             + f"<td class='num {total_cls}'><b>{total_disp}</b></td>"
-            f"<td>{verdict}</td></tr>"
+            f"<td>{verdict}</td>"
+            # Per-pair manual buy. Hidden by default and revealed only when the
+            # executor is LIVE and nothing is open - the same rule the winner
+            # card's button follows, applied to every row so the operator can
+            # buy a pair the funnel did NOT pick.
+            f"<td class='act'><button class='row-buy' data-sym='{r['pair']}' "
+            f"type='button' onclick=\"buyNow('{r['pair']}')\">BUY</button></td></tr>"
         )
     winner_text = f" · winner: <b>{winner}</b>" if winner else " · no eligible pair right now"
 
@@ -4784,7 +4832,7 @@ async def dashboard():
 
         <div class="section board-collapsed" id="boardSection">
             <h2>Filter Board — Prey Selection (live preview)</h2>
-            <p class="board-note">Live preview of The Hunter's funnel · trade size assumed 40,000 IDR (40% of the 100k paper balance) · depth shown = min(ask, bid) cover within ±2% · signal scoring is a preview · cooldown reads hunter_state.json · "!OB" = overbought penalty applied · ML = gradient-boost model predicting 1h direction (veto at P(down) ≥ 60%, 72% precision out-of-sample; majors ~ = no signal, 51.6% ≈ coin flip)</p>
+            <p class="board-note">Live preview of The Hunter's funnel · trade size computed from the CURRENT balance and sizing · depth shown = min(ask, bid) cover within ±2% · signal scoring is a preview · cooldown reads hunter_state.json · "!OB" = overbought penalty applied</p>
             <p class="board-summary"><b>{eligible_n} of 20</b> pairs fully eligible{winner_text}</p>
             <div class="scroll-hint">⟵ swipe horizontally to view all columns ⟶</div>
             <div class="board-wrap">
@@ -4792,10 +4840,15 @@ async def dashboard():
                     <thead><tr>
                         <th>#</th><th>Pair</th><th>Vol</th><th>Candles</th><th>Fresh</th>
                         <th>Spread</th><th>Depth</th><th>Cooldown</th><th>Trend</th>
-                        <th>Mom</th><th>Total</th><th>Verdict</th>
+                        <th>Mom</th><th>Total</th><th>Verdict</th><th>Action</th>
                     </tr></thead>
                     <tbody>{board_html_rows}</tbody>
                 </table>
+                <p class="action-note" id="actionNote">
+                    BUY buttons appear only in LIVE with no position open.
+                    The Action column is present either way so the layout does
+                    not shift when you arm live.
+                </p>
             </div>
         </div>
 
