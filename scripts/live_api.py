@@ -341,32 +341,96 @@ def get_order(pair: str, order_id: str, creds=None) -> Dict[str, Any]:
 
 # --- state-changing calls --------------------------------------------------
 
+def pair_param(pair_id: str, ticker_id: Optional[str] = None) -> str:
+    """The `pair` value the PRIVATE API expects, e.g. 'cst_idr'.
+
+    The public /api/pairs endpoint returns id='cstidr' (no separator) AND
+    ticker_id='cst_idr' (underscore). The private /tapi endpoints document
+    'btc_idr', 'ltc_btc' - underscore. Sending 'cstidr' to `trade` returns
+    {"error": "invalid_pair", "error_description": "Invalid Pair"}, which is what
+    "LiveApiError: Invalid pair." was.
+
+    ticker_id is used when present because it comes from the exchange itself;
+    otherwise it is derived. A value that already contains an underscore is
+    accepted as-is.
+    """
+    if ticker_id:
+        return str(ticker_id)
+    raw = str(pair_id or "").strip().lower()
+    if not raw:
+        raise LiveApiError("pair is required")
+    if "_" in raw:
+        return raw
+    # derive from the idr pair: everything before the trailing 'idr'
+    if raw.endswith("idr") and len(raw) > 3:
+        return f"{raw[:-3]}_idr"
+    raise LiveApiError(
+        f"cannot derive a private-API pair from {pair_id!r}; pass ticker_id")
+
+
 def trade(pair: str, side: str, idr: Optional[float] = None,
           coin: Optional[float] = None, price: Optional[float] = None,
-          creds=None) -> Dict[str, Any]:
+          creds=None, coin_symbol: Optional[str] = None,
+          order_type: Optional[str] = None) -> Dict[str, Any]:
     """Place an order. NEVER retried.
 
-    side  : "buy" or "sell"
-    idr   : for a market buy, the amount of IDR to spend
-    coin  : for a market sell, the amount of coin to sell
-    price : for a limit order, the limit price. Omitted = market (taker).
+    Indodax has three rules that are easy to get wrong and each produces a
+    different error:
 
-    Indodax encodes a market order by omitting the price.
+      1. `pair` is 'cst_idr', NOT 'cstidr'. Use pair_param().
+      2. `order_type` DEFAULTS TO LIMIT. A market order must say so, or the
+         server demands a price and rejects the request.
+      3. A BUY with `order_type=limit` must NOT send `idr` - it is rejected.
+         A limit buy sends the COIN amount instead; only a MARKET buy uses `idr`.
+
+    So the four legal shapes are:
+
+        market buy    order_type=market, idr=<amount>
+        market sell   order_type=market, <coin>=<amount>
+        limit buy     order_type=limit,  price=<p>, <coin>=<amount>
+        limit sell    order_type=limit,  price=<p>, <coin>=<amount>
+
+    `coin_symbol` is the traded currency (e.g. 'cst'), which is also the name of
+    the parameter Indodax expects. It is required for any coin-amount order.
     """
     if side not in ("buy", "sell"):
         raise LiveApiError(f"side must be buy or sell, got {side!r}")
 
-    params: Dict[str, Any] = {"pair": pair, "type": side}
-    if price is not None:
-        params["price"] = f"{price:.0f}"
-    if side == "buy":
-        if idr is None:
-            raise LiveApiError("a buy needs idr (the IDR amount to spend)")
-        params["idr"] = f"{idr:.0f}"
+    if order_type is None:
+        # infer: a sell always needs a coin amount so it is market unless a
+        # price is given; a buy is market when no price is given
+        order_type = "limit" if price is not None else "market"
+    if order_type not in ("limit", "market"):
+        raise LiveApiError(f"order_type must be limit or market, got {order_type!r}")
+
+    params: Dict[str, Any] = {"pair": pair, "type": side, "order_type": order_type}
+
+    if order_type == "limit":
+        if price is None:
+            raise LiveApiError("a limit order needs a price")
+        params["price"] = f"{float(price):.0f}"
+        if side == "buy":
+            # rule 3: idr + limit buy is rejected
+            if coin is None:
+                raise LiveApiError("a limit buy needs a coin amount (not idr)")
+        else:
+            if coin is None:
+                raise LiveApiError("a limit sell needs a coin amount")
+        if not coin_symbol:
+            raise LiveApiError("a coin-amount order needs coin_symbol (e.g. 'cst')")
+        params[coin_symbol] = coin_quantity(coin)
     else:
-        if coin is None:
-            raise LiveApiError("a sell needs coin (the amount of coin to sell)")
-        params["coin"] = coin_quantity(coin)
+        # market
+        if side == "buy":
+            if idr is None:
+                raise LiveApiError("a market buy needs idr (the IDR amount to spend)")
+            params["idr"] = f"{float(idr):.0f}"
+        else:
+            if coin is None:
+                raise LiveApiError("a market sell needs a coin amount")
+            if not coin_symbol:
+                raise LiveApiError("a market sell needs coin_symbol (e.g. 'cst')")
+            params[coin_symbol] = coin_quantity(coin)
 
     return call("trade", params, creds=creds, retries=0)
 
@@ -470,29 +534,86 @@ def _self_check():
     assert "hunter_secret_value" not in _redact("failed secret hunter_secret_value")
     print("[PASS] error text is redacted")
 
+    # --- the private API pair format: 'cst_idr', not 'cstidr' --------------
+    # The public /api/pairs returns id='cstidr'; the private /tapi endpoints
+    # document 'btc_idr'. Sending the public id is what produced
+    # "LiveApiError: Invalid pair."
+    assert pair_param("cstidr") == "cst_idr", pair_param("cstidr")
+    assert pair_param("btcidr") == "btc_idr"
+    assert pair_param("pepeidr") == "pepe_idr"
+    assert pair_param("cst_idr") == "cst_idr", "an underscored pair passes through"
+    assert pair_param("anything", ticker_id="cst_idr") == "cst_idr", "ticker_id wins"
+    try:
+        pair_param("ltcbtc")
+        raise AssertionError("should have raised for a non-idr pair")
+    except LiveApiError as e:
+        assert "ticker_id" in str(e)
+    print("[PASS] pairs are converted to the private-API format: cstidr -> cst_idr")
+
     # a bad side is refused before any network call
     try:
-        trade("btcidr", "hodl", idr=10000, creds=("k" * 30, "s" * 30))
+        trade("cst_idr", "hodl", idr=10000, creds=("k" * 30, "s" * 30))
         raise AssertionError("should have raised")
     except LiveApiError as e:
         assert "buy or sell" in str(e)
     print("[PASS] an invalid side is refused locally, before the network")
 
-    # a buy without idr is refused
+    # a market buy without idr is refused
     try:
-        trade("btcidr", "buy", creds=("k" * 30, "s" * 30))
+        trade("cst_idr", "buy", creds=("k" * 30, "s" * 30))
         raise AssertionError("should have raised")
     except LiveApiError as e:
         assert "idr" in str(e)
-    print("[PASS] a buy without an IDR amount is refused")
+    print("[PASS] a market buy without an IDR amount is refused")
 
     # a sell without coin is refused
     try:
-        trade("btcidr", "sell", creds=("k" * 30, "s" * 30))
+        trade("cst_idr", "sell", creds=("k" * 30, "s" * 30))
         raise AssertionError("should have raised")
     except LiveApiError as e:
         assert "coin" in str(e)
     print("[PASS] a sell without a coin amount is refused")
+
+    # --- order_type is sent explicitly, and the body is correct per shape ----
+    _cap = {}
+    _orig_call = call
+    def _spy(method, params=None, **kw):
+        _cap["method"], _cap["params"] = method, dict(params or {})
+        return {"success": 1, "return": {"order_id": "x"}}
+    globals()["call"] = _spy
+    try:
+        trade("cst_idr", "buy", idr=20000, creds=("k" * 30, "s" * 30),
+              coin_symbol="cst")
+        p_ = _cap["params"]
+        assert p_["order_type"] == "market", p_
+        assert p_.get("idr") == "20000" and "price" not in p_, p_
+        assert "cst" not in p_, "a market buy must not send a coin amount"
+        print("[PASS] market buy: order_type=market, idr only")
+
+        trade("cst_idr", "buy", coin=12.5, price=160, creds=("k" * 30, "s" * 30),
+              coin_symbol="cst")
+        p_ = _cap["params"]
+        assert p_["order_type"] == "limit", p_
+        assert "idr" not in p_, "a limit buy must NOT send idr - Indodax rejects it"
+        assert p_["cst"] == "12.5" and p_["price"] == "160", p_
+        print("[PASS] limit buy: order_type=limit, coin + price, NO idr")
+
+        trade("cst_idr", "sell", coin=12.5, creds=("k" * 30, "s" * 30),
+              coin_symbol="cst")
+        p_ = _cap["params"]
+        assert p_["order_type"] == "market" and p_["cst"] == "12.5", p_
+        assert "idr" not in p_
+        print("[PASS] market sell: order_type=market, coin only")
+    finally:
+        globals()["call"] = _orig_call
+
+    # a limit buy with idr is refused locally rather than by the exchange
+    try:
+        trade("cst_idr", "buy", idr=20000, price=160, creds=("k" * 30, "s" * 30))
+        raise AssertionError("should have refused idr on a limit buy")
+    except LiveApiError as e:
+        assert "coin amount" in str(e)
+    print("[PASS] a limit buy with idr is refused before the network")
 
     # the auth hint names all four causes
     h = _auth_hint("invalid sign", 401)

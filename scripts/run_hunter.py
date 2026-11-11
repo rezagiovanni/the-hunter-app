@@ -1602,7 +1602,8 @@ def run_buy_now(symbol: str, use_live: bool = True):
 
         if use_live:
             import executor_live
-            pf = executor_live.preflight(trade_size_idr=trade_size)
+            pf = executor_live.preflight(trade_size_idr=trade_size,
+                                         pair_info=p_info)
             if not pf.get("ok"):
                 print(json.dumps({"ok": False,
                                   "error": "; ".join(pf.get("problems") or [])[:400]}))

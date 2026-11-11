@@ -79,6 +79,26 @@ class RealClient:
 # Balance / preflight
 # ---------------------------------------------------------------------------
 
+def pair_refs(pair_info: dict) -> Tuple[str, str]:
+    """(private_api_pair, coin_symbol) from a pairs.json entry.
+
+    pairs.json carries id='cstidr' (public style) and ticker_id='cst_idr'
+    (private style). The private API wants the underscored form plus the COIN
+    SYMBOL as the amount parameter name - 'cst', not 'coin'. Both are taken from
+    the exchange's own metadata rather than derived where possible.
+    """
+    pair_id = pair_info.get("id") or pair_info.get("symbol", "").lower()
+    ticker_id = pair_info.get("ticker_id")
+    pair = live_api.pair_param(pair_id, ticker_id=ticker_id)
+    coin = (pair_info.get("traded_currency") or "").lower()
+    if not coin:
+        # 'cst_idr' -> 'cst'
+        coin = pair.split("_")[0]
+    if not coin:
+        raise live_api.LiveApiError(f"cannot determine the coin for {pair_id!r}")
+    return pair, coin
+
+
 def read_balance_idr(client=None) -> float:
     """Spendable IDR, as a float.
 
@@ -118,7 +138,8 @@ def read_coin_balance(symbol: str, client=None) -> float:
 
 
 def preflight(client=None, trade_size_idr: float = 0.0,
-              key_path: Optional[str] = None) -> Dict[str, Any]:
+              key_path: Optional[str] = None,
+              pair_info: Optional[dict] = None) -> Dict[str, Any]:
     """Everything that must be true before a live order is allowed.
 
     Returns {"ok": bool, "checks": [(name, ok, detail)], "problems": [...]}.
@@ -208,6 +229,23 @@ def preflight(client=None, trade_size_idr: float = 0.0,
         add("above exchange minimum", trade_size_idr >= 10000.0,
             f"IDR {trade_size_idr:,.0f} vs the 10,000 IDR minimum")
 
+    # 6b. the pair resolves to a real, tradeable market on the private API.
+    # A wrong pair name only surfaces as "Invalid pair." at order time, after
+    # the operator has typed a confirmation - too late to be useful. Checking it
+    # here turns a failed buy into a preflight line.
+    if pair_info is not None:
+        try:
+            api_pair, coin_sym = pair_refs(pair_info)
+            add("pair format", "_" in api_pair,
+                f"{pair_info.get('symbol')} -> {api_pair} (coin '{coin_sym}')")
+            susp = str(pair_info.get("is_market_suspended", "0"))
+            maint = str(pair_info.get("is_maintenance", "0"))
+            add("pair is tradeable", susp in ("0", "", "False", "false")
+                and maint in ("0", "", "False", "false"),
+                f"suspended={susp} maintenance={maint}")
+        except Exception as e:                               # noqa: BLE001
+            add("pair format", False, str(e))
+
     # 7. key file permissions - a WARNING, not a blocker.
     # A world-readable trading key on a shared machine is a real risk, but
     # refusing to trade over a file mode would block a legitimate operator for
@@ -252,9 +290,14 @@ def create_live_buy_order(symbol: str, limit_price: float, coin_amount: float,
     if now is None:
         now = time.time()
 
-    pair_id = pair_info.get("id", symbol.lower())
-    resp = client.trade(pair=pair_id, side="buy", idr=trade_size_idr,
-                        price=limit_price)
+    api_pair, coin_sym = pair_refs(pair_info)
+    # A LIMIT buy must send the COIN amount, never `idr` - Indodax rejects the
+    # combination explicitly ("Request will be rejected if you send BUY order
+    # request with both idr set & order_type set to LIMIT"). The coin amount is
+    # what the caller already computed for this trade size.
+    resp = client.trade(pair=api_pair, side="buy", coin=coin_amount,
+                        price=limit_price, coin_symbol=coin_sym,
+                        order_type="limit")
     ret = resp.get("return") or {}
     order_id = str(ret.get("order_id") or ret.get("id") or "")
     if not order_id:
@@ -268,7 +311,9 @@ def create_live_buy_order(symbol: str, limit_price: float, coin_amount: float,
         "live": True,
         "hunt_id": hunt_id,
         "symbol": symbol,
-        "pair_id": pair_id,
+        "pair_id": api_pair,
+        "api_pair": api_pair,
+        "coin_symbol": coin_sym,
         "side": "buy",
         "limit_price": float(limit_price),
         "coin_amount": float(coin_amount),
@@ -312,8 +357,9 @@ def create_live_market_buy(symbol: str, idr: float, pair_info: dict,
         raise live_api.LiveApiError(
             f"a market buy of IDR {idr:,.0f} is below the 10,000 IDR minimum")
 
-    pair_id = pair_info.get("id", symbol.lower())
-    resp = client.trade(pair=pair_id, side="buy", idr=idr)
+    api_pair, coin_sym = pair_refs(pair_info)
+    resp = client.trade(pair=api_pair, side="buy", idr=idr,
+                        coin_symbol=coin_sym, order_type="market")
     ret = resp.get("return") or {}
     order_id = str(ret.get("order_id") or ret.get("id") or "")
 
@@ -331,7 +377,9 @@ def create_live_market_buy(symbol: str, idr: float, pair_info: dict,
         "manual": True,
         "hunt_id": hunt_id,
         "symbol": symbol,
-        "pair_id": pair_id,
+        "pair_id": api_pair,
+        "api_pair": api_pair,
+        "coin_symbol": coin_sym,
         "side": "buy",
         "limit_price": entry_price,
         "coin_amount": coins,
@@ -464,13 +512,19 @@ def execute_live_sell(position: dict, best_bid: float, exit_reason: str,
 
     coins = float(position["coins"])
     pair_id = position.get("pair_id", position["symbol"].lower())
+    # a sell with an underscore is already private-format; normalise either way
+    api_pair = live_api.pair_param(pair_id, ticker_id=position.get("api_pair"))
+    coin_sym = (position.get("coin_symbol")
+                or (position.get("symbol") or "").lower().replace("idr", ""))
 
     if exit_reason == EXIT_TARGET and limit_price is not None:
-        resp = client.trade(pair=pair_id, side="sell", coin=coins,
-                            price=limit_price)
+        resp = client.trade(pair=api_pair, side="sell", coin=coins,
+                            price=limit_price, coin_symbol=coin_sym,
+                            order_type="limit")
         fee_pct = float(position.get("maker_fee_pct", 0.1))
     else:
-        resp = client.trade(pair=pair_id, side="sell", coin=coins)
+        resp = client.trade(pair=api_pair, side="sell", coin=coins,
+                            coin_symbol=coin_sym, order_type="market")
         fee_pct = float(position.get("taker_fee_pct", 0.2))
 
     ret = resp.get("return") or {}
@@ -607,6 +661,12 @@ def cancel_all_open_orders(client=None) -> Dict[str, Any]:
 # Self-check (a fake exchange, no network, no credentials)
 # ---------------------------------------------------------------------------
 
+def _base(pair: str) -> str:
+    """'btc_idr' or 'btcidr' -> 'btc'."""
+    p = str(pair).lower()
+    return p.split("_")[0] if "_" in p else p[:-3]
+
+
 class FakeExchange:
     """In-memory exchange that behaves like Indodax for the paths we exercise."""
 
@@ -647,9 +707,12 @@ class FakeExchange:
             "filled_idr": f"{o.get('filled_idr', 0):.8f}",
         }}}
 
-    def trade(self, pair, side, idr=None, coin=None, price=None):
+    def trade(self, pair, side, idr=None, coin=None, price=None,
+              coin_symbol=None, order_type=None):
         self.calls.append({"pair": pair, "side": side, "idr": idr,
-                           "coin": coin, "price": price})
+                           "coin": coin, "price": price,
+                           "coin_symbol": coin_symbol,
+                           "order_type": order_type})
         self._n += 1
         oid = f"live-{self._n}"
         if side == "buy" and price is None:
@@ -658,7 +721,7 @@ class FakeExchange:
             spend = float(idr)
             self.idr -= spend
             got = spend / 1000.0
-            self.coins[pair[:-3]] = self.coins.get(pair[:-3], 0) + got
+            self.coins[_base(pair)] = self.coins.get(_base(pair), 0) + got
             self.orders[oid] = {"pair": pair, "status": "filled",
                                 "filled_coin": got, "filled_idr": spend}
             return {"success": 1, "return": {"order_id": oid,
@@ -666,23 +729,28 @@ class FakeExchange:
                                              "spend_rp": f"{spend:.8f}"}}
 
         if side == "buy":
-            self.idr -= float(idr)
-            # In "full" mode the limit price is treated as already touched, so
-            # the order fills immediately. In "resting" mode it sits on the book
-            # until the test moves it.
+            # A LIMIT buy is priced in COIN (idr is None, coin is set); a MARKET
+            # buy is priced in IDR. Indodax takes exactly one of the two.
+            if coin is not None:
+                spend = float(coin) * float(price or 1000)
+                got = float(coin)
+            else:
+                spend = float(idr)
+                got = spend / float(price or 1000)
+            self.idr -= spend
             if self.fill_mode == "full":
-                got = float(idr) / float(price or 1000)
-                self.coins[pair[:-3]] = self.coins.get(pair[:-3], 0) + got
+                self.coins[_base(pair)] = self.coins.get(_base(pair), 0) + got
                 self.orders[oid] = {"pair": pair, "status": "filled",
-                                    "filled_coin": got, "filled_idr": float(idr)}
+                                    "filled_coin": got, "filled_idr": spend}
                 return {"success": 1, "return": {"order_id": oid,
-                                                 "receive_coin": f"{got:.8f}"}}
+                                                 "receive_coin": f"{got:.8f}",
+                                                 "spend_rp": f"{spend:.8f}"}}
             self.orders[oid] = {"pair": pair, "status": "open",
                                 "filled_coin": 0, "filled_idr": 0}
             return {"success": 1, "return": {"order_id": oid}}
         # sell
         got_coin = float(coin)
-        self.coins[pair[:-3]] = self.coins.get(pair[:-3], 0) - got_coin
+        self.coins[_base(pair)] = self.coins.get(_base(pair), 0) - got_coin
         proceeds = got_coin * float(price or 1000)
         self.idr += proceeds
         self.orders[oid] = {"pair": pair, "status": "filled",
@@ -797,7 +865,12 @@ def _self_check():
     pf8b = preflight(client=ex8b, trade_size_idr=32000.0, key_path="/tmp/none")
     clock = [c for c in pf8b["checks"] if c[0] == "clock"][0]
     assert clock[1] is True, clock
-    assert "56" not in clock[2] and "1792574065" not in clock[2], clock[2]
+    # assert on the NUMBER, not on substrings: "(local 1794394566...)" contains
+    # "56" by coincidence, and the earlier version of this assertion failed on
+    # correct output.
+    _drift = float(clock[2].split("is ")[1].split("s ")[0])
+    assert _drift < 5.0, clock[2]
+    assert "1792574065" not in clock[2], clock[2]
     assert float(clock[2].split("is ")[1].split("s ")[0]) < 5.0, clock[2]
     print(f"[PASS] a healthy clock reports real drift: {clock[2]}")
 
