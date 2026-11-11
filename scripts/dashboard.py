@@ -1262,6 +1262,13 @@ def _winner_card(winner, rows):
     </div>
     <div class="winner-actions">
         <button class="toggle-board" id="toggleBoard" type="button">[+] Show Filter Board</button>
+        <!-- BUY NOW: a manual market buy, LIVE only.
+             It sits on the winner card because that is where the operator
+             already is when they decide to act. It is a real order, so it asks
+             for a typed confirmation and the engine re-checks every cap. -->
+        <button class="buy-now" id="buyNow" type="button"
+                style="display:none"
+                onclick="buyNow('{winner}')">BUY {winner} NOW</button>
     </div>
 </div>"""
 
@@ -1515,6 +1522,34 @@ def _style():
         .ctrl-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 
         /* ---- live balance panel ------------------------------------------ */
+        .buy-now {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            margin-left: 10px;
+            padding: 9px 16px;
+            border: 1px solid #ef4444;
+            border-radius: 6px;
+            background: #ef4444;
+            color: #fff;
+            font-family: inherit;
+            font-size: 0.8em;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            cursor: pointer;
+            transition: background 0.15s, transform 0.1s;
+        }
+        .buy-now:hover { background: #dc2626; }
+        .buy-now:active { transform: scale(0.98); }
+        .buy-now:disabled {
+            background: #7f1d1d;
+            border-color: #7f1d1d;
+            cursor: wait;
+        }
+        @media (max-width: 720px) {
+            .buy-now { margin-left: 0; margin-top: 8px; width: 100%; justify-content: center; min-height: 46px; }
+        }
+
         .winner-tag.blocked {
             background: rgba(239,68,68,0.18);
             color: #ef4444;
@@ -2701,6 +2736,7 @@ CHART_JS = """
         // the tabs in agreement with the control file. The first time the page
         // loads with LIVE armed, open the live ledger - that is where the real
         // money is and it should not be hidden behind a tab.
+        refreshBuyButton();
         if (isLive && !window.__ledgerInit && currentLedger === 'paper') {
             window.__ledgerInit = true;
             showLedger('live');
@@ -2829,6 +2865,62 @@ CHART_JS = """
                 if (main) main.textContent = 'unavailable';
                 if (err) err.textContent = String(e);
             });
+    }
+
+    function refreshBuyButton() {
+        // The button only exists meaningfully in LIVE with nothing open: a
+        // manual buy in paper would be a simulated order dressed as a real one,
+        // and a second position is refused by the engine anyway.
+        var b = document.getElementById('buyNow');
+        if (!b) return;
+        var can = (ctrlState.exec === 'LIVE')
+                  && (ctrlState.mode === 'RUNNING')
+                  && !(ctrlState.position && ctrlState.position.symbol)
+                  && !ctrlState.blocked;
+        b.style.display = can ? 'inline-flex' : 'none';
+        if (!can) return;
+        b.title = 'Market buy at the best ask. Real money.';
+    }
+
+    function buyNow(symbol) {
+        var NL = String.fromCharCode(10);
+        var msg = 'MARKET BUY ' + symbol + '?' + NL + NL;
+        msg += 'This spends REAL money at whatever the book gives.' + NL;
+        msg += 'A market order cannot be undone.' + NL + NL;
+        msg += 'Type ' + symbol + ' to confirm.';
+        var typed = window.prompt(msg, '');
+        if (typed === null) return;
+        if (String(typed).trim().toUpperCase() !== symbol) {
+            window.alert('Not bought: you must type ' + symbol + ' exactly.');
+            return;
+        }
+        var b = document.getElementById('buyNow');
+        if (b) { b.disabled = true; b.textContent = 'BUYING...'; }
+        fetch('/api/position/buy', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({symbol: symbol, confirm: symbol})
+        })
+        .then(function (r) { return r.json().then(function (d) {
+            return {status: r.status, d: d}; }); })
+        .then(function (res) {
+            if (res.status === 409 && res.d.busy) {
+                setTimeout(function () { buyNow(symbol); }, 2500);
+                return;
+            }
+            if (!res.d.ok) {
+                window.alert('Not bought: ' + (res.d.error || 'unknown'));
+                if (b) { b.disabled = false; b.textContent = 'BUY ' + symbol + ' NOW'; }
+                refreshControl();
+                return;
+            }
+            window.alert(res.d.message || 'bought');
+            refreshDashboard();
+        })
+        .catch(function (e) {
+            window.alert('Buy failed: ' + e);
+            if (b) { b.disabled = false; b.textContent = 'BUY ' + symbol + ' NOW'; }
+        });
     }
 
     function onStartLive() {
@@ -4203,6 +4295,84 @@ async def api_control_start():
     cron_ok, cron_detail = _run_cron("resume")
     return {"ok": True, "mode": MODE_RUNNING,
             "cron_ok": cron_ok, "cron_detail": cron_detail}
+
+
+@app.post("/api/position/buy")
+async def api_position_buy(request: Request):
+    """Market-buy a pair NOW, as a manual operator action.
+
+    Only available in LIVE, and only while flat. It spends real money, so it
+    requires the symbol in the body AND a typed confirmation phrase, and the
+    engine re-checks every cap itself - this endpoint is not the safety layer.
+
+    A market order is used rather than a limit because the button's whole point
+    is "buy it now". A limit can rest unfilled for minutes, which is the
+    opposite of an immediate buy.
+    """
+    try:
+        from control import load_control, is_live
+        ctrl = load_control()
+    except Exception as e:                                   # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"cannot read control: {e}"},
+                            status_code=500)
+
+    if not is_live(ctrl):
+        return JSONResponse(
+            {"ok": False,
+             "error": "market buy is LIVE only - start LIVE first, or use the "
+                      "paper engine's own entries"},
+            status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    symbol = str(body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return JSONResponse({"ok": False, "error": "symbol is required"},
+                            status_code=400)
+    if str(body.get("confirm", "")).strip().upper() != symbol:
+        return JSONResponse(
+            {"ok": False,
+             "error": f"type {symbol} to confirm"},
+            status_code=400)
+
+    if _open_position() or _open_order():
+        return JSONResponse(
+            {"ok": False,
+             "error": "a position or order is already open - close it first"},
+            status_code=409)
+
+    try:
+        proc = subprocess.run(
+            [ENGINE_PYTHON, str(STOP_SCRIPT), "--buy-now", symbol],
+            capture_output=True, text=True, timeout=90,
+            cwd=str(BASE_DIR),
+        )
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"ok": False, "error": "buy timed out"},
+                            status_code=504)
+    except OSError as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"},
+                            status_code=500)
+
+    if proc.returncode == 2:
+        return JSONResponse({"ok": False, "busy": True,
+                             "error": "engine tick in progress - retry"},
+                            status_code=409)
+
+    try:
+        result = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse(
+            {"ok": False,
+             "error": (proc.stderr or proc.stdout or "no output").strip()[:400]},
+            status_code=500)
+
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=400)
+    return result
 
 
 @app.post("/api/position/sell")

@@ -287,6 +287,73 @@ def create_live_buy_order(symbol: str, limit_price: float, coin_amount: float,
     }
 
 
+def create_live_market_buy(symbol: str, idr: float, pair_info: dict,
+                           now: Optional[float] = None,
+                           hunt_id: Optional[str] = None,
+                           entry_bid: Optional[float] = None,
+                           entry_ask: Optional[float] = None,
+                           client=None) -> Tuple[dict, dict]:
+    """Spend IDR at market and return (order, fill).
+
+    A LIMIT order was wrong for a manual "buy now": it rests on the book and may
+    never fill, which is the opposite of the button's purpose. A market order has
+    no price parameter at all - Indodax fills it against the book immediately.
+
+    Returns (order, fill) where fill carries the coins actually received and the
+    IDR actually spent, both read from the response. If the exchange does not
+    report the received coin, the fill is marked unreconciled rather than
+    inventing an amount - a position with a guessed size would sell the wrong
+    number of coins later.
+    """
+    client = client or RealClient()
+    if now is None:
+        now = time.time()
+    if idr < 10000:
+        raise live_api.LiveApiError(
+            f"a market buy of IDR {idr:,.0f} is below the 10,000 IDR minimum")
+
+    pair_id = pair_info.get("id", symbol.lower())
+    resp = client.trade(pair=pair_id, side="buy", idr=idr)
+    ret = resp.get("return") or {}
+    order_id = str(ret.get("order_id") or ret.get("id") or "")
+
+    coins = _f(ret.get("receive_coin") or ret.get("get_coin") or ret.get("coin"))
+    spent = _f(ret.get("spend_rp") or ret.get("spend") or ret.get("idr")) or float(idr)
+    reconciled = coins > 0
+
+    entry_price = (spent / coins) if reconciled and coins else 0.0
+
+    order = {
+        "order_id": order_id,
+        "exchange": "indodax",
+        "live": True,
+        "market": True,
+        "manual": True,
+        "hunt_id": hunt_id,
+        "symbol": symbol,
+        "pair_id": pair_id,
+        "side": "buy",
+        "limit_price": entry_price,
+        "coin_amount": coins,
+        "trade_size_idr": spent,
+        "placed_at": now,
+        "checks_elapsed": 0,
+        "tick": float(pair_info.get("tick", 1.0)),
+        "maker_fee_pct": float(pair_info.get("trade_fee_percent_maker", 0.1)),
+        "taker_fee_pct": float(pair_info.get("trade_fee_percent_taker", 0.2)),
+        "entry_bid": entry_bid,
+        "entry_ask": entry_ask,
+        "qty_increment": float(pair_info.get("quantity_increment", 0.0) or 0.0),
+        "filled_coins": coins,
+        "filled_idr": spent,
+        "reconciled": reconciled,
+        "fees_paid_idr": spent * float(pair_info.get("trade_fee_percent_taker", 0.2)) / 100.0,
+    }
+    fill = {"coins": coins, "idr": spent, "entry_price": entry_price,
+            "reconciled": reconciled}
+    return order, fill
+
+
 def check_live_buy_fill(order: dict, live_price: float,
                         now: Optional[float] = None,
                         client=None) -> Tuple[bool, Optional[dict]]:
@@ -585,6 +652,19 @@ class FakeExchange:
                            "coin": coin, "price": price})
         self._n += 1
         oid = f"live-{self._n}"
+        if side == "buy" and price is None:
+            # MARKET BUY: Indodax fills against the book and reports the coin
+            # received. 1000 IDR per coin is the fake's notional price.
+            spend = float(idr)
+            self.idr -= spend
+            got = spend / 1000.0
+            self.coins[pair[:-3]] = self.coins.get(pair[:-3], 0) + got
+            self.orders[oid] = {"pair": pair, "status": "filled",
+                                "filled_coin": got, "filled_idr": spend}
+            return {"success": 1, "return": {"order_id": oid,
+                                             "receive_coin": f"{got:.8f}",
+                                             "spend_rp": f"{spend:.8f}"}}
+
         if side == "buy":
             self.idr -= float(idr)
             # In "full" mode the limit price is treated as already touched, so
@@ -753,6 +833,37 @@ def _self_check():
     execute_live_sell(dict(pos11), 960.0, EXIT_HARD_SL, now=4.0, client=ex12)
     assert ex12.calls[-1]["price"] is None, ex12.calls[-1]
     print("[PASS] a hard stop is a MARKET sell - it takes what the book gives")
+
+    # --- market buy (the manual BUY NOW button) -----------------------------
+    ex13 = FakeExchange(idr=50000.0)
+    order13, fill13 = create_live_market_buy(
+        "BTCIDR", 20000.0, pair_info, now=5.0, hunt_id="H-MKT", client=ex13)
+    assert order13["market"] is True and order13["manual"] is True, order13
+    assert ex13.calls[-1]["price"] is None, "a market buy must send no price"
+    assert fill13["reconciled"] is True and fill13["coins"] > 0, fill13
+    assert abs(fill13["idr"] - 20000.0) < 1e-6, fill13
+    print(f"[PASS] a market buy spends IDR at market: {fill13['coins']:.6f} coins "
+          f"for {fill13['idr']:,.0f}")
+
+    # below the exchange minimum must be refused locally
+    try:
+        create_live_market_buy("BTCIDR", 5000.0, pair_info, client=FakeExchange())
+        raise AssertionError("should have refused a 5,000 IDR buy")
+    except live_api.LiveApiError as e:
+        assert "10,000" in str(e)
+    print("[PASS] a market buy below 10,000 IDR is refused before the network")
+
+    # if the exchange does not report the coin received, say so
+    class NoCoin(FakeExchange):
+        def trade(self, pair, side, **kw):
+            self._n += 1
+            return {"success": 1, "return": {"order_id": f"n{self._n}"}}
+
+    o14, f14 = create_live_market_buy("BTCIDR", 20000.0, pair_info,
+                                      client=NoCoin())
+    assert f14["reconciled"] is False and f14["coins"] == 0.0, f14
+    assert o14["reconciled"] is False
+    print("[PASS] an unreported fill is flagged, not guessed")
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 

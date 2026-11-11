@@ -1383,6 +1383,17 @@ def main():
 
     if "--sell-now" in sys.argv:
         run_sell_now()
+        return
+    if "--buy-now" in sys.argv:
+        # --buy-now SYMBOL [--paper]
+        args = [a for a in sys.argv[1:] if not a.startswith("--")]
+        sym = args[0] if args else None
+        if not sym:
+            print(json.dumps({"ok": False,
+                              "error": "usage: --buy-now SYMBOL [--paper]"}))
+            sys.exit(3)
+        run_buy_now(sym.upper(), use_live=("--paper" not in sys.argv))
+        return
     if "--stop-now" in sys.argv:
         run_stop_now()
         return
@@ -1499,6 +1510,213 @@ def run_sell_now():
     finally:
         release_lock(lock_fd)
     sys.exit(0)
+
+
+def run_buy_now(symbol: str, use_live: bool = True):
+    """Market-buy `symbol` immediately, as a MANUAL operator action.
+
+    This exists because waiting for the engine to pick a pair is not always what
+    the operator wants: the funnel can show a winner and the engine can be busy
+    with a different one. It is deliberately NOT the strategy path - it bypasses
+    entry scoring entirely, because the human already decided.
+
+    What it does NOT bypass:
+
+      the executor      refusing to run as PAPER (a "live buy" while paper is
+                        armed would place a real order under a simulated label)
+      the phase         refuses if a position or order is already open
+      the caps          live.max_per_trade_idr and the daily live loss cap
+      the preflight     credentials, balance, frozen account, clock
+      the sizing floor  the exchange's 10,000 IDR minimum
+
+    Takes the engine flock so it cannot interleave with a tick. Exit codes:
+    0 = bought, 2 = a tick holds the lock, 3 = refused (with a reason).
+    """
+    now = time.time()
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "busy": True,
+                          "error": "engine tick in progress, retry"}))
+        sys.exit(2)
+
+    try:
+        check_kill_switch()
+        ctrl = load_control()
+        state = load_state()
+
+        if state.get("phase") != "HUNTING" or state.get("position") or state.get("order"):
+            print(json.dumps({
+                "ok": False,
+                "error": f"cannot buy: phase is {state.get('phase')} "
+                         f"with an open position or order",
+                "phase": state.get("phase"),
+            }))
+            sys.exit(3)
+
+        if use_live and ctrl.get("exec") != "LIVE":
+            print(json.dumps({
+                "ok": False,
+                "error": "this is a LIVE market buy but the executor is PAPER - "
+                         "start LIVE first",
+            }))
+            sys.exit(3)
+
+        if use_live and live_daily_cap_hit(state, now):
+            print(json.dumps({
+                "ok": False,
+                "error": f"daily live loss cap reached "
+                         f"(-{live_daily_loss_idr(state, now):,.0f} of "
+                         f"{LIVE_MAX_DAILY_LOSS_IDR:,.0f} IDR)",
+            }))
+            sys.exit(3)
+
+        # find the pair in the ranked universe; a manual buy is only offered for
+        # pairs the app already tracks, so the tick can manage the exit
+        with open(PAIRS_FILE, "r") as fh:
+            pairs = json.load(fh)
+        p_info = next((p for p in pairs if p["symbol"].upper() == symbol.upper()), None)
+        if p_info is None:
+            print(json.dumps({"ok": False,
+                              "error": f"{symbol} is not in the tracked universe"}))
+            sys.exit(3)
+
+        # size: the same fraction the engine uses, clamped to the live cap
+        if use_live:
+            try:
+                import executor_live
+                balance = executor_live.read_balance_idr()
+            except Exception as e:                           # noqa: BLE001
+                print(json.dumps({"ok": False,
+                                  "error": f"cannot read the exchange balance: {e}"}))
+                sys.exit(3)
+            trade_size = balance * SIZING_FRACTION
+            trade_size = min(trade_size, live_trade_cap_idr())
+        else:
+            trade_size = state.get("balance_idr", 0.0) * SIZING_FRACTION
+
+        if trade_size < 10000:
+            print(json.dumps({"ok": False,
+                              "error": f"size {trade_size:,.0f} IDR is below the "
+                                       f"10,000 IDR exchange minimum"}))
+            sys.exit(3)
+
+        if use_live:
+            import executor_live
+            pf = executor_live.preflight(trade_size_idr=trade_size)
+            if not pf.get("ok"):
+                print(json.dumps({"ok": False,
+                                  "error": "; ".join(pf.get("problems") or [])[:400]}))
+                sys.exit(3)
+
+        pair_id = p_info.get("id", symbol.lower())
+        depth = load_depth(pair_id)
+        ticker = fetch_live_ticker(pair_id, depth_fallback=depth)
+        best_bid = ticker.get("buy") or ticker.get("last")
+        best_ask = ticker.get("sell") or best_bid
+
+        fw = get_framework(ctrl.get("framework") or active_framework())
+        hunt_id = next_hunt_id(state)
+
+        if use_live:
+            import executor_live
+            order, fill = executor_live.create_live_market_buy(
+                symbol=p_info["symbol"], idr=trade_size, pair_info=p_info,
+                now=now, hunt_id=hunt_id,
+                entry_bid=best_bid, entry_ask=best_ask,
+            )
+            if not fill.get("reconciled"):
+                # the order succeeded but we do not know how many coins we hold;
+                # guessing would make the stop sell the wrong size
+                record_hunt_event(hunt_id, "MANUAL_BUY_UNRECONCILED", {
+                    "symbol": p_info["symbol"], "order_id": order.get("order_id"),
+                    "idr": trade_size,
+                }, now=now)
+                print(json.dumps({
+                    "ok": False,
+                    "error": "the order was accepted but the exchange did not "
+                             "report the coin received - check the position in "
+                             "Indodax before trading further",
+                    "order_id": order.get("order_id"),
+                }))
+                sys.exit(3)
+        else:
+            limit_price = compute_maker_limit_price(
+                float(best_bid), float(best_ask), float(p_info.get("tick", 1.0)))
+            qty_incr = float(p_info.get("quantity_increment", 1e-8))
+            coin_amount = compute_coin_amount(trade_size, limit_price, qty_incr)
+            order = create_paper_buy_order(
+                symbol=p_info["symbol"], limit_price=limit_price,
+                coin_amount=coin_amount, trade_size_idr=trade_size,
+                pair_info=p_info, now=now, hunt_id=hunt_id,
+                entry_bid=best_bid, entry_ask=best_ask,
+                qty_increment=qty_incr,
+            )
+            fill = {"coins": coin_amount, "idr": trade_size,
+                    "entry_price": limit_price, "reconciled": True}
+
+        levels = fw.initialize_exit(float(fill["entry_price"]), float(p_info.get("tick", 1.0)))
+
+        position = {
+            "hunt_id": hunt_id,
+            "symbol": p_info["symbol"],
+            "pair_id": pair_id,
+            "entry_price": float(fill["entry_price"]),
+            "coins": float(fill["coins"]),
+            "entry_time": now,
+            "order_id": order.get("order_id"),
+            "live": bool(use_live),
+            "manual": True,
+            "maker_fee_pct": order.get("maker_fee_pct", 0.1),
+            "taker_fee_pct": order.get("taker_fee_pct", 0.2),
+            "fees_paid_idr": order.get("fees_paid_idr", 0.0),
+            "entry_bid": best_bid,
+            "entry_ask": best_ask,
+            "framework": fw.name,
+            "framework_version": getattr(fw, "version", "?"),
+            "exit_levels": levels,
+            "total_cost_idr": float(fill["idr"]),
+            "filled_idr": float(fill["idr"]),
+            "tick": float(p_info.get("tick", 1.0)),
+            "qty_increment": float(p_info.get("quantity_increment", 1e-8)),
+        }
+
+        state["position"] = position
+        state["order"] = None
+        state["phase"] = "HOLDING"
+        save_state(state)
+
+        record_hunt_event(hunt_id, "MANUAL_MARKET_BUY", {
+            "symbol": p_info["symbol"],
+            "order_id": order.get("order_id"),
+            "coins": position["coins"],
+            "entry_price": position["entry_price"],
+            "idr": trade_size,
+            "framework": fw.name,
+        }, now=now)
+
+        print(json.dumps({
+            "ok": True,
+            "message": (f"bought {p_info['symbol']} at market: "
+                        f"{position['coins']:.8f} for {trade_size:,.0f} IDR "
+                        f"@ ~{position['entry_price']:,.4f}"),
+            "hunt_id": hunt_id,
+            "symbol": p_info["symbol"],
+            "order_id": order.get("order_id"),
+            "entry_price": position["entry_price"],
+            "coins": position["coins"],
+            "idr": trade_size,
+            "target": levels["target_price"],
+            "stop": levels["stop_trigger_price"],
+            "phase": state["phase"],
+        }, indent=2))
+    except HaltSignal as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
+    except Exception as e:                                  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        sys.exit(1)
+    finally:
+        release_lock(lock_fd)
 
 
 def run_stop_now():
