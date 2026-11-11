@@ -869,23 +869,30 @@ def _trading_log_section(state: dict) -> str:
                 <div class="trade-sub">{status_badge} {status_detail}</div>
             </div>
             <div class="mode-control-wrap">
-                <!-- These were previously view toggles that only swapped which
-                     trade TABLE was displayed, while looking exactly like a
-                     paper/live switch. That is the most dangerous UI the app
-                     could have: an operator could believe they were on paper
-                     while real orders were live, or vice versa. The executor is
-                     now shown from the control file, and changing it requires
-                     STOPPED plus a typed confirmation. -->
-                <!-- A single read-only badge. The previous two-chip PAPER |
-                     LIVE control looked exactly like a segmented switch, so it
-                     invited exactly the question "why can't I click it?". It
-                     was never clickable: the executor is changed by START LIVE
-                     while stopped, never by poking this. One badge cannot be
-                     mistaken for a control. -->
+                <!-- Two tabs, back by request - they are the fastest way to
+                     compare the two ledgers.
+
+                     They are TABS, not a mode switch. Clicking one changes
+                     which ledger you are LOOKING at; it never changes which
+                     executor trades. The executor is the badge to their left,
+                     and it is the only thing that says where money moves.
+                     The earlier version of these same buttons WROTE the choice
+                     to localStorage and changed nothing, which is how someone
+                     ends up reading a simulated balance as their own. -->
                 <div class="exec-badge" id="execBadge" role="status"
-                     aria-live="polite">
+                     aria-live="polite" title="Which executor places orders. Changed only by START PAPER / START LIVE while stopped.">
                     <span class="dot paper" id="execDot"></span>
                     <span id="execLabel">EXECUTOR: PAPER</span>
+                </div>
+                <div class="mode-btn-group" id="ledgerTabs" role="tablist">
+                    <button class="mode-btn active" id="tabPaper" type="button"
+                            role="tab" aria-selected="true" onclick="showLedger('paper')">
+                        <span class="dot paper"></span> PAPER MODE
+                    </button>
+                    <button class="mode-btn" id="tabLive" type="button"
+                            role="tab" aria-selected="false" onclick="showLedger('live')">
+                        <span class="dot live"></span> LIVE MODE
+                    </button>
                 </div>
             </div>
         </div>
@@ -1986,6 +1993,44 @@ def _style():
         .badge-status.open { background: rgba(251,191,36,0.15); color: var(--warn); border: 1px solid #fbbf24; }
 
         .mode-control-wrap { display: flex; align-items: center; }
+        /* Ledger tabs. They choose which table you read; they do not choose
+           which executor trades. */
+        .mode-btn-group {
+            display: flex;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            border-radius: 6px;
+            overflow: hidden;
+            margin-left: 10px;
+        }
+        .mode-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            padding: 8px 14px;
+            font-family: inherit;
+            font-size: 0.78em;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            transition: background 0.15s, color 0.15s;
+        }
+        .mode-btn:hover { background: var(--bg-elevated); }
+        .mode-btn.active { background: var(--bg-elevated); color: var(--text-primary); }
+        .mode-btn .dot { width: 7px; height: 7px; border-radius: 50%; }
+        .mode-btn .dot.paper { background: #60a5fa; }
+        .mode-btn .dot.live { background: #ef4444; }
+        #tabLive.active { color: #ef4444; box-shadow: inset 0 -2px 0 #ef4444; }
+        #tabPaper.active { color: #60a5fa; box-shadow: inset 0 -2px 0 #60a5fa; }
+        @media (max-width: 720px) {
+            .mode-control-wrap { width: 100%; flex-wrap: wrap; gap: 8px; }
+            .mode-btn-group { width: 100%; margin-left: 0; }
+            .mode-btn { flex: 1; justify-content: center; padding: 11px 6px; min-height: 44px; }
+        }
+
         /* A read-only badge, deliberately not shaped like a switch: no border
            between halves, no hover state, cursor stays default. */
         .exec-badge {
@@ -2590,14 +2635,16 @@ CHART_JS = """
 
         paintExec();
 
-        // The two panels are different ledgers, not two views of one. Showing
-        // the SIMULATION panel while LIVE is armed is how someone reads a
-        // simulated IDR 92,818 as their real balance.
-        var liveWrap = document.getElementById('liveTradeWrap');
-        var paperWrap = document.getElementById('paperTradeWrap');
-        if (liveWrap) liveWrap.style.display = isLive ? 'block' : 'none';
-        if (paperWrap) paperWrap.style.display = isLive ? 'none' : 'block';
-        if (isLive) loadLiveBalance();
+        // The TAB owns which panel is visible; this only keeps the badge and
+        // the tabs in agreement with the control file. The first time the page
+        // loads with LIVE armed, open the live ledger - that is where the real
+        // money is and it should not be hidden behind a tab.
+        if (isLive && !window.__ledgerInit && currentLedger === 'paper') {
+            window.__ledgerInit = true;
+            showLedger('live');
+        } else {
+            showLedger(currentLedger);
+        }
 
         // While RUNNING there is exactly one action - STOP - and it says which
         // executor it is stopping. While STOPPED there are two ways to start,
@@ -2658,6 +2705,26 @@ CHART_JS = """
                 ? '<span class="live-badge">\u25CF LIVE \u00B7 REAL MONEY</span>'
                 : '';
         }
+    }
+
+    // Which ledger the operator is LOOKING at. Deliberately not persisted and
+    // deliberately separate from ctrlState.exec: this is a view, and a view
+    // must never be able to disagree with what is trading.
+    var currentLedger = 'paper';
+
+    function showLedger(which) {
+        currentLedger = (which === 'live') ? 'live' : 'paper';
+        var paperWrap = document.getElementById('paperTradeWrap');
+        var liveWrap = document.getElementById('liveTradeWrap');
+        var tabP = document.getElementById('tabPaper');
+        var tabL = document.getElementById('tabLive');
+        if (paperWrap) paperWrap.style.display = (currentLedger === 'paper') ? 'block' : 'none';
+        if (liveWrap) liveWrap.style.display = (currentLedger === 'live') ? 'block' : 'none';
+        if (tabP) { tabP.classList.toggle('active', currentLedger === 'paper');
+                    tabP.setAttribute('aria-selected', currentLedger === 'paper'); }
+        if (tabL) { tabL.classList.toggle('active', currentLedger === 'live');
+                    tabL.setAttribute('aria-selected', currentLedger === 'live'); }
+        if (currentLedger === 'live') loadLiveBalance();
     }
 
     function loadLiveBalance() {
