@@ -126,6 +126,9 @@ DEFAULT_FROM = "2024-01-01"
 
 app = FastAPI(title="The Hunter Dashboard")
 
+# short-lived cache for the real balance; the exchange rate-limits
+_LIVE_BAL_CACHE = {"at": 0.0, "data": None}
+
 # Favicon / static assets (dagger icon)
 STATIC_DIR = Path(_STATIC)
 if STATIC_DIR.exists():
@@ -694,7 +697,14 @@ def _trading_log_section(state: dict) -> str:
         )
     else:
         status_badge = f'<span class="badge-status hunting">● {phase}</span>'
-        status_detail = f"Scanning 20 IDR Pairs · Virtual Balance: <b>IDR {balance:,.0f}</b> · engine ready"
+        # The header says which ledger it is quoting. It used to say
+        # "Virtual Balance" unconditionally, which is true in paper and a lie in
+        # live - and the number shown was the simulated one either way.
+        if _exec_is_live():
+            status_detail = ("Scanning 20 IDR Pairs · "
+                             "<b>LIVE</b> · real balance on the exchange panel")
+        else:
+            status_detail = f"Scanning 20 IDR Pairs · Virtual Balance: <b>IDR {balance:,.0f}</b> · engine ready"
 
     def _open_row(p, o):
         """Live position/order row (pinned above the paginated history).
@@ -919,14 +929,16 @@ def _trading_log_section(state: dict) -> str:
             {paper_pager}
         </div>
 
-        <!-- Live Mode Trade Log (hidden by default) -->
+        <!-- Live Mode panel (hidden until LIVE is armed) -->
         <div id="liveTradeWrap" class="trade-log-container" style="display:none;">
-            <div class="live-standby-banner">
-                <div class="standby-icon">🛡️</div>
-                <div class="standby-text">
-                    <div class="standby-title">LIVE TRADING STANDBY · 0 REAL CAPITAL POSITIONS</div>
-                    <div class="standby-sub">Live executor is unconfigured by design (paper validation phase active). All automated trades are executed in Paper Mode.</div>
-                </div>
+            <div class="live-banner">
+                <span class="tag-live">LIVE</span>
+                <span class="live-banner-main">
+                    Real capital on Indodax ·
+                    IDR <b id="liveBalIdr">—</b> available
+                    <span id="liveBalHold" class="live-bal-sub"></span>
+                </span>
+                <span id="liveBalErr" class="live-bal-err"></span>
             </div>
             {live_stats}
             <div class="scroll-hint">⟵ swipe horizontally to view all columns ⟶</div>
@@ -1458,6 +1470,37 @@ def _style():
 
         /* Control plane: START / STOP switch + framework picker */
         .ctrl-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+        /* ---- live balance panel ------------------------------------------ */
+        .live-banner {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            padding: 11px 16px;
+            border: 1px solid #ef4444;
+            border-left-width: 4px;
+            border-radius: 6px;
+            background: rgba(239,68,68,0.07);
+            font-size: 0.82em;
+            color: var(--text-primary);
+        }
+        .live-banner-main b { color: #fff; font-size: 1.15em; }
+        .live-bal-sub { color: var(--text-dim); font-size: 0.9em; }
+        .live-bal-err {
+            color: #fca5a5;
+            font-size: 0.9em;
+            width: 100%;
+        }
+        .tag-live {
+            background: #ef4444;
+            color: #fff;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 0.78em;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+        }
 
         /* ---- LIVE execution ----------------------------------------------
            LIVE must never look like paper. A separate button colour, a red
@@ -2546,6 +2589,15 @@ CHART_JS = """
 
         paintExec();
 
+        // The two panels are different ledgers, not two views of one. Showing
+        // the SIMULATION panel while LIVE is armed is how someone reads a
+        // simulated IDR 92,818 as their real balance.
+        var liveWrap = document.getElementById('liveTradeWrap');
+        var paperWrap = document.getElementById('paperTradeWrap');
+        if (liveWrap) liveWrap.style.display = isLive ? 'block' : 'none';
+        if (paperWrap) paperWrap.style.display = isLive ? 'none' : 'block';
+        if (isLive) loadLiveBalance();
+
         // While RUNNING there is exactly one action - STOP - and it says which
         // executor it is stopping. While STOPPED there are two ways to start,
         // and they are different buttons hitting different endpoints.
@@ -2605,6 +2657,41 @@ CHART_JS = """
                 ? '<span class="live-badge">\u25CF LIVE \u00B7 REAL MONEY</span>'
                 : '';
         }
+    }
+
+    function loadLiveBalance() {
+        // Real exchange balance, fetched server-side. Shown only while LIVE is
+        // armed; the paper balance belongs to the SIMULATION panel and must
+        // never be presented as if it were real money.
+        if (ctrlState.exec !== 'LIVE') return;
+        var main = document.getElementById('liveBalIdr');
+        var hold = document.getElementById('liveBalHold');
+        var err = document.getElementById('liveBalErr');
+        fetch('/api/live/balance', { cache: 'no-store' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d.ok) {
+                    if (main) main.textContent = 'unavailable';
+                    if (err) err.textContent = d.error || 'cannot read balance';
+                    return;
+                }
+                if (err) err.textContent = '';
+                if (main) {
+                    main.textContent = 'IDR ' + Number(d.idr || 0)
+                        .toLocaleString(undefined, {maximumFractionDigits: 0});
+                }
+                if (hold) {
+                    hold.textContent = (d.idr_on_hold > 0)
+                        ? (' (IDR ' + Number(d.idr_on_hold)
+                             .toLocaleString(undefined, {maximumFractionDigits: 0})
+                           + ' locked in open orders)')
+                        : '';
+                }
+            })
+            .catch(function (e) {
+                if (main) main.textContent = 'unavailable';
+                if (err) err.textContent = String(e);
+            });
     }
 
     function onStartLive() {
@@ -3776,6 +3863,15 @@ def _dash_state():
         return {}
 
 
+def _exec_is_live() -> bool:
+    """True if the control file says LIVE. Never raises; failure means paper."""
+    try:
+        from control import load_control, is_live
+        return is_live(load_control())
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def _open_position() -> bool:
     """True if a position is currently held. Blocks arming or switching LIVE."""
     st = _dash_state()
@@ -3830,6 +3926,49 @@ def _trade_size() -> float:
         except Exception:                                    # noqa: BLE001
             bal = 0.0
     return round(bal * frac, 2)
+
+
+@app.get("/api/live/balance")
+async def api_live_balance():
+    """The REAL exchange balance.
+
+    Read server-side because the browser must never hold the API secret. Cached
+    for a few seconds so a page that polls does not hammer the exchange.
+
+    Returns ok=False with the exchange's own message on failure - a balance the
+    app cannot read must be shown as unknown, never as zero.
+    """
+    global _LIVE_BAL_CACHE
+    now = time.time()
+    try:
+        if _LIVE_BAL_CACHE["at"] and (now - _LIVE_BAL_CACHE["at"]) < 10:
+            return _LIVE_BAL_CACHE["data"]
+    except Exception:
+        pass
+
+    try:
+        import executor_live
+        client = executor_live.RealClient()
+        info = client.get_info()
+        ret = info.get("return") or {}
+        bal = ret.get("balance") or {}
+        hold = ret.get("balance_hold") or {}
+        idr = float(bal.get("idr") or 0)
+        held = float(hold.get("idr") or 0)
+        data = {
+            "ok": True,
+            "idr": idr,
+            "idr_on_hold": held,
+            "spendable": idr,
+            "assets": {k.upper(): float(v) for k, v in bal.items()
+                       if k.lower() != "idr" and float(v or 0) > 0},
+            "fetched_at": now,
+        }
+    except Exception as e:                                   # noqa: BLE001
+        data = {"ok": False, "idr": None, "error": str(e)[:300], "fetched_at": now}
+
+    _LIVE_BAL_CACHE = {"at": now, "data": data}
+    return data
 
 
 @app.get("/api/live/preflight")
