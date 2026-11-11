@@ -637,6 +637,91 @@ def reconcile(client=None) -> Dict[str, Any]:
     return out
 
 
+def holdings(client=None) -> Dict[str, Any]:
+    """What the exchange actually says this account holds, right now.
+
+    This is the authority. Local state can be stale, lost to a crash, or simply
+    wrong after a manual trade in the Indodax app - and a holding the bot does
+    not know about is a position with no stop and no target.
+
+    Returns {"ok", "idr", "coins": {SYMBOL: amount}, "error"}. Zero balances are
+    omitted: exchange APIs report every currency that ever existed.
+    """
+    client = client or RealClient()
+    out = {"ok": False, "idr": 0.0, "coins": {}, "error": None}
+    try:
+        info = client.get_info()
+    except Exception as e:                                   # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        return out
+
+    ret = info.get("return") or {}
+    bal = ret.get("balance") or {}
+    for cur, amt in bal.items():
+        c = str(cur).lower()
+        try:
+            v = float(amt or 0)
+        except (TypeError, ValueError):
+            continue
+        if v <= 0:
+            continue
+        if c == "idr":
+            out["idr"] = v
+        else:
+            out["coins"][c.upper()] = v
+    out["ok"] = True
+    return out
+
+
+def reconcile_position(state: dict, client=None) -> Dict[str, Any]:
+    """Compare local state with the exchange and say what to do about it.
+
+    Four possibilities, and only one of them is "fine":
+
+      MATCH        local position, exchange holds it      -> nothing to do
+      RECOVER      no local position, exchange holds coin -> ADOPT it
+      PHANTOM      local position, exchange has no coin   -> local state is wrong
+      FOREIGN      exchange holds a coin the bot never
+                   bought, and there is no open position   -> report it
+
+    Recovery matters most: the operator may have bought in the Indodax app, or
+    the bot may have crashed between placing and recording a fill. Either way the
+    coins exist and need a stop, and ignoring them lets the engine open a second
+    position while the first is unprotected.
+    """
+    client = client or RealClient()
+    h = holdings(client=client)
+    if not h["ok"]:
+        return {"status": "UNKNOWN", "error": h["error"], "coins": {}}
+
+    pos = state.get("position") or {}
+    sym = str(pos.get("symbol") or "").upper()
+    local_coin = sym.replace("IDR", "") if sym else ""
+
+    coins = h["coins"]
+    result = {"status": "FLAT", "exchange": coins, "idr": h["idr"],
+              "local_symbol": sym or None, "adopted": None, "foreign": []}
+
+    if pos and local_coin:
+        held = float(coins.get(local_coin, 0.0))
+        if held <= 0:
+            result["status"] = "PHANTOM"
+            return result
+        # tolerate a small difference: fees and partial fills round
+        want = float(pos.get("coins") or 0.0)
+        result["status"] = "MATCH" if abs(held - want) <= max(want * 0.02, 1e-8) else "MISMATCH"
+        result["held"] = held
+        return result
+
+    # no local position
+    if not coins:
+        return result
+    # coins exist but the bot is flat: adopt the largest as a recovered position
+    result["status"] = "RECOVER"
+    result["foreign"] = sorted(coins.items(), key=lambda kv: -kv[1])
+    return result
+
+
 def cancel_all_open_orders(client=None) -> Dict[str, Any]:
     """Cancel every resting order. Used by STOP LIVE before halting.
 
@@ -889,6 +974,57 @@ def _self_check():
     assert rec10["open_orders"] == []
     print(f"[PASS] reconcile reads the account: IDR {rec10['idr']:,.0f}, "
           f"{len(rec10['open_orders'])} open orders")
+
+    # --- 13. holdings + reconciliation --------------------------------------
+    # The case that prompted this: Indodax held 0.75 SHIB while the bot reported
+    # "HUNTING, no position". A real holding with no stop.
+    ex14 = FakeExchange(idr=46622.0)
+    ex14.coins = {"shib": 0.75}
+    h14 = holdings(client=ex14)
+    assert h14["ok"] and h14["coins"] == {"SHIB": 0.75}, h14
+    assert h14["idr"] == 46622.0
+    print(f"[PASS] holdings are read from the exchange: {h14['coins']}")
+
+    # flat locally, coin on the exchange -> RECOVER
+    r14 = reconcile_position({"position": None}, client=ex14)
+    assert r14["status"] == "RECOVER", r14
+    assert r14["foreign"][0][0] == "SHIB"
+    print("[PASS] a holding with no local position is flagged RECOVER")
+
+    # local position that the exchange also holds -> MATCH
+    pos14 = {"position": {"symbol": "SHIBIDR", "coins": 0.75}}
+    r15 = reconcile_position(pos14, client=ex14)
+    assert r15["status"] == "MATCH", r15
+    print("[PASS] a local position the exchange also holds is MATCH")
+
+    # local position but no coins -> PHANTOM
+    ex15 = FakeExchange(idr=50000.0)
+    r16 = reconcile_position({"position": {"symbol": "SHIBIDR", "coins": 0.75}},
+                             client=ex15)
+    assert r16["status"] == "PHANTOM", r16
+    print("[PASS] a local position the exchange does not hold is PHANTOM")
+
+    # amount disagreement -> MISMATCH (fees/partial fills are tolerated)
+    ex16 = FakeExchange(idr=50000.0)
+    ex16.coins = {"shib": 0.50}
+    r17 = reconcile_position({"position": {"symbol": "SHIBIDR", "coins": 0.75}},
+                             client=ex16)
+    assert r17["status"] == "MISMATCH", r17
+    print("[PASS] a coin-count disagreement is MISMATCH")
+
+    # flat + empty -> FLAT
+    r18 = reconcile_position({"position": None}, client=FakeExchange(idr=50000.0))
+    assert r18["status"] == "FLAT", r18
+    print("[PASS] an empty account and no position is FLAT")
+
+    # an unreadable exchange is UNKNOWN, never FLAT
+    class Broken(FakeExchange):
+        def get_info(self):
+            raise live_api.LiveApiError("network down")
+
+    r19 = reconcile_position({"position": None}, client=Broken())
+    assert r19["status"] == "UNKNOWN", r19
+    print("[PASS] an unreadable exchange is UNKNOWN, not FLAT")
 
     # --- 11. a target exit uses a LIMIT sell (maker fee) --------------------
     ex11 = FakeExchange(idr=100000.0)

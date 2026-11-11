@@ -239,6 +239,24 @@ def live_daily_cap_hit(state: dict, now: Optional[float] = None) -> bool:
         return True          # fail closed: if the check breaks, do not trade
 
 
+def _describe_reconcile(rec: dict) -> str:
+    """A one-line explanation of why trading is halted, in operator language."""
+    st = rec.get("status")
+    coins = rec.get("exchange") or {}
+    held = ", ".join(f"{v:g} {k}" for k, v in list(coins.items())[:3]) or "nothing"
+
+    if st == "RECOVER":
+        return (f"the exchange holds {held} but the bot has no open position. "
+                f"Sell it, or adopt it, before hunting - those coins have no stop.")
+    if st == "PHANTOM":
+        return (f"the bot records a position in {rec.get('local_symbol')} but the "
+                f"exchange holds no coins. Local state is wrong; clear it before hunting.")
+    if st == "MISMATCH":
+        return (f"the exchange holds {rec.get('held'):g} of {rec.get('local_symbol')} "
+                f"which does not match the recorded amount.")
+    return f"exchange state {st}"
+
+
 def _live_mode() -> bool:
     """True when the control file says LIVE. Read once per tick by the caller.
 
@@ -894,14 +912,47 @@ def tick(now: Optional[float] = None) -> dict:
                 return {"status": "LIVE_PREFLIGHT_FAILED",
                         "message": f"{dt_str}  [BLOCKED] live preflight failed: {_why[:300]}"}
 
+        state = load_state()
+
+        # --- exchange reconciliation ----------------------------------------
+        # Local state is not the truth; the exchange is. If the account holds
+        # coins the bot does not know about - bought in the Indodax app, or left
+        # by a crash between placing and recording - those coins have no stop.
+        # Buying anything else would mean two positions, one unprotected.
+        if ctrl.get("exec") == "LIVE":
+            try:
+                import executor_live
+                _rec = executor_live.reconcile_position(state)
+                _st = _rec.get("status")
+                if _st in ("RECOVER", "PHANTOM", "MISMATCH"):
+                    _detail = _describe_reconcile(_rec)
+                    try:
+                        from control import set_blocked
+                        set_blocked(_detail[:280])
+                    except Exception:                        # noqa: BLE001
+                        pass
+                    return {"status": "EXCHANGE_MISMATCH",
+                            "message": f"{dt_str}  [BLOCKED] {_detail}"}
+                if _st == "UNKNOWN":
+                    try:
+                        from control import set_blocked
+                        set_blocked(str(_rec.get("error"))[:280])
+                    except Exception:                        # noqa: BLE001
+                        pass
+                    return {"status": "EXCHANGE_UNREADABLE",
+                            "message": f"{dt_str}  [BLOCKED] cannot read the "
+                                       f"exchange: {_rec.get('error')}"}
+            except Exception as e:                           # noqa: BLE001
+                return {"status": "EXCHANGE_ERROR",
+                        "message": f"{dt_str}  [BLOCKED] reconciliation failed: "
+                                   f"{type(e).__name__}: {str(e)[:150]}"}
+
         # past the guards: this tick really runs, so any previous block is stale
         try:
             from control import clear_blocked
             clear_blocked()
         except Exception:                                    # noqa: BLE001
             pass
-
-        state = load_state()
 
         if ctrl["mode"] == MODE_STOPPING:
             summary = perform_stop(state, now, ctrl)

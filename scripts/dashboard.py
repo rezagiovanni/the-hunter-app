@@ -691,7 +691,29 @@ def _trading_log_section(state: dict) -> str:
     order = state.get("order")
     trade_log = state.get("trade_log", [])
 
-    if _blocked and not pos:
+    # What the EXCHANGE holds. This is checked before anything else on the
+    # panel, because "the bot thinks it is flat but Indodax holds coins" is the
+    # state where a real position has no stop and the operator is looking at an
+    # empty table.
+    _exch = None
+    try:
+        from control import load_control as _lc2, is_live as _il2
+        if _il2(_lc2()):
+            import executor_live as _exl3
+            _exch = _exl3.reconcile_position(state)
+    except Exception:                                        # noqa: BLE001
+        _exch = None
+
+    if _exch and _exch.get("status") in ("RECOVER", "PHANTOM", "MISMATCH"):
+        _held = ", ".join(f"{v:g} {k}" for k, v in
+                          list((_exch.get("exchange") or {}).items())[:3]) or "nothing"
+        status_badge = '<span class="badge-status blocked">⚠ HOLDING ON EXCHANGE</span>'
+        status_detail = (
+            f"Indodax holds <b>{_held}</b> but the bot has no matching position. "
+            f"Those coins have <b>no stop and no target</b>. "
+            f"Trading is halted until they are sold or adopted."
+        )
+    elif _blocked and not pos:
         status_badge = '<span class="badge-status blocked">✕ NOT TRADING</span>'
         status_detail = (
             "Engine is refusing to run: <b>"
@@ -886,49 +908,38 @@ def _trading_log_section(state: dict) -> str:
                 <div class="trade-sub">{status_badge} {status_detail}</div>
             </div>
             <div class="mode-control-wrap">
-                <!-- Two tabs, back by request - they are the fastest way to
-                     compare the two ledgers.
+                <!-- Two tabs, and the tab IS the mode. Selecting PAPER shows the
+                     paper ledger and the paper START/STOP; selecting LIVE shows
+                     the live ledger and the live START/STOP. One button on
+                     screen at a time, matching the tab you are on.
 
-                     They are TABS, not a mode switch. Clicking one changes
-                     which ledger you are LOOKING at; it never changes which
-                     executor trades. The executor is the badge to their left,
-                     and it is the only thing that says where money moves.
-                     The earlier version of these same buttons WROTE the choice
-                     to localStorage and changed nothing, which is how someone
-                     ends up reading a simulated balance as their own. -->
-                <div class="exec-badge" id="execBadge" role="status"
-                     aria-live="polite" title="Which executor places orders. Changed only by START PAPER / START LIVE while stopped.">
-                    <span class="dot paper" id="execDot"></span>
-                    <span id="execLabel">EXECUTOR: PAPER</span>
-                </div>
+                     The tab therefore also selects the executor. That is safe
+                     only because actually STARTING is still a separate act: the
+                     tab decides which button you see, and pressing that button
+                     is what arms it. Switching tabs while running is refused. -->
                 <div class="mode-btn-group" id="ledgerTabs" role="tablist">
                     <button class="mode-btn active" id="tabPaper" type="button"
-                            role="tab" aria-selected="true" onclick="showLedger('paper')">
+                            role="tab" aria-selected="true" onclick="selectMode('paper')">
                         <span class="dot paper"></span> PAPER MODE
                     </button>
                     <button class="mode-btn" id="tabLive" type="button"
-                            role="tab" aria-selected="false" onclick="showLedger('live')">
+                            role="tab" aria-selected="false" onclick="selectMode('live')">
                         <span class="dot live"></span> LIVE MODE
                     </button>
                 </div>
             </div>
         </div>
 
-        <!-- Hunt control.
-             STOPPED shows two START buttons: paper and live. They are separate
-             elements with separate endpoints rather than one button with a
-             flag, because a flag can be wrong - a stale config, a leftover
-             value, a typo - and the consequence of reading it wrong is that
-             real money trades. A separate endpoint cannot be reached by
-             accident. While RUNNING only STOP is offered, labelled with what is
-             actually running. -->
+        <!-- Hunt control: exactly ONE button, and the selected tab decides
+             what it does. On PAPER it starts/stops the paper engine; on LIVE it
+             arms or stops real trading.
+
+             Starting LIVE still goes to its own endpoint with a typed
+             confirmation - the shared button only chooses WHICH action, never
+             skips it. -->
         <div class="ctrl-wrap" id="ctrlWrap">
             <button class="ctrl-switch" id="ctrlSwitch" type="button" onclick="onControlSwitch()">
                 <span class="led"></span><span id="ctrlLabel">● HUNTING</span>
-            </button>
-            <button class="ctrl-switch ctrl-live" id="ctrlStartLive" type="button"
-                    style="display:none" onclick="onStartLive()">
-                <span class="led"></span> START LIVE
             </button>
             <span id="ctrlHint" style="font-size:0.72em; color:#6b7280;"></span>
             <span id="liveBadge"></span>
@@ -2746,60 +2757,101 @@ CHART_JS = """
     // ----------------------------------------------------------------------
     let ctrlState = { mode: 'RUNNING', framework: 'A' };
 
-    function paintControl() {
-        const sw = document.getElementById('ctrlSwitch');
-        const lbl = document.getElementById('ctrlLabel');
-        const hint = document.getElementById('ctrlHint');
-        if (!sw || !lbl) return;
-        const running = (ctrlState.mode === 'RUNNING');
-        const isLive = (ctrlState.exec === 'LIVE');
-        const liveBtn = document.getElementById('ctrlStartLive');
+    // ---------------------------------------------------------------------
+    // The TAB is the mode. Selecting PAPER shows the paper ledger and a
+    // paper START/STOP; selecting LIVE shows the live ledger and a live
+    // START/STOP. Exactly one button on screen at a time.
+    //
+    // This is safe because the tab only decides WHICH button you see - pressing
+    // it is still what arms anything, and LIVE still goes to its own endpoint
+    // with a typed confirmation.
+    // ---------------------------------------------------------------------
+    var selectedMode = 'paper';
+    var currentLedger = 'paper';
 
-        paintExec();
+    function selectMode(which) {
+        var want = (which === 'live') ? 'live' : 'paper';
+        var runningExec = (ctrlState.mode === 'RUNNING') ? ctrlState.exec : null;
 
-        // The TAB owns which panel is visible; this only keeps the badge and
-        // the tabs in agreement with the control file. The first time the page
-        // loads with LIVE armed, open the live ledger - that is where the real
-        // money is and it should not be hidden behind a tab.
+        // Refuse to hide the stop button of a running engine by switching tabs.
+        if (runningExec && runningExec !== (want === 'live' ? 'LIVE' : 'PAPER')) {
+            window.alert('The ' + runningExec + ' engine is running. Stop it before '
+                         + 'switching to ' + (want === 'live' ? 'LIVE' : 'PAPER') + '.');
+            return;
+        }
+        selectedMode = want;
+        currentLedger = want;
+        paintControl();
         refreshBuyButton();
-        if (isLive && !window.__ledgerInit && currentLedger === 'paper') {
-            window.__ledgerInit = true;
-            showLedger('live');
-        } else {
-            showLedger(currentLedger);
+    }
+
+    function paintControl() {
+        var sw = document.getElementById('ctrlSwitch');
+        var lbl = document.getElementById('ctrlLabel');
+        var hint = document.getElementById('ctrlHint');
+        if (!sw || !lbl) return;
+
+        var isLive = (ctrlState.exec === 'LIVE');
+        var wantLive = (selectedMode === 'live');
+        var running = (ctrlState.mode === 'RUNNING');
+        var blocked = ctrlState.blocked && ctrlState.blocked.reason;
+        var thisOneRuns = running && (isLive === wantLive);
+
+        // the page carries the live treatment regardless of which tab is open
+        document.body.classList.toggle('live-armed', isLive);
+        var lb = document.getElementById('liveBadge');
+        if (lb) {
+            lb.innerHTML = isLive
+                ? '<span class="live-badge">\u25CF LIVE \u00B7 REAL MONEY</span>' : '';
         }
 
-        // While RUNNING there is exactly one action - STOP - and it says which
-        // executor it is stopping. While STOPPED there are two ways to start,
-        // and they are different buttons hitting different endpoints.
-        if (running) {
+        // panels + tab highlight follow the selection (or the running engine)
+        var shown = running ? (isLive ? 'live' : 'paper') : selectedMode;
+        currentLedger = shown;
+        var paperWrap = document.getElementById('paperTradeWrap');
+        var liveWrap = document.getElementById('liveTradeWrap');
+        var tabP = document.getElementById('tabPaper');
+        var tabL = document.getElementById('tabLive');
+        if (paperWrap) paperWrap.style.display = (shown === 'paper') ? 'block' : 'none';
+        if (liveWrap) liveWrap.style.display = (shown === 'live') ? 'block' : 'none';
+        if (tabP) { tabP.classList.toggle('active', shown === 'paper');
+                    tabP.setAttribute('aria-selected', shown === 'paper'); }
+        if (tabL) { tabL.classList.toggle('active', shown === 'live');
+                    tabL.setAttribute('aria-selected', shown === 'live'); }
+        if (shown === 'live') loadLiveBalance();
+
+        // ONE button, meaning decided by the tab
+        if (thisOneRuns) {
             sw.style.display = '';
-            if (liveBtn) liveBtn.style.display = 'none';
-            sw.title = 'Running. Stop first - then START PAPER or START LIVE appears.';
-            sw.classList.toggle('stopped', false);
+            sw.classList.remove('stopped');
             sw.classList.toggle('live', isLive);
-            var blocked = ctrlState.blocked && ctrlState.blocked.reason;
             sw.classList.toggle('blocked', !!blocked);
+            sw.title = 'Running. Click to stop.';
             lbl.textContent = blocked
-                ? '■ STOP — ENGINE BLOCKED'
-                : (isLive ? '■ STOP LIVE' : '■ STOP');
+                ? '\u25A0 STOP \u2014 ENGINE BLOCKED'
+                : (isLive ? '\u25A0 STOP LIVE' : '\u25A0 STOP PAPER');
+        } else if (running) {
+            sw.style.display = 'none';
         } else {
             sw.style.display = '';
-            sw.classList.remove('live');
-            if (liveBtn) liveBtn.style.display = '';
-            sw.classList.toggle('stopped', true);
-            lbl.textContent = '▶ START PAPER';
+            sw.classList.remove('live', 'blocked');
+            sw.classList.add('stopped');
+            sw.classList.toggle('ctrl-live', wantLive);
+            sw.title = wantLive ? 'Arm LIVE trading (asks for confirmation).'
+                                : 'Start the paper engine.';
+            lbl.textContent = wantLive ? '\u25B6 START LIVE' : '\u25B6 START PAPER';
         }
+
         if (hint) {
-            var blk = ctrlState.blocked && ctrlState.blocked.reason;
-            hint.textContent = blk
-                ? ('NOT TRADING: ' + blk)
-                : (running
-                   ? ('framework ' + ctrlState.framework + ' · engine every 60s'
-                      + (isLive ? ' · LIVE' : ' · paper'))
-                   : ('framework ' + ctrlState.framework + ' · stopped'
-                      + (ctrlState.position && ctrlState.position.symbol
-                         ? ' · position open' : '')));
+            hint.textContent = blocked
+                ? ('NOT TRADING: ' + blocked)
+                : (thisOneRuns
+                   ? ('framework ' + ctrlState.framework + ' \u00B7 every 60s'
+                      + (isLive ? ' \u00B7 LIVE' : ' \u00B7 paper'))
+                   : (running
+                      ? ('the ' + (isLive ? 'LIVE' : 'PAPER') + ' engine is running \u2014 '
+                         + 'stop it to use this tab')
+                      : ('framework ' + ctrlState.framework + ' \u00B7 stopped')));
         }
     }
 
@@ -2808,53 +2860,6 @@ CHART_JS = """
             .then(r => r.json())
             .then(d => { ctrlState = d; paintControl(); })
             .catch(() => {});
-    }
-
-    function paintExec() {
-        // The executor is a FACT from the control file. It is rendered as a
-        // badge, never as a switch - there is nothing here to click, and it
-        // should not look like there is.
-        var isLive = (ctrlState.exec === 'LIVE');
-        var badge = document.getElementById('execBadge');
-        var label = document.getElementById('execLabel');
-        var dot = document.getElementById('execDot');
-        if (badge) {
-            badge.classList.toggle('is-live', isLive);
-            badge.classList.toggle('is-paper', !isLive);
-        }
-        if (label) {
-            label.textContent = isLive ? 'EXECUTOR: LIVE' : 'EXECUTOR: PAPER';
-        }
-        if (dot) {
-            dot.className = 'dot ' + (isLive ? 'live' : 'paper');
-        }
-        document.body.classList.toggle('live-armed', isLive);
-        var lb = document.getElementById('liveBadge');
-        if (lb) {
-            lb.innerHTML = isLive
-                ? '<span class="live-badge">\u25CF LIVE \u00B7 REAL MONEY</span>'
-                : '';
-        }
-    }
-
-    // Which ledger the operator is LOOKING at. Deliberately not persisted and
-    // deliberately separate from ctrlState.exec: this is a view, and a view
-    // must never be able to disagree with what is trading.
-    var currentLedger = 'paper';
-
-    function showLedger(which) {
-        currentLedger = (which === 'live') ? 'live' : 'paper';
-        var paperWrap = document.getElementById('paperTradeWrap');
-        var liveWrap = document.getElementById('liveTradeWrap');
-        var tabP = document.getElementById('tabPaper');
-        var tabL = document.getElementById('tabLive');
-        if (paperWrap) paperWrap.style.display = (currentLedger === 'paper') ? 'block' : 'none';
-        if (liveWrap) liveWrap.style.display = (currentLedger === 'live') ? 'block' : 'none';
-        if (tabP) { tabP.classList.toggle('active', currentLedger === 'paper');
-                    tabP.setAttribute('aria-selected', currentLedger === 'paper'); }
-        if (tabL) { tabL.classList.toggle('active', currentLedger === 'live');
-                    tabL.setAttribute('aria-selected', currentLedger === 'live'); }
-        if (currentLedger === 'live') loadLiveBalance();
     }
 
     function loadLiveBalance() {
@@ -3034,6 +3039,17 @@ CHART_JS = """
         const sw = document.getElementById('ctrlSwitch');
         const goingDown = (ctrlState.mode === 'RUNNING');
         var stopChoice = null;
+
+        // Starting: the SELECTED TAB decides which engine. LIVE keeps its own
+        // endpoint and its typed confirmation - the shared button only chooses
+        // the action, it never skips the check.
+        if (!goingDown) {
+            if (selectedMode === 'live') {
+                onStartLive();
+                return;
+            }
+        }
+
         if (goingDown) {
             if (ctrlState.exec === 'LIVE') {
                 stopChoice = stopLiveWithChoice();
@@ -4122,6 +4138,11 @@ async def api_control_get():
         "phase": st.get("phase"),
         "position": _position_summary(),
         "blocked": c.get("blocked"),
+        # what the EXCHANGE holds, not just what the bot thinks. A coin in the
+        # account that the bot does not know about has no stop, and reporting
+        # "HUNTING / no position" while holding real coins is how the operator
+        # ends up with an unprotected position.
+        "exchange": _exchange_summary(st),
         "frameworks": list_frameworks(),
     }
 
@@ -4155,6 +4176,22 @@ def _open_order() -> bool:
     was placed by one executor and would be filled against another's accounting."""
     st = _dash_state()
     return st.get("phase") == "ORDER_OPEN" and bool(st.get("order"))
+
+
+def _exchange_summary(state: dict) -> dict:
+    """Real holdings, or an error. Never raises; never blocks the page."""
+    try:
+        from control import is_live, load_control
+        if not is_live(load_control()):
+            return {"available": False, "reason": "paper mode"}
+    except Exception:                                        # noqa: BLE001
+        return {"available": False, "reason": "control unreadable"}
+    try:
+        import executor_live
+        rec = executor_live.reconcile_position(state)
+        return {"available": True, **rec}
+    except Exception as e:                                   # noqa: BLE001
+        return {"available": False, "reason": str(e)[:200]}
 
 
 def _position_summary() -> dict:
