@@ -229,16 +229,23 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
         return ""
 
     n = len(log)
-    net = sum(t.get("net_pnl_idr", 0.0) or 0.0 for t in log)
-    wins = sum(1 for t in log if (t.get("net_pnl_idr", 0.0) or 0.0) > 0)
-    winrate = wins / n * 100.0
+    # A trade whose exit price is unknown (sold by hand outside the bot) has
+    # net_pnl_idr = None. It must NOT be counted as zero: that would drag the
+    # average toward breakeven and count it as a loss against the win rate.
+    # It is excluded from every P&L statistic and reported separately.
+    scored = [t for t in log if t.get("net_pnl_idr") is not None]
+    unknown = n - len(scored)
+
+    net = sum(t.get("net_pnl_idr") or 0.0 for t in scored)
+    wins = sum(1 for t in scored if (t.get("net_pnl_idr") or 0.0) > 0)
+    winrate = (wins / len(scored) * 100.0) if scored else 0.0
 
     # Realized equity curve in append order (append order == chronological)
     equity = start_balance
     peak = equity
     max_dd_pct = 0.0
-    for t in log:
-        equity += t.get("net_pnl_idr", 0.0) or 0.0
+    for t in scored:
+        equity += t.get("net_pnl_idr") or 0.0
         peak = max(peak, equity)
         if peak > 0:
             dd = (peak - equity) / peak * 100.0
@@ -255,9 +262,9 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
     min_hold = _fmt_duration(0, min(durations)) if durations else "—"
     max_hold = _fmt_duration(0, max(durations)) if durations else "—"
 
-    nets = [t.get("net_pnl_idr", 0.0) or 0.0 for t in log]
-    best = max(nets)
-    worst = min(nets)
+    nets = [t.get("net_pnl_idr") or 0.0 for t in scored]
+    best = max(nets) if nets else 0.0
+    worst = min(nets) if nets else 0.0
     best_sign = "+" if best >= 0 else "-"
     worst_sign = "+" if worst >= 0 else "-"
 
@@ -266,8 +273,9 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
     wr_cls = "pass" if winrate >= 50 else "fail"
 
     cards = (
-        '<div class="stat-card"><div class="sv num-hunts">{}</div>'
-        '<div class="sl">Total Hunts</div></div>'.format(n) +
+        '<div class="stat-card"><div class="sv num-hunts">{}{}</div>'
+        '<div class="sl">Total Hunts</div></div>'.format(
+            n, f"<span class='unknown-n' title='sold outside the bot: P&L not known, excluded from the stats'>{unknown} unknown</span>" if unknown else "") +
         '<div class="stat-card"><div class="sv {}">{}IDR {:,.0f}</div>'
         '<div class="sl">PnL</div></div>'.format(net_cls, pnl_sign, net) +
         '<div class="stat-card"><div class="sv {}">{:.1f}%</div>'
@@ -871,10 +879,22 @@ def _trading_log_section(state: dict) -> str:
         out = ""
         for idx, t in enumerate(reversed(log), 1):
             ts = t.get("exit_time", t.get("entry_time", 0))
-            net = t.get("net_pnl_idr", 0.0) or 0.0
-            pct = t.get("net_pnl_pct", 0.0) or 0.0
-            sign = "+" if net >= 0 else ""
-            pnl_cls = "pass" if net >= 0 else "fail"
+            # net_pnl_idr is None when the coins were sold outside the bot: the
+            # exit price is unknown, so the P&L is unknown. Show it as unknown
+            # rather than as zero, which would read as a breakeven trade.
+            _known = t.get("net_pnl_idr") is not None
+            net = t.get("net_pnl_idr") if _known else None
+            pct = t.get("net_pnl_pct") if _known else None
+            sign = ""
+            if _known:
+                sign = "+" if float(net) >= 0 else ""
+                pnl_cls = "pass" if float(net) >= 0 else "fail"
+                pnl_cell = f"<b>{sign}IDR {float(net):,.0f}</b>"
+                pct_cell = f"<b>{sign}{float(pct or 0):.2f}%</b>"
+            else:
+                pnl_cls = "unknown"
+                pnl_cell = "<b title='sold outside the bot; the exit price is not known'>unknown</b>"
+                pct_cell = "<b>—</b>"
             hidden = "" if idx <= TRADES_PER_PAGE else " style='display:none;'"
             hold = _fmt_duration(t.get("entry_time"), t.get("exit_time"))
             out += (
@@ -887,8 +907,8 @@ def _trading_log_section(state: dict) -> str:
                 f"<td class='num'>{t.get('entry_price', 0):,.0f}</td>"
                 f"<td class='num'>{t.get('exit_price', 0):,.0f}</td>"
                 f"<td class='num'>{t.get('quantity', 0)}</td>"
-                f"<td class='num {pnl_cls}'><b>{sign}IDR {net:,.0f}</b></td>"
-                f"<td class='num {pnl_cls}'><b>{sign}{pct:.2f}%</b></td>"
+                f"<td class='num {pnl_cls}'>{pnl_cell}</td>"
+                f"<td class='num {pnl_cls}'>{pct_cell}</td>"
                 f"<td>{t.get('exit_reason', '—')}</td></tr>"
             )
         return out
@@ -2257,6 +2277,14 @@ def _style():
         .stat-card .sv.pass { color: #4ade80; }
         .stat-card .sv.fail { color: #f87171; }
         .stat-card .sv.num-hunts { color: var(--accent-blue); }
+        .stat-card .sv .unknown-n {
+            display: inline-block; margin-left: 6px; padding: 1px 6px;
+            font-size: 10px; font-weight: 600; letter-spacing: 0.03em;
+            color: #94a3b8; background: rgba(148,163,184,0.12);
+            border: 1px solid rgba(148,163,184,0.35); border-radius: 4px;
+            text-transform: uppercase; vertical-align: middle; cursor: help;
+        }
+        .trade-row td.unknown { color: #94a3b8; font-style: italic; }
         .stat-card .sl {
             font-size: 0.62em; color: var(--text-secondary); text-transform: uppercase;
             letter-spacing: 0.5px; margin-top: 3px;
@@ -2484,10 +2512,16 @@ CHART_JS = """
                     const mid = (x1 + x2) / 2;
                     x1 = mid - minW / 2; x2 = mid + minW / 2;
                 }
-                const win = t.net_pnl_idr >= 0;
-                ctx.fillStyle = win ? 'rgba(34,197,94,0.16)' : 'rgba(239,68,68,0.16)';
+                // null P&L (coins sold outside the bot) is neither a win nor
+                // a loss; JS would treat null >= 0 as true and paint it green
+                const win = t.net_pnl_idr == null ? null : t.net_pnl_idr >= 0;
+                ctx.fillStyle = win === null
+                    ? 'rgba(148,163,184,0.16)'
+                    : (win ? 'rgba(34,197,94,0.16)' : 'rgba(239,68,68,0.16)');
                 ctx.fillRect(x1, padT, x2 - x1, priceH);
-                ctx.strokeStyle = win ? 'rgba(34,197,94,0.85)' : 'rgba(239,68,68,0.85)';
+                ctx.strokeStyle = win === null
+                    ? 'rgba(148,163,184,0.85)'
+                    : (win ? 'rgba(34,197,94,0.85)' : 'rgba(239,68,68,0.85)');
                 ctx.lineWidth = 1;
                 ctx.beginPath(); ctx.moveTo(x1, padT); ctx.lineTo(x1, padT + priceH); ctx.stroke();
                 ctx.beginPath(); ctx.moveTo(x2, padT); ctx.lineTo(x2, padT + priceH); ctx.stroke();
@@ -2589,8 +2623,8 @@ CHART_JS = """
                 let tradeHtml = '';
                 if (hit) {
                     const t = hit.trade;
-                    const ok = t.net_pnl_idr >= 0;
-                    const c2 = ok ? '#22c55e' : '#ef4444';
+                    const ok = t.net_pnl_idr == null ? null : t.net_pnl_idr >= 0;
+                    const c2 = ok === null ? '#94a3b8' : (ok ? '#22c55e' : '#ef4444');
                     const mins = Math.max(0, Math.round((t.exit_time - t.entry_time) / 60));
                     const held = mins >= 60 ? `${(mins / 60).toFixed(1)}h` : `${mins}m`;
                     tradeHtml =

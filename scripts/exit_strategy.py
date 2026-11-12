@@ -40,6 +40,7 @@ EXIT_HARD_SL = "EXIT_HARD_SL"        # -STOP_PCT crossed -> market sell    (take
 EXIT_BE_RATCHET = "EXIT_BE_RATCHET"  # breakeven ratchet triggered after +1.2% (protects profit)
 EXIT_USER_STOP = "EXIT_USER_STOP"    # user pressed STOP -> immediate market sell (taker fee)
 EXIT_MANUAL_MARKET = "EXIT_MANUAL_MARKET"  # user pressed SELL NOW -> exit, keep hunting
+EXIT_EXTERNAL_SELL = "EXIT_EXTERNAL_SELL"  # coins left the account outside the bot (sold by hand)
 
 
 # ---------------------------------------------------------------------------

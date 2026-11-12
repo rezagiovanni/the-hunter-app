@@ -1051,6 +1051,23 @@ def sync_with_exchange(state: dict, framework: str, tick: float,
 
     if st in ("MATCH", "MISMATCH", "PHANTOM", "PHANTOM_DUST"):
         # The bot already tracks something. Never adopt on top of it.
+        if st in ("PHANTOM", "PHANTOM_DUST"):
+            # The coins are gone locally. Before calling that an external sell,
+            # check the account is not simply trying to sell them: coins locked
+            # in a resting SELL order disappear from the available balance, and
+            # closing the position then would abandon an order already working.
+            try:
+                _orders = client_open_orders(client)
+            except Exception:                                # noqa: BLE001
+                _orders = []
+            _coins = str(pos.get("symbol") or "").upper().replace("IDR", "")
+            _selling = [o for o in _orders
+                        if _base(o.get("pair") or "") == _coins.lower()
+                        and str(o.get("type") or "").lower() == "sell"]
+            if _selling:
+                out["action"] = "ORDER_PENDING"
+                out["orders"] = _selling
+                return out
         out["action"] = "KEPT"
         return out
 
@@ -1118,6 +1135,73 @@ def sync_with_exchange(state: dict, framework: str, tick: float,
     out["value_idr"] = value
     out["unmanaged"] = {c: a for c, a in ranked[1:]}
     return out
+
+
+def close_externally_sold(state: dict, rec: dict,
+                          now: Optional[float] = None) -> Dict[str, Any]:
+    """Close a local position whose coins have left the account by hand.
+
+    Reported: the bot held UAIIDR, the operator sold it in the Indodax app, and
+    the engine halted with "local state is wrong; clear it before hunting". The
+    detection was right and the response was wrong. A confirmed external sell is
+    not a corrupt state to be cleared - it is an EXIT, and the position should be
+    closed like any other so the bot can hunt again.
+
+    WHAT IS NOT KNOWN: the exit price. The bot did not sell it; it only sees that
+    the coins are gone. So the record says exactly that instead of inventing a
+    number:
+
+        exit_price = 0, exit_price_source = "unknown"
+        net_pnl_idr = None, pnl_known = False
+
+    and the trade is stored with EXIT_EXTERNAL_SELL. A null P&L is honest; a
+    P&L computed against the current market price would silently corrupt every
+    statistic derived from the trade log. Anything that sums P&L must skip nulls.
+
+    Returns {"closed": bool, "trade": ..., "reason": ...}.
+    """
+    now = time.time() if now is None else now
+    pos = (state or {}).get("position") or {}
+    if not pos:
+        return {"closed": False, "reason": "no position"}
+
+    sym = str(pos.get("symbol") or "")
+    coins = float(pos.get("coins") or 0.0)
+    entry = float(pos.get("entry_price") or 0.0)
+
+    # Sanity: only close when the coin really is absent, and absent for a
+    # reason that is not "we could not read the account".
+    present = (rec or {}).get("status")
+    if present not in ("PHANTOM", "PHANTOM_DUST"):
+        return {"closed": False, "reason": f"not an external sell ({present})"}
+
+    trade = {
+        "hunt_id": pos.get("hunt_id"),
+        "symbol": sym,
+        "framework": pos.get("framework", "A"),
+        "entry_price": entry,
+        "exit_price": 0.0,
+        "exit_price_source": "unknown",
+        "coins": coins,
+        "live": True,
+        "exit_reason": "EXIT_EXTERNAL_SELL",
+        "entry_time": pos.get("opened_at") or pos.get("entry_time"),
+        "exit_time": now,
+        "adopted": bool(pos.get("adopted")),
+        "net_pnl_idr": None,
+        "net_pnl_pct": None,
+        "pnl_known": False,
+        "note": ("the coins left the exchange outside the bot, so the exit "
+                 "price is not known and P&L cannot be computed"),
+    }
+
+    state.setdefault("live_trade_log", []).append(trade)
+    state["position"] = None
+    state["phase"] = "HUNTING"
+
+    return {"closed": True, "trade": trade,
+            "reason": (f"{sym} {coins:g} is no longer on the exchange - closed "
+                       f"as an external sell, P&L unknown")}
 
 
 def client_open_orders(client=None) -> list:
@@ -1760,8 +1844,77 @@ def _self_check():
             os.path.join(os.path.dirname(__file__), "run_hunter.py")).read().split(
             'if ctrl.get("exec") == "LIVE":')[0]
         print("[PASS] adoption is unreachable in paper mode")
+
     finally:
         globals()["_last_price"] = _orig_lp
+
+    # --- 18. a manually sold position is CLOSED, not halted ------------------
+    # Reported: the bot held UAIIDR, the operator sold it in the Indodax app,
+    # and the engine halted with "local state is wrong; clear it before hunting"
+    # - so the next winner was never traded.
+    class _SoldByHand(FakeExchange):
+        def __init__(self, coins=None, orders=None):
+            super().__init__(idr=45514.0)
+            self.coins = coins or {}
+            self._orders = orders or {}
+
+        def open_orders(self, pair=None):
+            return {"success": 1, "return": {"orders": self._orders}}
+
+    _orig_lp2 = _last_price
+    globals()["_last_price"] = lambda p, t=None: 682.0
+    try:
+        _pos = {"symbol": "UAIIDR", "coins": 29.28257686, "entry_price": 682.0,
+                "hunt_id": "H-ADOPT-UAI", "framework": "C", "adopted": True,
+                "opened_at": 1000.0, "live": True,
+                "exit_levels": {"target_price": 716.0, "stop_trigger_price": 613.0,
+                                "target_pct": 0.05, "stop_pct": 0.10}}
+
+        # a) coins gone, nothing selling -> closed as an external sell
+        st18 = {"position": dict(_pos), "phase": "HOLDING",
+                "live_trade_log": [], "tick": 1.0}
+        r18 = sync_with_exchange(st18, framework="C", tick=1.0,
+                                 client=_SoldByHand(), now=2000.0)
+        assert r18["action"] == "KEPT", r18["action"]
+        assert r18["reconcile"]["status"] == "PHANTOM"
+
+        _closed = close_externally_sold(st18, r18["reconcile"], now=2000.0)
+        assert _closed["closed"] is True, _closed
+        assert st18["position"] is None, st18["position"]
+        assert st18["phase"] == "HUNTING", st18["phase"]
+        _t = st18["live_trade_log"][-1]
+        assert _t["exit_reason"] == "EXIT_EXTERNAL_SELL", _t["exit_reason"]
+        # the exit price is NOT known, and must not be invented
+        assert _t["exit_price"] == 0.0 and _t["exit_price_source"] == "unknown", _t
+        assert _t["net_pnl_idr"] is None and _t["pnl_known"] is False, _t
+        print("[PASS] a manually sold position closes with an unknown exit price")
+
+        # b) coins 'gone' because a SELL ORDER is working -> do NOT close
+        _selling = {"uai_idr": [{"order_id": "9", "type": "sell",
+                                 "status": "open", "price": "716000"}]}
+        st19 = {"position": dict(_pos), "phase": "HOLDING",
+                "live_trade_log": [], "tick": 1.0}
+        r19 = sync_with_exchange(st19, framework="C", tick=1.0,
+                                 client=_SoldByHand(orders=_selling), now=2000.0)
+        assert r19["action"] == "ORDER_PENDING", r19["action"]
+        assert st19["position"] is not None
+        print("[PASS] coins locked in a SELL order are not treated as sold")
+
+        # c) never close on an unreadable exchange
+        class _Blind(FakeExchange):
+            def get_info(self):
+                raise live_api.LiveApiError("network down")
+
+        st20 = {"position": dict(_pos), "phase": "HOLDING",
+                "live_trade_log": [], "tick": 1.0}
+        r20 = sync_with_exchange(st20, framework="C", tick=1.0,
+                                 client=_Blind(), now=2000.0)
+        assert r20["action"] == "UNKNOWN", r20["action"]
+        assert close_externally_sold(st20, r20["reconcile"])["closed"] is False
+        assert st20["position"] is not None
+        print("[PASS] an unreadable exchange never closes a position")
+    finally:
+        globals()["_last_price"] = _orig_lp2
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 

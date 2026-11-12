@@ -1096,11 +1096,40 @@ def tick(now: Optional[float] = None) -> dict:
 
                 # MATCH/MISMATCH/PHANTOM: the bot already holds; normal path.
                 if _act in ("KEPT",) and _st in ("PHANTOM", "PHANTOM_DUST"):
+                    # The coins are gone and nothing is selling them, so the
+                    # operator sold by hand. That is an EXIT, not corruption:
+                    # close the position and keep hunting. Halting here left the
+                    # bot frozen until a human cleared a state it could close
+                    # itself, and the next winner went untraded.
+                    _closed = executor_live.close_externally_sold(
+                        state, _rec, now=now)
+                    if _closed.get("closed"):
+                        save_state(state)
+                        _c = _closed["trade"]
+                        record_hunt_event(_c["hunt_id"] or "GLOBAL",
+                                          "EXIT_EXTERNAL_SELL", {
+                            "symbol": _c["symbol"],
+                            "coins": _c["coins"],
+                            "entry_price": _c["entry_price"],
+                            "pnl_known": False,
+                        }, now=now)
+                        try:
+                            from control import clear_blocked
+                            clear_blocked()
+                        except Exception:                # noqa: BLE001
+                            pass
+                        return {"status": "EXIT_EXTERNAL_SELL",
+                                "message": (f"{dt_str}  [EXTERNAL SELL] "
+                                            f"{_c['symbol']} {_c['coins']:g} "
+                                            f"closed - the coins were sold "
+                                            f"outside the bot. Exit price "
+                                            f"unknown, so P&L is not recorded. "
+                                            f"Back to HUNTING.")}
                     _detail = _describe_reconcile(_rec)
                     try:
                         from control import set_blocked
                         set_blocked(_detail[:280])
-                    except Exception:                        # noqa: BLE001
+                    except Exception:                    # noqa: BLE001
                         pass
                     return {"status": "EXCHANGE_MISMATCH",
                             "message": f"{dt_str}  [BLOCKED] {_detail}"}
