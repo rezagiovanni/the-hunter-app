@@ -822,15 +822,30 @@ def _trading_log_section(state: dict) -> str:
                 f"<span class='hunt-link' onclick=\"openHuntPage('{hunt_id}', this)\">{hid_disp}</span>"
                 if hunt_id else hid_disp
             )
+            # Hold is measured from when the position actually opened. An adopted
+            # position has opened_at; a hunted one has entry_time. Showing "—"
+            # here made an open position look like it had no clock at all.
+            _opened = p.get("opened_at") or p.get("entry_time")
+            hold_txt = _fmt_duration(_opened, time.time()) if _opened else "—"
+            # The EXIT column is the price it left at, so an open position has no
+            # exit price. It used to print the TARGET there, which read as if the
+            # trade had already closed at its target.
+            _tags = []
+            if p.get("adopted"):
+                _tags.append("<span class='open-tag'>ADOPTED</span>")
+            if p.get("entry_source") == "market_at_adoption":
+                _tags.append("<span class='open-tag est' title='estimated from the "
+                             "market price when the bot noticed the coins'>EST.</span>")
             return (
                 f"<tr class='open-trade'>"
                 f"<td class='num'>{hid_html}</td>"
                 f"<td>OPEN NOW</td>"
-                f"<td><b>{p.get('symbol', '—')}</b></td>"
+                f"<td><b>{p.get('symbol', '—')}</b>"
+                + ("".join(_tags)) + "</td>"
                 f"<td class='num'><span class='fw-tag {'fw-exp' if p.get('framework','A') != 'A' else 'fw-a'}'>{p.get('framework','A')}</span></td>"
-                f"<td class='num'>{_fmt_duration(p.get('entry_time'), time.time())}</td>"
+                f"<td class='num'>{hold_txt}</td>"
                 f"<td class='num'>{entry_price:,.0f}</td>"
-                f"<td class='num'>{target_txt}</td>"
+                f"<td class='num' title='still open: no exit price yet'>—</td>"
                 f"<td class='num'>{coins}</td>"
                 f"{pnl_cells}"
                 f"<td><button class='sell-now' type='button'"
@@ -2258,6 +2273,17 @@ def _style():
             font-size: 0.75em; font-weight: bold; margin-right: 6px; border-radius: 2px;
         }
         tr.open-trade { background: rgba(96, 165, 250, 0.08) !important; }
+        .open-tag {
+            display: inline-block; margin-left: 6px; padding: 1px 5px;
+            font-size: 9px; font-weight: 700; letter-spacing: 0.04em;
+            text-transform: uppercase; border-radius: 3px; vertical-align: middle;
+            color: #60a5fa; background: rgba(96,165,250,0.14);
+            border: 1px solid rgba(96,165,250,0.4);
+        }
+        .open-tag.est {
+            color: #fbbf24; background: rgba(251,191,36,0.14);
+            border-color: rgba(251,191,36,0.4); cursor: help;
+        }
 
         /* Trade log pagination */
         .stats-strip {

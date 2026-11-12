@@ -255,6 +255,70 @@ def _post(body: str, key: str, signature: str,
     return data
 
 
+def trade_history_v2(symbol: str, order_id: Optional[str] = None,
+                     days: int = 7, limit: int = 100,
+                     creds: Optional[Tuple[str, str]] = None,
+                     timeout: float = DEFAULT_TIMEOUT) -> list:
+    """Filled trades for one pair, newest first, from Trade API v2.
+
+    This is the only way to learn what the operator ACTUALLY PAID for coins the
+    bot did not buy. v1's tradeHistory was decommissioned on 2026-04-07; the
+    replacement is GET /api/v2/myTrades, which returns every fill with price,
+    qty, fee and side.
+
+    WHY A SEPARATE TRANSPORT
+
+    v2 signs differently from v1: HMAC-SHA256 over the URL QUERY STRING (not
+    SHA512 over a POST body), the key goes in X-APIKEY, and the response is a
+    bare {"data": [...]} with no "success" envelope. Reusing the v1 helper would
+    produce a valid-looking request that the server rejects, so the difference is
+    kept in one small function instead of being spread through the trading path.
+
+    Returns [] on any error. A missing fill is not a reason to refuse to trade -
+    the caller decides what to do without it.
+    """
+    if creds is None:
+        try:
+            key, secret = load_credentials()
+        except Exception:                                    # noqa: BLE001
+            return []
+    else:
+        key, secret = creds
+
+    now_ms = int(time.time() * 1000)
+    params = {
+        "symbol": str(symbol).lower(),
+        "limit": str(max(10, min(int(limit), 1000))),
+        "timestamp": str(now_ms),
+        "recvWindow": str(RECV_WINDOW_MS),
+    }
+    if order_id:
+        params["orderId"] = str(order_id)
+    query = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}"
+                     for k, v in params.items())
+    sig = hmac.new(secret.encode("utf-8"), query.encode("utf-8"),
+                   hashlib.sha256).hexdigest()
+
+    url = f"https://api.indodax.com/api/v2/myTrades?{query}"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Accept", "application/json")
+    req.add_header("X-APIKEY", key)
+    req.add_header("Sign", sig)
+    req.add_header("User-Agent", "the-hunter/0.1")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+    except Exception:                                        # noqa: BLE001
+        return []
+
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
 def _auth_hint(raw: str, code: int) -> str:
     """Turn a signature rejection into the four things that actually cause it.
 
@@ -628,6 +692,22 @@ def _self_check():
     src_c = inspect.getsource(cancel_order)
     assert "retries=0" in src_c, "cancel_order() must never retry"
     print("[PASS] trade and cancel_order never retry")
+
+    # --- v2 signing: checked against Indodax's OWN published vector ----------
+    # A signing scheme cannot be verified by reading it. The docs publish one
+    # example (GET /api/v2/myTrades) with the resulting signature; if our
+    # implementation reproduces that hash, the scheme is right. If it does not,
+    # the endpoint would reject every request and we would never know why -
+    # this is exactly how the "server_time in seconds" bug survived.
+    _v2_secret = ("f60617a68fcce028f0a90bc9eb765d17379eb548cc935c01a7ee3186eecf870"
+                  "e9b68f27a31bcfe8d")
+    _v2_query = "symbol=btcidr&limit=100&timestamp=1578304294000&recvWindow=5000"
+    _v2_expected = ("58b503019a8f2754af7097b4d981913a8dca9e5cb2b408061cbd48736a940"
+                    "558")
+    _v2_sig = hmac.new(_v2_secret.encode(), _v2_query.encode(),
+                       hashlib.sha256).hexdigest()
+    assert _v2_sig == _v2_expected, (_v2_sig, _v2_expected)
+    print("[PASS] v2 signing reproduces Indodax's published example signature")
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 

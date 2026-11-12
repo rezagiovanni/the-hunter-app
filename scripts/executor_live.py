@@ -1204,6 +1204,125 @@ def close_externally_sold(state: dict, rec: dict,
                        f"as an external sell, P&L unknown")}
 
 
+def true_entry_price(coin: str, amount: float, max_age_days: int = 7,
+                     client=None) -> Dict[str, Any]:
+    """What the operator actually paid, recovered from the exchange's own fills.
+
+    An adopted position starts with an ESTIMATED entry (the market price when the
+    bot first noticed it). The exchange, however, remembers every fill - so the
+    real cost basis can usually be recovered instead of guessed.
+
+    Algorithm: walk the newest fills for this pair, keep the ones where this
+    account was the BUYER, accumulate quantity until it covers `amount` (+1%
+    tolerance for fees and rounding), and use the quantity-weighted average
+    price. Walking newest-first matches the case that matters - the operator
+    bought by hand a few minutes before the bot noticed.
+
+    Returns {"ok", "price", "qty", "fee_idr", "fills", "source", "error"}.
+    `ok` is False when no fills cover the position; the caller then keeps the
+    estimate rather than inventing a cost basis from partial data.
+    """
+    try:
+        import live_api
+        rows = live_api.trade_history_v2(f"{str(coin).lower()}idr")
+    except Exception as e:                                   # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:160]}"}
+
+    if not rows:
+        return {"ok": False, "error": "the exchange returned no fills",
+                "source": "exchange_fills"}
+
+    want = float(amount or 0.0)
+    if want <= 0:
+        return {"ok": False, "error": "no position to price"}
+
+    got_qty = 0.0
+    got_idr = 0.0
+    fee_idr = 0.0
+    used = []
+    for r in rows:
+        try:
+            if r.get("isBuyer") is False:
+                continue
+            q = float(r.get("qty") or 0.0)
+            p = float(r.get("price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if q <= 0 or p <= 0:
+            continue
+        # only buy the shortfall, so an older, larger buy cannot dominate
+        take = min(q, max(0.0, want - got_qty))
+        if take <= 0:
+            continue
+        got_qty += take
+        got_idr += take * p
+        try:
+            if str(r.get("commissionAsset") or "").lower() == "idr":
+                fee_idr += float(r.get("commission") or 0.0) * (take / q)
+        except (TypeError, ValueError):
+            pass
+        used.append(r)
+        if got_qty >= want * 1.01:
+            break
+
+    if got_qty <= 0:
+        return {"ok": False, "source": "exchange_fills",
+                "error": "no BUY fills found for this pair"}
+
+    # Not enough fills to cover the position: report what was found, but do not
+    # call it the entry price. Partial data would misstate the cost basis.
+    covered = got_qty >= want * 0.99
+    return {
+        "ok": covered,
+        "price": got_idr / got_qty if got_qty else None,
+        "qty": got_qty,
+        "fee_idr": round(fee_idr, 2),
+        "fills": len(used),
+        "source": "exchange_fills",
+        "error": None if covered else (
+            f"fills cover only {got_qty:g} of {want:g} - too little to price it"),
+    }
+
+
+def reprice_adopted(pos: dict, truth: Dict[str, Any], tick: float) -> Dict[str, Any]:
+    """Re-anchor an adopted position on the operator's real entry price.
+
+    The levels were built from an estimate. Now that the true price is known,
+    the target and stop should move with it - otherwise a position bought 8%
+    below the estimate is being managed against levels that reflect a trade that
+    never happened.
+
+    Only an ADOPTED position is repriced. A position the bot opened itself
+    already knows its own fill and must never be second-guessed by history.
+
+    Returns the position dict (mutated copy) and whether anything changed.
+    """
+    if not pos or not pos.get("adopted"):
+        return {"changed": False, "reason": "not an adopted position"}
+    if not truth or not truth.get("ok") or not truth.get("price"):
+        return {"changed": False, "reason": "no reliable entry price"}
+
+    old = float(pos.get("entry_price") or 0.0)
+    new = float(truth["price"])
+    if old <= 0 or new <= 0:
+        return {"changed": False, "reason": "unusable price"}
+    if abs(new - old) / old < 1e-6:
+        return {"changed": False, "reason": "already priced from the exchange"}
+
+    import run_hunter
+    fw = run_hunter.get_framework(pos.get("framework") or "A")
+    levels = fw.initialize_exit(new, tick)
+
+    pos = dict(pos)
+    pos["entry_price"] = new
+    pos["entry_source"] = "exchange_fills"
+    pos["entry_estimated_price"] = old
+    pos["exit_levels"] = levels
+    pos["cost_idr"] = round(float(pos.get("coins") or 0.0) * new, 2)
+    return {"changed": True, "position": pos, "old_price": old, "new_price": new,
+            "levels": levels}
+
+
 def client_open_orders(client=None) -> list:
     """Every resting order on the account, flattened, or [] if unreadable."""
     client = client or RealClient()
@@ -1913,8 +2032,83 @@ def _self_check():
         assert close_externally_sold(st20, r20["reconcile"])["closed"] is False
         assert st20["position"] is not None
         print("[PASS] an unreadable exchange never closes a position")
+
     finally:
         globals()["_last_price"] = _orig_lp2
+
+    # --- 19. the real entry price is recovered from the exchange's fills ------
+    # The operator asked whether the entry can come from Indodax instead of the
+    # adoption estimate. It can: /api/v2/myTrades returns every fill.
+    _rows = [
+        # newest first, as the API returns them
+        {"price": "1310000", "qty": "0.00800000", "isBuyer": True,
+         "commission": "1048", "commissionAsset": "idr"},
+        {"price": "1320000", "qty": "0.00777735", "isBuyer": True,
+         "commission": "1027", "commissionAsset": "idr"},
+        # an older SELL must be ignored: we want what was PAID, not received
+        {"price": "900000", "qty": "5.00000000", "isBuyer": False,
+         "commission": "0", "commissionAsset": "idr"},
+    ]
+    _orig_hist = live_api.trade_history_v2
+    live_api.trade_history_v2 = lambda *a, **k: _rows
+    try:
+        _t = true_entry_price("HYPE", 0.01377735)
+        assert _t["ok"] is True, _t
+        _want = (0.008 * 1310000 + 0.00577735 * 1320000) / 0.01377735
+        assert abs(_t["price"] - _want) < 1.0, (_t["price"], _want)
+        assert _t["fills"] == 2, _t
+        assert _t["fee_idr"] > 0, _t
+        print(f"[PASS] the real entry is recovered from fills: "
+              f"{_t['price']:,.0f} IDR over {_t['fills']} fills")
+
+        # a SELL must never be used as an entry price
+        live_api.trade_history_v2 = lambda *a, **k: [
+            {"price": "900000", "qty": "1.0", "isBuyer": False}]
+        _t2 = true_entry_price("HYPE", 0.5)
+        assert _t2["ok"] is False, _t2
+        print("[PASS] a sell fill is never mistaken for the entry price")
+
+        # partial coverage must not be called the entry price
+        live_api.trade_history_v2 = lambda *a, **k: [
+            {"price": "1310000", "qty": "0.001", "isBuyer": True}]
+        _t3 = true_entry_price("HYPE", 0.5)
+        assert _t3["ok"] is False and "too little" in (_t3.get("error") or ""), _t3
+        print("[PASS] fills that do not cover the position are refused")
+
+        # an unreadable history is not fatal
+        live_api.trade_history_v2 = lambda *a, **k: []
+        _t4 = true_entry_price("HYPE", 0.5)
+        assert _t4["ok"] is False, _t4
+        print("[PASS] no fill history leaves the estimate in place")
+
+        # --- repricing an adopted position ---
+        _pos19 = {"symbol": "HYPEIDR", "coins": 0.01377735, "entry_price": 1316000.0,
+                  "framework": "A", "adopted": True,
+                  "entry_source": "market_at_adoption"}
+        live_api.trade_history_v2 = lambda *a, **k: _rows
+        _truth = true_entry_price("HYPE", 0.01377735)
+        _rp = reprice_adopted(_pos19, _truth, 1.0)
+        assert _rp["changed"] is True, _rp
+        _np = _rp["position"]
+        assert _np["entry_source"] == "exchange_fills", _np
+        assert abs(_np["entry_price"] - _truth["price"]) < 1e-6, _np
+        assert _np["entry_estimated_price"] == 1316000.0, _np
+        # A is +2% / -4%: the levels must move with the new entry
+        assert _np["exit_levels"]["target_price"] > _np["entry_price"]
+        assert _np["exit_levels"]["stop_trigger_price"] < _np["entry_price"]
+        print(f"[PASS] an adopted position is repriced to the real entry: "
+              f"{_rp['old_price']:,.0f} -> {_rp['new_price']:,.0f}")
+
+        # a position the bot opened itself is NEVER repriced
+        _own = dict(_pos19, adopted=False, entry_source="own_fill")
+        assert reprice_adopted(_own, _truth, 1.0)["changed"] is False
+        print("[PASS] a hunted position is never repriced by history")
+
+        # no reliable truth -> no change
+        assert reprice_adopted(_pos19, {"ok": False}, 1.0)["changed"] is False
+        print("[PASS] repricing refuses without a reliable price")
+    finally:
+        live_api.trade_history_v2 = _orig_hist
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 

@@ -1084,6 +1084,43 @@ def tick(now: Optional[float] = None) -> dict:
                                         f"resting on the exchange; watching it "
                                         f"before hunting.")}
 
+                # An adopted position carries an ESTIMATED entry. The exchange
+                # knows the real one, so re-anchor the levels on it the first
+                # time we can recover it. Doing it here (before handle_holding)
+                # means the stop and target reflect the operator's actual trade
+                # rather than a placeholder.
+                _pos_now = state.get("position") or {}
+                if _pos_now.get("adopted") and _pos_now.get("entry_source") == \
+                        "market_at_adoption":
+                    _coin = str(_pos_now.get("symbol") or "").upper().replace(
+                        "IDR", "")
+                    _truth = executor_live.true_entry_price(
+                        _coin, _pos_now.get("coins") or 0.0)
+                    _rp = executor_live.reprice_adopted(
+                        _pos_now, _truth, float(state.get("tick") or 1.0))
+                    if _rp.get("changed"):
+                        state["position"] = _rp["position"]
+                        save_state(state)
+                        record_hunt_event(_pos_now.get("hunt_id") or "GLOBAL",
+                                          "ENTRY_REPRICED", {
+                            "symbol": _pos_now.get("symbol"),
+                            "was": _rp["old_price"],
+                            "now": _rp["new_price"],
+                            "source": "exchange_fills",
+                            "fills": _truth.get("fills"),
+                        }, now=now)
+                        _p2 = _rp["position"]
+                        return {"status": "ENTRY_REPRICED",
+                                "message": (f"{dt_str}  [REPRICED] "
+                                            f"{_p2['symbol']}: entry "
+                                            f"{_rp['old_price']:,.0f} -> "
+                                            f"{_rp['new_price']:,.0f} IDR from "
+                                            f"{_truth.get('fills')} exchange "
+                                            f"fill(s). New target "
+                                            f"{_p2['exit_levels'].get('target_price'):,.0f} "
+                                            f"/ stop "
+                                            f"{_p2['exit_levels'].get('stop_trigger_price'):,.0f}.")}
+
                 if _act == "UNMANAGED":
                     _why = _sync.get("reason") or "unmanageable holding"
                     try:
