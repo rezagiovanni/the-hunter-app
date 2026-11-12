@@ -432,7 +432,7 @@ def handle_hunting(state: dict, now: float, fw=None) -> str:
             continue
 
         # WINNER ACQUIRED! Allocate a hunt id and place the buy order
-        hunt_id = next_hunt_id(state)
+        hunt_id = next_hunt_id(state, live=_live_mode())
 
         if _live_mode():
             # REAL ORDER. Every guard that protects the balance lives here,
@@ -2143,7 +2143,10 @@ def run_buy_now(symbol: str, use_live: bool = True):
         best_ask = ticker.get("sell") or best_bid
 
         fw = get_framework(ctrl.get("framework") or active_framework())
-        hunt_id = next_hunt_id(state)
+        # A live hunt gets the L- prefix and the live counter. use_live is the
+        # same flag that decides which executor runs, so the id can never
+        # disagree with the ledger the trade lands in.
+        hunt_id = next_hunt_id(state, live=bool(use_live))
 
         if use_live:
             import executor_live

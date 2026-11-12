@@ -755,16 +755,14 @@ def _trading_log_section(state: dict) -> str:
                 f"here, not from what you paid."
             )
     elif order and order.get("live") and _order_gone(order):
-        # The order is no longer on the book (cancelled in the app, filled, or
-        # expired) but the engine has not ticked yet. Say so instead of showing
-        # a resting order that does not exist.
-        status_badge = '<span class="badge-status blocked">✕ ORDER NO LONGER OPEN</span>'
-        status_detail = (
-            f"<b>{order.get('symbol')}</b> limit buy "
-            f"<b>{order.get('limit_price', 0):,.0f} IDR</b> is not on the "
-            f"exchange any more - it was cancelled, filled or expired. "
-            f"The engine will settle this on its next tick."
-        )
+        # The order is gone from the book but the engine has not ticked yet.
+        # Show NOTHING about it. The operator knows the order is not open - they
+        # are the one who cancelled it - so a banner explaining that the order
+        # they just cancelled has been cancelled is noise on a live dashboard.
+        # The engine settles this on its next tick, usually within a minute.
+        status_badge = f'<span class="badge-status hunting">● {phase}</span>'
+        status_detail = ("Waiting for the engine to settle the last order · "
+                         "no orders will be placed for it")
     elif order:
         status_badge = '<span class="badge-status open">● ORDER OPEN</span>'
         status_detail = (
@@ -921,7 +919,7 @@ def _trading_log_section(state: dict) -> str:
                 f"<td class='num'>{hold}</td>"
                 f"<td class='num'>{t.get('entry_price', 0):,.0f}</td>"
                 f"<td class='num'>{t.get('exit_price', 0):,.0f}</td>"
-                f"<td class='num'>{t.get('quantity', 0)}</td>"
+                f"<td class='num'>{t.get('quantity') or t.get('coins') or 0}</td>"
                 f"<td class='num {pnl_cls}'>{pnl_cell}</td>"
                 f"<td class='num {pnl_cls}'>{pct_cell}</td>"
                 f"<td>{t.get('exit_reason', '—')}</td></tr>"
@@ -932,6 +930,13 @@ def _trading_log_section(state: dict) -> str:
         """Pagination bar — rendered only for a table that has trades."""
         if count == 0:
             return ""
+        # The live ledger is the one the operator may want to reset (a test
+        # account, a fresh start). The button lives here, in the live table
+        # only, never on paper history.
+        _clear = ""
+        if table_id == "live":
+            _clear = ('<button class="pg-btn clear-live" type="button" '
+                      'onclick="clearLiveHistory(this)">Clear history</button>')
         return (
             f'<div class="pagination-wrap" data-pager="{table_id}">'
             f'<div class="pg-info">Showing <b class="pg-from">1</b>–<b class="pg-to">'
@@ -940,6 +945,7 @@ def _trading_log_section(state: dict) -> str:
             f'<button class="pg-btn" data-page="prev" type="button">← Prev</button>'
             f'<span class="pg-nums"></span>'
             f'<button class="pg-btn" data-page="next" type="button">Next →</button>'
+            + _clear +
             f'</div>'
             f'</div>'
         )
@@ -1386,8 +1392,14 @@ def _parse_date(date_str: str, end_of_day: bool = False):
 def _trades_for(symbol: str) -> list:
     """Closed trades for one symbol, oldest first, with the fields a chart needs.
 
-    Read from hunter_state.json's trade_log. Malformed rows are skipped rather
-    than raised: a chart must not fail because one trade record is odd.
+    Reads BOTH ledgers. It used to read only trade_log, so a chart for a pair
+    that had been traded in LIVE mode showed no trade bands at all - the trades
+    existed, they were simply in the other file. The two ledgers are still never
+    summed for P&L; here we are drawing markers, not adding money up, and each
+    trade keeps its `live` flag so the chart can colour it differently.
+
+    Malformed rows are skipped rather than raised: a chart must not fail because
+    one trade record is odd.
     """
     import state as _state
     try:
@@ -1395,28 +1407,37 @@ def _trades_for(symbol: str) -> list:
     except Exception:
         return []
     out = []
-    for t in (st.get("trade_log") or []):
-        if not isinstance(t, dict):
-            continue
-        if (t.get("symbol") or "").upper() != symbol.upper():
-            continue
-        entry, exit_ = t.get("entry_time"), t.get("exit_time")
-        if not entry or not exit_:
-            continue
-        try:
-            out.append({
-                "hunt_id": t.get("hunt_id"),
-                "entry_time": float(entry),
-                "exit_time": float(exit_),
-                "entry_price": float(t.get("entry_price") or 0),
-                "exit_price": float(t.get("exit_price") or 0),
-                "net_pnl_idr": float(t.get("net_pnl_idr") or 0),
-                "net_pnl_pct": float(t.get("net_pnl_pct") or 0),
-                "exit_reason": t.get("exit_reason") or "",
-                "framework": t.get("framework") or "",
-            })
-        except (TypeError, ValueError):
-            continue
+    for ledger, is_live in (("trade_log", False), ("live_trade_log", True)):
+        for t in (st.get(ledger) or []):
+            if not isinstance(t, dict):
+                continue
+            if (t.get("symbol") or "").upper() != symbol.upper():
+                continue
+            entry, exit_ = t.get("entry_time"), t.get("exit_time")
+            if not entry or not exit_:
+                continue
+            try:
+                out.append({
+                    "hunt_id": t.get("hunt_id"),
+                    "entry_time": float(entry),
+                    "exit_time": float(exit_),
+                    "entry_price": float(t.get("entry_price") or 0),
+                    # 0 means the exit price is unknown (sold outside the bot),
+                    # not "sold at zero". The chart must not draw a marker at
+                    # price 0, so it is carried through as None.
+                    "exit_price": (float(t.get("exit_price"))
+                                   if t.get("exit_price") else None),
+                    "net_pnl_idr": (None if t.get("net_pnl_idr") is None
+                                    else float(t.get("net_pnl_idr") or 0)),
+                    "net_pnl_pct": (None if t.get("net_pnl_pct") is None
+                                    else float(t.get("net_pnl_pct") or 0)),
+                    "exit_reason": t.get("exit_reason") or "",
+                    "framework": t.get("framework") or "",
+                    "live": is_live,
+                    "pnl_known": t.get("net_pnl_idr") is not None,
+                })
+            except (TypeError, ValueError):
+                continue
     out.sort(key=lambda x: x["entry_time"])
     return out
 
@@ -3898,6 +3919,49 @@ PAGE_JS = """
     // Sells the open position at the best bid and keeps hunting. NOT the same as
     // STOP: STOP liquidates and parks the engine. A confirmation is deliberate -
     // there is no undo on a market sell.
+    // Deletes the LIVE trade history. The server takes a backup first and
+    // refuses while a position is open. Deliberately a typed confirmation:
+    // this is the only record of money that was really spent.
+    function clearLiveHistory(btn) {
+        var want = 'DELETE LIVE HISTORY';
+        var typed = window.prompt(
+            'Delete the entire LIVE trade history?' +
+            String.fromCharCode(10, 10) +
+            'A backup is written to the data folder first.' +
+            String.fromCharCode(10) +
+            'Paper history is not touched.' +
+            String.fromCharCode(10, 10) +
+            'Type ' + want + ' to confirm:');
+        if (typed === null) { return; }
+        if (typed !== want) {
+            showToast('Not deleted: the confirmation text did not match.');
+            return;
+        }
+        if (btn) { btn.disabled = true; btn.textContent = 'Clearing...'; }
+        fetch('/api/trades/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirm: want })
+        })
+            .then(function (r) { return r.json().then(function (d) {
+                return { status: r.status, d: d }; }); })
+            .then(function (res) {
+                var d = res.d || {};
+                if (res.status === 200 && d.ok) {
+                    showToast('Deleted ' + (d.deleted || 0) +
+                              ' live trade(s). Backup: ' + (d.backup || 'n/a'));
+                    setTimeout(function () { location.reload(); }, 1200);
+                } else {
+                    showToast('Not deleted: ' + (d.error || 'unknown error'));
+                    if (btn) { btn.disabled = false; btn.textContent = 'Clear history'; }
+                }
+            })
+            .catch(function (e) {
+                showToast('Not deleted: ' + e);
+                if (btn) { btn.disabled = false; btn.textContent = 'Clear history'; }
+            });
+    }
+
     function sellNow(symbol, btn) {
         var msg = 'Market sell ' + symbol + ' now?';
         msg += String.fromCharCode(10, 10);
@@ -4582,6 +4646,73 @@ async def api_position_buy(request: Request):
     if not result.get("ok"):
         return JSONResponse(result, status_code=400)
     return result
+
+
+@app.post("/api/trades/clear")
+async def api_trades_clear(req: Request):
+    """Delete the LIVE trade history. Paper history is never touched.
+
+    Two guards, because this destroys the only record of money that was really
+    spent:
+
+      1. A backup is written to the data dir FIRST, and the path is returned.
+         If the delete succeeds and the operator then wants the rows back, they
+         are still on disk.
+      2. `confirm` must be the literal string "DELETE LIVE HISTORY".
+
+    It refuses while a position is open: deleting the history of a trade that is
+    still running would leave the position pointing at a hunt id that no longer
+    exists anywhere.
+    """
+    try:
+        body = await req.json()
+    except Exception:                                        # noqa: BLE001
+        body = {}
+
+    if str(body.get("confirm") or "") != "DELETE LIVE HISTORY":
+        return JSONResponse({"ok": False,
+                             "error": 'confirm must be "DELETE LIVE HISTORY"'},
+                            status_code=400)
+
+    lock_fd = None
+    try:
+        # imported here, like the other handlers, so the module stays importable
+        # in tests without touching the live data dir
+        import state as _state
+        lock_fd = _state.acquire_lock()
+        if lock_fd is None:
+            return JSONResponse({"ok": False, "busy": True,
+                                 "error": "engine tick in progress, retry"},
+                                status_code=409)
+
+        st = _state.load_state()
+        if st.get("position"):
+            return JSONResponse(
+                {"ok": False,
+                 "error": "a position is still open - close it before clearing "
+                          "the history it belongs to"},
+                status_code=409)
+
+        rows = st.get("live_trade_log") or []
+        if not rows:
+            return JSONResponse({"ok": True, "deleted": 0,
+                                 "message": "no live history to delete"})
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = DATA_DIR / f"live_trade_log.backup-{stamp}.json"
+        backup.write_text(json.dumps(rows, indent=2) + "\n")
+
+        st["live_trade_log"] = []
+        _state.save_state(st)
+        return JSONResponse({"ok": True, "deleted": len(rows),
+                             "backup": str(backup)})
+    except Exception as e:                                   # noqa: BLE001
+        return JSONResponse({"ok": False,
+                             "error": f"{type(e).__name__}: {e}"},
+                            status_code=500)
+    finally:
+        if lock_fd is not None:
+            _state.release_lock(lock_fd)
 
 
 @app.post("/api/position/sell")

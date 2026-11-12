@@ -19,6 +19,14 @@ Two jobs:
 
 Hunt IDs (locked with Reza, 2026-10-21):
    H-0001, H-0002, ... H-9999, H-10000, H-10001  (zero-padded to 4, then natural)
+
+   LIVE MODE USES ITS OWN PREFIX: L-00001, L-00002, ...
+
+   Two reasons. A live hunt and a paper hunt are not the same kind of event -
+   one is simulated money and the other is not - so they must never share a
+   numbering space or a label. And the live ledger is the one an operator
+   actually audits, so it gets its own sequence starting at 1 rather than
+   inheriting a paper counter that has been running for weeks.
 """
 
 import json
@@ -38,20 +46,32 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Hunt ID
 # ---------------------------------------------------------------------------
-def format_hunt_id(n: int) -> str:
+def format_hunt_id(n: int, live: bool = False) -> str:
     """
     H-0001 ... H-9999, then H-10000, H-10001 (natural growth past 4 digits).
+
+    live=True gives L-00001 ... L-99999, the live ledger's own sequence.
     """
+    if live:
+        if n < 100000:
+            return f"L-{n:05d}"
+        return f"L-{n}"
     if n < 10000:
         return f"H-{n:04d}"
     return f"H-{n}"
 
 
-def next_hunt_id(state: dict) -> str:
-    """Allocate the next hunt id and advance the counter in state."""
-    nxt = int(state.get("hunt_counter", 0)) + 1
-    state["hunt_counter"] = nxt
-    return format_hunt_id(nxt)
+def next_hunt_id(state: dict, live: bool = False) -> str:
+    """Allocate the next hunt id and advance the counter in state.
+
+    Live and paper keep SEPARATE counters (live_hunt_counter vs hunt_counter).
+    Sharing one counter would make the live sequence jump by however many paper
+    hunts happened to run, which is neither useful nor auditable.
+    """
+    key = "live_hunt_counter" if live else "hunt_counter"
+    nxt = int(state.get(key, 0)) + 1
+    state[key] = nxt
+    return format_hunt_id(nxt, live=live)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +135,22 @@ if __name__ == "__main__":
     assert format_hunt_id(10001) == "H-10001"
     assert format_hunt_id(123456) == "H-123456"
     print("[PASS] hunt id: H-0001 / H-9999 / H-10000 / H-10001 / H-123456")
+
+    # 1b. live ids carry their own prefix and their own counter
+    assert format_hunt_id(1, live=True) == "L-00001"
+    assert format_hunt_id(42, live=True) == "L-00042"
+    assert format_hunt_id(99999, live=True) == "L-99999"
+    assert format_hunt_id(100000, live=True) == "L-100000"
+    print("[PASS] live hunt id: L-00001 / L-99999 / L-100000")
+
+    _mix = {"hunt_counter": 27}
+    _l = [next_hunt_id(_mix, live=True) for _ in range(3)]
+    assert _l == ["L-00001", "L-00002", "L-00003"], _l
+    # the paper counter must not have moved
+    assert _mix["hunt_counter"] == 27, _mix
+    assert _mix["live_hunt_counter"] == 3
+    assert next_hunt_id(_mix) == "H-0028"
+    print("[PASS] live and paper counters are independent")
 
     # 2. Counter advances and is monotonic
     st = {}

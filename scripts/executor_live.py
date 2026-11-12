@@ -1121,7 +1121,7 @@ def sync_with_exchange(state: dict, framework: str, tick: float,
         out["reason"] = f"cannot price {coin}, so it cannot be adopted safely"
         return out
 
-    hunt_id = f"H-ADOPT-{coin}"
+    hunt_id = f"L-ADOPT-{coin}"
     adopted = adopt_position(coin, amount, price, tick, hunt_id, framework,
                              now=now)
     if adopted.get("error"):
@@ -1183,6 +1183,10 @@ def close_externally_sold(state: dict, rec: dict,
         "exit_price": 0.0,
         "exit_price_source": "unknown",
         "coins": coins,
+        # the table reads `quantity`; an adopted position carries `coins`. Write
+        # both so the QTY column is not blank for exactly the trades the
+        # operator is most likely to inspect.
+        "quantity": coins,
         "live": True,
         "exit_reason": "EXIT_EXTERNAL_SELL",
         "entry_time": pos.get("opened_at") or pos.get("entry_time"),
