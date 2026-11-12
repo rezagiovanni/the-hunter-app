@@ -137,6 +137,63 @@ def load_credentials(path: Optional[str] = None) -> Tuple[str, str]:
     return key, secret
 
 
+_CRED_LABELS = {
+    "api_key", "apikey", "key", "api_key_id", "api-key",
+    "secret_key", "secretkey", "secret", "api_secret", "api-secret",
+}
+
+
+def _parse_cred_lines(lines, path: str) -> Tuple[str, str, dict]:
+    """Turn a credential file's non-empty lines into (key, secret, labels).
+
+    Accepts both shapes, because both exist in the wild and guessing wrong
+    produces a 401 that looks exactly like an expired key:
+
+        <key>
+        <secret>
+
+        api_key=XXXX
+        secret_key=YYYY
+
+    A `name=` prefix is a LABEL, not part of the value. Passing the whole line
+    through - which an earlier version did - sends "api_key=XXXX" as the API key
+    and "secret_key=YYYY" as the secret, and Indodax answers "Invalid
+    credentials", which sends the operator off to regenerate a perfectly good
+    key. That mistake cost one debugging round here; do not reintroduce it.
+
+    Only recognised labels are stripped. An unrecognised prefix is treated as
+    part of the value, so a key that legitimately contains '=' is not mangled.
+    """
+    pairs = {}
+    bare = []
+    for raw in lines:
+        ln = raw.strip().strip("\"'")
+        if not ln or ln.startswith("#"):
+            continue
+        if "=" in ln:
+            name, _, val = ln.partition("=")
+            name_l = name.strip().lower().replace(" ", "_")
+            if name_l in _CRED_LABELS:
+                pairs[name_l] = val.strip().strip("\"'")
+                continue
+        bare.append(ln)
+
+    key = pairs.get("api_key") or pairs.get("apikey") or pairs.get("key") or ""
+    secret = (pairs.get("secret_key") or pairs.get("secretkey")
+              or pairs.get("secret") or pairs.get("api_secret") or "")
+
+    # positional fallback: the first two values that are not the ones we found
+    for v in bare:
+        if not key and v != secret:
+            key = v
+        elif not secret and v != key:
+            secret = v
+        if key and secret:
+            break
+
+    return key, secret, pairs
+
+
 def _load_two_line_file(path: str) -> Tuple[str, str]:
     """Two-line key/secret file: line 1 key, line 2 secret. Explicit use only."""
     path = os.path.expanduser(str(path))
@@ -144,7 +201,8 @@ def _load_two_line_file(path: str) -> Tuple[str, str]:
         raise LiveApiError(
             f"no API credentials at {path}. One line key, one line secret.")
     try:
-        lines = [ln.strip() for ln in open(path).read().splitlines() if ln.strip()]
+        lines = [ln.strip() for ln in open(path, encoding="utf-8-sig").read().splitlines()
+                 if ln.strip()]
     except OSError as e:
         raise LiveApiError(f"cannot read {path}: {type(e).__name__}")
 
@@ -153,11 +211,19 @@ def _load_two_line_file(path: str) -> Tuple[str, str]:
             f"{path} must contain the key on line 1 and the secret on line 2; "
             f"found {len(lines)} non-empty line(s).")
 
-    key, secret = lines[0], lines[1]
+    key, secret, _labels = _parse_cred_lines(lines, path)
+
+    if not key or not secret:
+        raise LiveApiError(
+            f"{path}: could not find both a key and a secret. "
+            f"Found {len(lines)} non-empty line(s); expected either two plain "
+            f"lines or api_key= / secret_key= lines.")
+
     if len(key) < 20 or len(secret) < 20:
         raise LiveApiError(
             f"{path}: the key or secret looks too short "
-            f"({len(key)} and {len(secret)} characters).")
+            f"({len(key)} and {len(secret)} characters). "
+            f"Check for a stray 'name=' prefix or a truncated paste.")
     return key, secret
 
 
@@ -708,6 +774,23 @@ def _self_check():
                        hashlib.sha256).hexdigest()
     assert _v2_sig == _v2_expected, (_v2_sig, _v2_expected)
     print("[PASS] v2 signing reproduces Indodax's published example signature")
+
+    # --- credential files may carry name= labels -----------------------------
+    # Reported live: indodax_api.txt held "api_key=..." / "secret_key=..." and
+    # the loader sent the whole line as the key, so every call answered
+    # "Invalid credentials" and the operator was told to regenerate a good key.
+    _k1, _s1, _ = _parse_cred_lines(
+        ["api_key=AAAABBBBCCCCDDDDEEEEFFFF", "secret_key=" + "a" * 64], "t")
+    _k2, _s2, _ = _parse_cred_lines(
+        ["AAAABBBBCCCCDDDDEEEEFFFF", "a" * 64], "t")
+    assert (_k1, _s1) == (_k2, _s2), (_k1, _k2)
+    assert "=" not in _k1 and "=" not in _s1
+    print("[PASS] a labelled credential file parses exactly like a plain one")
+
+    # an unrecognised prefix is part of the value, not a label to strip
+    _k3, _s3, _ = _parse_cred_lines(["weird=abcd", "other=efgh"], "t")
+    assert _k3 == "weird=abcd" and _s3 == "other=efgh", (_k3, _s3)
+    print("[PASS] only recognised labels are stripped")
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 
