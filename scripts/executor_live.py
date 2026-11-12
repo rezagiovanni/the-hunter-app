@@ -438,10 +438,24 @@ def check_live_buy_fill(order: dict, live_price: float,
     if now is None:
         now = time.time()
 
+    # The pair on a stored order may be the PUBLIC form ("hypeidr") if it was
+    # placed by an older build. Normalise it, or every lookup fails with
+    # invalid_pair and the order can never be resolved.
+    pair_ref = order.get("api_pair") or order.get("pair_id")
     try:
-        detail = client.get_order(order["pair_id"], order["order_id"])
+        pair_ref = live_api.pair_param(pair_ref)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    try:
+        detail = client.get_order(pair_ref, order["order_id"])
     except Exception as e:                                   # noqa: BLE001
         msg = str(e).lower()
+        # invalid_pair means the REQUEST was malformed, not that the order is
+        # gone. Reporting CANCELLED here would silently drop a real order, so it
+        # gets its own outcome: unresolved, needs a human.
+        if "invalid_pair" in msg or "invalid pair" in msg:
+            return "UNRESOLVED", None
         if "invalid order" in msg or "not found" in msg:
             return "CANCELLED", None
         return "ERROR", None
@@ -821,8 +835,14 @@ def reconcile_order(state: dict, client=None) -> Dict[str, Any]:
     if not order.get("live"):
         return {"status": "MATCH", "note": "paper order"}
 
+    pair_ref = order.get("api_pair") or order.get("pair_id")
     try:
-        open_orders = client.open_orders(pair=order.get("pair_id"))
+        pair_ref = live_api.pair_param(pair_ref)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    try:
+        open_orders = client.open_orders(pair=pair_ref)
     except Exception as e:                                   # noqa: BLE001
         return {"status": "UNKNOWN", "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
@@ -843,9 +863,15 @@ def reconcile_order(state: dict, client=None) -> Dict[str, Any]:
 
     detail = {}
     try:
-        d = client.get_order(order.get("pair_id"), target)
+        d = client.get_order(pair_ref, target)
         detail = (d.get("return") or {}).get("order") or {}
-    except Exception:                                        # noqa: BLE001
+    except Exception as e:                                   # noqa: BLE001
+        msg = str(e).lower()
+        if "invalid_pair" in msg or "invalid pair" in msg:
+            # we could not even build a valid request: this is not evidence the
+            # order is gone, and calling it GONE would hide a live order
+            return {"status": "UNKNOWN",
+                    "error": f"cannot resolve the pair for this order: {str(e)[:160]}"}
         detail = {}
     return {"status": "GONE", "detail": detail,
             "reason": str(detail.get("status") or "not on the book")}
@@ -1417,6 +1443,59 @@ def _self_check():
                             client=NoOrders())
     assert rec29["status"] == "MATCH", rec29
     print("[PASS] a paper order is left alone by reconciliation")
+
+    # --- 16. an older order stores the PUBLIC pair form ----------------------
+    # Reported: the engine sat at phase=ORDER_OPEN forever after a cancel,
+    # because the stored pair_id was "hypeidr" (public) and every private-API
+    # lookup answered invalid_pair -> ERROR, which never settles.
+    class _LegacyPair(FakeExchange):
+        def __init__(self):
+            super().__init__(idr=50000.0)
+            self.seen = []
+
+        def get_order(self, pair, order_id):
+            self.seen.append(pair)
+            if "_" not in pair:
+                raise live_api.LiveApiError(
+                    '{"error":"invalid_pair","error_description":"Invalid Pair"}')
+            if order_id == "gone":
+                raise live_api.LiveApiError("invalid order.")
+            return {"success": 1, "return": {"order": {
+                "order_id": order_id, "status": "cancelled",
+                "order_rp": "100.0", "remain_rp": "100.0"}}}
+
+        def open_orders(self, pair=None):
+            self.seen.append(pair)
+            return {"success": 1, "return": {"orders": {}}}
+
+    legacy = {"order_id": "123", "pair_id": "hypeidr", "live": True,
+              "symbol": "HYPEIDR", "limit_price": 1000.0, "coin_amount": 1.0,
+              "trade_size_idr": 1000.0, "placed_at": 0.0, "tick": 1.0}
+
+    ex30 = _LegacyPair()
+    out30, _ = check_live_buy_fill(legacy, 1000.0, now=1.0, client=ex30)
+    assert "hype_idr" in ex30.seen, ex30.seen
+    assert out30 == "CANCELLED", out30
+    print("[PASS] a legacy public pair_id is normalised before the lookup")
+
+    # an unresolved pair must NOT be reported as gone
+    class _BadPair(FakeExchange):
+        def open_orders(self, pair=None):
+            raise live_api.LiveApiError("invalid_pair")
+
+    rec31 = reconcile_order({"order": dict(legacy, pair_id="@@@")}, client=_BadPair())
+    assert rec31["status"] == "UNKNOWN", rec31
+    print("[PASS] an unresolvable pair is UNKNOWN, never GONE")
+
+    # invalid_pair in check_live_buy_fill is UNRESOLVED, not CANCELLED
+    class _BadPair2(FakeExchange):
+        def get_order(self, pair, order_id):
+            raise live_api.LiveApiError("invalid_pair")
+
+    out32, _ = check_live_buy_fill({"order_id": "x", "pair_id": "@@@", "live": True},
+                                   1000.0, client=_BadPair2())
+    assert out32 == "UNRESOLVED", out32
+    print("[PASS] invalid_pair is UNRESOLVED, so a real order is never dropped")
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 

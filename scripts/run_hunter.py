@@ -566,9 +566,29 @@ def handle_order_open(state: dict, now: float) -> str:
             return (f"[ORDER_GONE] {hunt_id} {sym}: the exchange reports the "
                     f"order as cancelled or expired. Back to HUNTING.")
 
-        if outcome == "ERROR":
-            return (f"[ORDER_OPEN] {hunt_id} {sym}: the exchange returned an "
-                    f"unrecognised order state. Not guessing - check Indodax.")
+        if outcome in ("ERROR", "UNRESOLVED"):
+            # The exchange cannot tell us what happened to this order. Do not
+            # guess - but do not jam either. An unresolvable order used to keep
+            # phase=ORDER_OPEN forever, which blocks every future hunt while the
+            # dashboard shows an order that may not exist.
+            #
+            # After the same wall-clock bound as a timeout, stop and say so.
+            placed = float(order.get("placed_at") or now)
+            age_min = (now - placed) / 60.0
+            if age_min >= ORDER_TIMEOUT_MINUTES:
+                state["order"] = None
+                state["phase"] = "HUNTING"
+                record_hunt_event(hunt_id, "ORDER_UNRESOLVED", {
+                    "symbol": sym, "order_id": order.get("order_id"),
+                    "outcome": outcome, "age_min": round(age_min, 1),
+                }, now=now)
+                return (f"[ORDER_UNRESOLVED] {hunt_id} {sym}: the exchange could "
+                        f"not resolve this order after {age_min:.0f}m "
+                        f"({outcome}). Cleared so hunting can continue - check "
+                        f"Indodax for an orphan.")
+            return (f"[ORDER_OPEN] {hunt_id} {sym}: the exchange could not "
+                    f"resolve this order ({outcome}). Will clear it after "
+                    f"{ORDER_TIMEOUT_MINUTES:.0f}m.")
 
         if outcome in ("FILLED", "PARTIAL") and position:
             # the exit levels were computed when the order was placed, using the
@@ -1634,6 +1654,9 @@ def main():
     if "--sell-now" in sys.argv:
         run_sell_now()
         return
+    if "--clear-stale-order" in sys.argv:
+        run_clear_stale_order(force=("--force" in sys.argv))
+        return
     if "--buy-now" in sys.argv:
         # --buy-now SYMBOL [--paper]
         args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -1760,6 +1783,74 @@ def run_sell_now():
     finally:
         release_lock(lock_fd)
     sys.exit(0)
+
+
+def run_clear_stale_order(force: bool = False):
+    """Clear a recorded order that the exchange does not have.
+
+    For the state a bug can leave behind: phase=ORDER_OPEN with an order that is
+    no longer (or never really was) on the book. The engine resolves this itself
+    now, but an existing install can already be stuck.
+
+    SAFETY: it asks the exchange first. If the order IS still open there this
+    refuses, because clearing it would leave a real order working with nobody
+    watching. --force overrides and says so.
+
+    Exit codes: 0 cleared or nothing to do, 1 refused/failed, 2 locked.
+    """
+    now = time.time()
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "busy": True,
+                          "error": "engine tick in progress, retry"}))
+        sys.exit(2)
+    try:
+        state = load_state()
+        order = state.get("order")
+        if not order:
+            print(json.dumps({"ok": True, "nothing_to_do": True,
+                              "message": "no recorded order",
+                              "phase": state.get("phase")}))
+            return
+
+        live_state = "UNKNOWN"
+        try:
+            import executor_live
+            rec = executor_live.reconcile_order({"order": order})
+            live_state = rec.get("status")
+        except Exception as e:                               # noqa: BLE001
+            live_state = f"UNKNOWN:{type(e).__name__}"
+
+        if live_state == "MATCH" and not force:
+            print(json.dumps({
+                "ok": False,
+                "error": "the order is STILL OPEN at the exchange - cancel it in "
+                         "Indodax first, or use --force to forget it anyway",
+                "order_id": order.get("order_id"),
+                "symbol": order.get("symbol"),
+            }))
+            sys.exit(1)
+
+        state["order"] = None
+        state["phase"] = "HUNTING"
+        save_state(state)
+        record_hunt_event(order.get("hunt_id") or "GLOBAL", "ORDER_CLEARED", {
+            "symbol": order.get("symbol"), "order_id": order.get("order_id"),
+            "exchange_state": live_state, "forced": bool(force),
+        }, now=now)
+        print(json.dumps({
+            "ok": True,
+            "message": (f"cleared {order.get('symbol')} order "
+                        f"{order.get('order_id')} (exchange said: {live_state})"),
+            "exchange_state": live_state,
+            "forced": bool(force),
+            "phase": state["phase"],
+        }))
+    except Exception as e:                                   # noqa: BLE001
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        sys.exit(1)
+    finally:
+        release_lock(lock_fd)
 
 
 def run_buy_now(symbol: str, use_live: bool = True):
