@@ -57,6 +57,11 @@ DEFAULTS = {
         "cooldown_hours": 4.0,          # per-pair cooldown after exit
         "stop_slip_fraction": 0.0094,   # measured avg gap-through on market stops
         "order_timeout_checks": 6,      # ~6 min timeout for resting limit orders
+        "order_timeout_minutes": 15,    # wall-clock backstop, in case ticks stop
+        # LIVE only. When the exchange holds coins the bot did not buy, take them
+        # over and manage them instead of halting. Halting was safe but useless:
+        # it left those coins with no stop while waiting for a human.
+        "adopt_foreign_holdings": True,
     },
     "frameworks": {
         "A": {

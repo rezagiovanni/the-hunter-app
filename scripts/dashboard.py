@@ -722,13 +722,30 @@ def _trading_log_section(state: dict) -> str:
             + " · no orders will be placed until this is resolved"
         )
     elif pos:
-        status_badge = '<span class="badge-status holding">● HOLDING</span>'
+        if pos.get("adopted"):
+            # The operator bought this by hand; the bot only took over watching
+            # it. Say so plainly - the entry price is the price at adoption, not
+            # what was actually paid, so any P&L shown against it is measured
+            # from here and must not be read as the trade's real result.
+            status_badge = ('<span class="badge-status holding">'
+                            '● HOLDING · ADOPTED</span>')
+        else:
+            status_badge = '<span class="badge-status holding">● HOLDING</span>'
         _lv = pos.get("exit_levels", {})
         status_detail = (
             f"Active Position: <b>{pos.get('coins')} {pos.get('symbol')}</b> @ {pos.get('entry_price', 0):,} IDR · "
             f"Target: <b>{_lv.get('target_price', 0):,} IDR</b> (+{_lv.get('target_pct', 0)*100:.0f}%) · "
             f"Stop: <b>{_lv.get('stop_trigger_price', 0):,} IDR</b> (-{_lv.get('stop_pct', 0)*100:.0f}%)"
         )
+        if pos.get("adopted"):
+            _src = ("the current market price" if pos.get("entry_source") ==
+                    "market_at_adoption" else "the price you entered")
+            status_detail += (
+                f" · Adopted at {_src} on "
+                f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(pos.get('adopted_at') or 0))} WIB"
+                f" - the bot did not see the original fill, so P&L runs from "
+                f"here, not from what you paid."
+            )
     elif order and order.get("live") and _order_gone(order):
         # The order is no longer on the book (cancelled in the app, filled, or
         # expired) but the engine has not ticked yet. Say so instead of showing

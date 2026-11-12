@@ -1029,17 +1029,13 @@ def tick(now: Optional[float] = None) -> dict:
                         _rows = json.load(_fh)
                 except Exception:                        # noqa: BLE001
                     _rows = []
-                _rec = executor_live.reconcile_position(state, pair_rows=_rows)
+                _sync = executor_live.sync_with_exchange(
+                    state, framework=ctrl.get("framework") or "C",
+                    tick=float(state.get("tick") or 1.0), pair_rows=_rows)
+                _act = _sync.get("action")
+                _rec = _sync.get("reconcile") or {}
                 _st = _rec.get("status")
-                if _st in ("RECOVER", "PHANTOM", "MISMATCH", "PHANTOM_DUST"):
-                    _detail = _describe_reconcile(_rec)
-                    try:
-                        from control import set_blocked
-                        set_blocked(_detail[:280])
-                    except Exception:                        # noqa: BLE001
-                        pass
-                    return {"status": "EXCHANGE_MISMATCH",
-                            "message": f"{dt_str}  [BLOCKED] {_detail}"}
+
                 if _st == "UNKNOWN":
                     try:
                         from control import set_blocked
@@ -1049,6 +1045,70 @@ def tick(now: Optional[float] = None) -> dict:
                     return {"status": "EXCHANGE_UNREADABLE",
                             "message": f"{dt_str}  [BLOCKED] cannot read the "
                                        f"exchange: {_rec.get('error')}"}
+
+                # Coins the bot did not buy are ADOPTED, not refused. Refusing
+                # left them with no stop; adopting gives them one.
+                if _act == "ADOPTED":
+                    _p = _sync["position"]
+                    state["position"] = _p
+                    state["phase"] = "HOLDING"
+                    save_state(state)
+                    record_hunt_event(_p["hunt_id"], "POSITION_ADOPTED", {
+                        "symbol": _p["symbol"], "coins": _p["coins"],
+                        "entry_price": _p["entry_price"],
+                        "entry_source": _p.get("entry_source"),
+                        "value_idr": _sync.get("value_idr"),
+                        "unmanaged": _sync.get("unmanaged") or {},
+                    }, now=now)
+                    try:
+                        from control import clear_blocked
+                        clear_blocked()
+                    except Exception:                        # noqa: BLE001
+                        pass
+                    _extra = ""
+                    if _sync.get("unmanaged"):
+                        _extra = (" Also unmanaged: " + ", ".join(
+                            f"{v:g} {k}" for k, v in
+                            _sync["unmanaged"].items()) + ".")
+                    return {"status": "POSITION_ADOPTED",
+                            "message": (f"{dt_str}  [ADOPTED] {_p['symbol']} "
+                                        f"{_p['coins']:g} @ "
+                                        f"{_p['entry_price']:g} - tracking to "
+                                        f"target {_p['exit_levels'].get('target_price')} "
+                                        f"/ stop {_p['exit_levels'].get('stop_trigger_price')}."
+                                        f"{_extra}")}
+
+                if _act == "ORDER_PENDING":
+                    return {"status": "ORDER_PENDING",
+                            "message": (f"{dt_str}  [WAITING] an order is "
+                                        f"resting on the exchange; watching it "
+                                        f"before hunting.")}
+
+                if _act == "UNMANAGED":
+                    _why = _sync.get("reason") or "unmanageable holding"
+                    try:
+                        from control import set_blocked
+                        set_blocked(_why[:280])
+                    except Exception:                        # noqa: BLE001
+                        pass
+                    return {"status": "UNMANAGED_HOLDING",
+                            "message": f"{dt_str}  [BLOCKED] {_why}"}
+
+                # MATCH/MISMATCH/PHANTOM: the bot already holds; normal path.
+                if _act in ("KEPT",) and _st in ("PHANTOM", "PHANTOM_DUST"):
+                    _detail = _describe_reconcile(_rec)
+                    try:
+                        from control import set_blocked
+                        set_blocked(_detail[:280])
+                    except Exception:                        # noqa: BLE001
+                        pass
+                    return {"status": "EXCHANGE_MISMATCH",
+                            "message": f"{dt_str}  [BLOCKED] {_detail}"}
+                try:
+                    from control import clear_blocked
+                    clear_blocked()
+                except Exception:                            # noqa: BLE001
+                    pass
             except Exception as e:                           # noqa: BLE001
                 return {"status": "EXCHANGE_ERROR",
                         "message": f"{dt_str}  [BLOCKED] reconciliation failed: "
@@ -1398,6 +1458,66 @@ def run_self_checks():
         print("[PASS] an externally cancelled order is dropped back to HUNTING")
     finally:
         _exl2.RealClient = _orig_rc2
+
+    # 4c. a manual buy is adopted by a real tick, then managed to a stop
+    # Requested: on every live scan check Indodax; if coins are held, track them.
+    class _Holder(_exl2.FakeExchange):
+        def __init__(self):
+            super().__init__(idr=2000.0)
+            self.coins = {"hype": 20.0}
+
+        def open_orders(self, pair=None):
+            return {"success": 1, "return": {"orders": {}}}
+
+        def get_order(self, pair, order_id):
+            raise _exl2.live_api.LiveApiError("invalid order.")
+
+    _orig_rc3 = _exl2.RealClient
+    _orig_px3 = _exl2._last_price
+    _orig_live3 = globals()["_live_mode"]
+    _sandbox3 = tempfile.mkdtemp(prefix="hunter_adopt_test_")
+    _holder = _Holder()
+    try:
+        _exl2.RealClient = lambda creds=None: _holder
+        _exl2._last_price = lambda p, t=None: 1000.0
+        globals()["_live_mode"] = lambda: True
+
+        _st5 = {"phase": "HUNTING", "balance_idr": 2000.0, "cooldowns": {},
+                "trade_log": [], "live_trade_log": [], "hunt_counter": 90,
+                "gate_stats": {}, "position": None, "order": None, "tick": 1.0}
+        _r5 = _exl2.sync_with_exchange(_st5, framework="C", tick=1.0,
+                                 client=_holder, now=_now_cap + 3600)
+        assert _r5["action"] == "ADOPTED", (_r5["action"], _r5)
+        _st5["position"] = _r5["position"]
+        _st5["phase"] = "HOLDING"
+        _p5 = _st5["position"]
+        assert _p5["adopted"] is True and _p5["symbol"] == "HYPEIDR", _p5
+        assert _p5["coins"] == 20.0 and _p5["entry_price"] == 1000.0, _p5
+        print("[PASS] the live scan adopts a manual buy and starts tracking it")
+
+        # and the adopted position is managed: price at the stop sells it
+        _exl2._last_price = lambda p, t=None: 850.0     # below C's -10% stop
+        _sell_calls = []
+
+        def _fake_sell(*a, **k):
+            _sell_calls.append(a)
+            return {"ok": True, "order_id": "x", "filled": True,
+                    "coins": 20.0, "idr": 17000.0, "fee_idr": 10.0,
+                    "avg_price": 850.0}
+
+        _orig_sell5 = _exl2.execute_live_sell
+        _exl2.execute_live_sell = _fake_sell
+        try:
+            _r6 = handle_holding(_st5, now=_now_cap + 3660)
+        finally:
+            _exl2.execute_live_sell = _orig_sell5
+        assert _sell_calls, f"the adopted position was not sold at its stop: {_r6}"
+        print("[PASS] an adopted position is stopped out like any other")
+    finally:
+        _exl2.RealClient = _orig_rc3
+        _exl2._last_price = _orig_px3
+        globals()["_live_mode"] = _orig_live3
+        shutil.rmtree(_sandbox3, ignore_errors=True)
 
     # 5. perform_stop(): HOLDING -> market sell, then STOPPED
     import control as _control

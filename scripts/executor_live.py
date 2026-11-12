@@ -39,6 +39,7 @@ from typing import Any, Dict, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import live_api
+import config as _config
 from exit_strategy import (
     EXIT_HARD_SL,
     EXIT_TARGET,
@@ -877,6 +878,64 @@ def reconcile_order(state: dict, client=None) -> Dict[str, Any]:
             "reason": str(detail.get("status") or "not on the book")}
 
 
+def adopt_position(coin: str, amount: float, price: float, tick: float,
+                   hunt_id: str, framework: str, now: Optional[float] = None,
+                   source: str = "market_at_adoption") -> Dict[str, Any]:
+    """Build a position for coins the operator bought outside the bot.
+
+    The operator buys in the Indodax app; the bot must then WATCH those coins
+    rather than refuse to trade. To watch them it needs levels, and levels need
+    an entry price.
+
+    THE HONESTY PROBLEM: the bot never saw that fill, so it does not know the
+    real entry price. Whatever it uses is an estimate.
+
+    So it does not pretend. It records:
+
+        entry_price    the price at adoption
+        entry_source   "market_at_adoption" (or "operator" when supplied)
+        adopted        True
+        adopted_at     when
+
+    Every consumer can then tell an adopted position from a hunted one. P&L on
+    an adopted position is measured FROM THE ADOPTION PRICE, not from what the
+    operator actually paid, and the trade log must label it: a trade the bot did
+    not open cannot be scored as if it did.
+
+    Returns the position dict, or {"error": ...} if the inputs are unusable.
+    """
+    now = time.time() if now is None else now
+    try:
+        amount = float(amount)
+        price = float(price)
+    except (TypeError, ValueError):
+        return {"error": "amount and price must be numbers"}
+    if amount <= 0:
+        return {"error": "nothing to adopt"}
+    if price <= 0:
+        return {"error": "cannot adopt at a zero price"}
+
+    import run_hunter  # late import: run_hunter imports this module
+    fw = run_hunter.get_framework(framework)
+    levels = fw.initialize_exit(price, tick)
+
+    return {
+        "hunt_id": hunt_id,
+        "symbol": f"{coin.upper()}IDR",
+        "coins": amount,
+        "entry_price": price,
+        "entry_source": source,
+        "adopted": True,
+        "adopted_at": now,
+        "opened_at": now,
+        "framework": framework,
+        "manual": False,
+        "live": True,
+        "exit_levels": levels,
+        "cost_idr": round(amount * price, 2),
+    }
+
+
 def reconcile_position(state: dict, client=None,
                        pair_rows: Optional[list] = None) -> Dict[str, Any]:
     """Compare local state with the exchange and say what to do about it.
@@ -947,6 +1006,137 @@ def reconcile_position(state: dict, client=None,
     result["status"] = "RECOVER"
     result["foreign"] = sorted(significant.items(), key=lambda kv: -kv[1])
     return result
+
+
+def sync_with_exchange(state: dict, framework: str, tick: float,
+                       pair_rows: Optional[list] = None,
+                       client=None, now: Optional[float] = None) -> Dict[str, Any]:
+    """Make local state follow the exchange instead of blocking on it.
+
+    Requested behaviour: on every live scan, look at Indodax first.
+
+      coins held, no local position   -> ADOPT them and watch them
+      a resting order, no position    -> keep waiting for it to fill
+      neither                         -> flat, hunt normally
+
+    This replaces the old RECOVER halt. Halting was safe but useless: it told the
+    operator to fix something the bot could fix itself, and left coins with no
+    stop in the meantime. A position with levels is strictly safer than coins
+    with none.
+
+    WHAT COINS TO ADOPT WHEN SEVERAL ARE HELD
+
+    Only ONE position may be open at a time, so adopting all of them would
+    guarantee incoherence. The largest by IDR value is adopted and the rest are
+    reported as unmanaged. Adopting the largest is the defensible choice: it is
+    the one with the most money exposed and the most to lose without a stop.
+
+    Returns {"action": ..., "position": ..., ...} where action is one of
+    ADOPTED, ORDER_PENDING, FLAT, KEPT, UNMANAGED, UNREADABLE.
+    """
+    now = time.time() if now is None else now
+    rec = reconcile_position(state, client=client, pair_rows=pair_rows)
+    st = rec.get("status")
+
+    out = {"action": rec.get("status"), "reconcile": rec, "position": None,
+           "adopted": None, "orders": []}
+
+    if st == "UNKNOWN":
+        # Cannot see the account. Do NOT hunt: a blind buy could double a
+        # position we simply failed to read. Do NOT adopt either - we have
+        # nothing to adopt from.
+        return out
+
+    pos = state.get("position") or {}
+
+    if st in ("MATCH", "MISMATCH", "PHANTOM", "PHANTOM_DUST"):
+        # The bot already tracks something. Never adopt on top of it.
+        out["action"] = "KEPT"
+        return out
+
+    if st == "FLAT":
+        # Nothing on the exchange. If the bot thinks it holds something, the
+        # position is stale - but that is reconcile_position's business, and it
+        # only reports FLAT when there are no significant coins, which with a
+        # local position is PHANTOM. So FLAT here means genuinely flat.
+        out["action"] = "FLAT"
+        return out
+
+    # --- RECOVER: coins exist, the bot has no position ---------------------
+    significant = rec.get("exchange") or {}
+    vals = rec.get("valuations") or {}
+
+    if not significant:
+        out["action"] = "FLAT"
+        return out
+
+    if not bool(_config.get(_config.current(), "trading.adopt_foreign_holdings", True)):
+        # opting out: behave as before, report and let the caller halt
+        out["action"] = "RECOVER"
+        return out
+
+    # Prefer an order the bot is already waiting on: those coins are not
+    # orphans, they are the fill we are tracking.
+    try:
+        open_orders = client_open_orders(client)
+        out["orders"] = open_orders
+    except Exception:                                        # noqa: BLE001
+        open_orders = []
+
+    if open_orders:
+        out["action"] = "ORDER_PENDING"
+        return out
+
+    ranked = sorted(
+        significant.items(),
+        key=lambda kv: -float((vals.get(kv[0]) or {}).get("value_idr") or 0.0))
+    coin, amount = ranked[0]
+    value = float((vals.get(coin) or {}).get("value_idr") or 0.0)
+
+    price = None
+    try:
+        price = float((vals.get(coin) or {}).get("price") or 0.0) or None
+    except (TypeError, ValueError):
+        price = None
+
+    if not price:
+        out["action"] = "UNMANAGED"
+        out["reason"] = f"cannot price {coin}, so it cannot be adopted safely"
+        return out
+
+    hunt_id = f"H-ADOPT-{coin}"
+    adopted = adopt_position(coin, amount, price, tick, hunt_id, framework,
+                             now=now)
+    if adopted.get("error"):
+        out["action"] = "UNMANAGED"
+        out["reason"] = adopted["error"]
+        return out
+
+    out["action"] = "ADOPTED"
+    out["position"] = adopted
+    out["adopted"] = adopted
+    out["value_idr"] = value
+    out["unmanaged"] = {c: a for c, a in ranked[1:]}
+    return out
+
+
+def client_open_orders(client=None) -> list:
+    """Every resting order on the account, flattened, or [] if unreadable."""
+    client = client or RealClient()
+    try:
+        raw = client.open_orders()
+    except Exception:                                        # noqa: BLE001
+        return []
+    ret = (raw or {}).get("return") or {}
+    rows = ret.get("orders") or []
+    if isinstance(rows, dict):
+        flat = []
+        for pair, lst in rows.items():
+            for o in (lst or []):
+                if isinstance(o, dict):
+                    flat.append(dict(o, pair=pair))
+        return flat
+    return [o for o in rows if isinstance(o, dict)]
 
 
 def cancel_all_open_orders(client=None) -> Dict[str, Any]:
@@ -1496,6 +1686,82 @@ def _self_check():
                                    1000.0, client=_BadPair2())
     assert out32 == "UNRESOLVED", out32
     print("[PASS] invalid_pair is UNRESOLVED, so a real order is never dropped")
+
+    # --- 17. adopt holdings the bot did not buy ------------------------------
+    # Requested: on every live scan check Indodax. Holding coins -> track them.
+    # Resting order -> wait. Neither -> hunt.
+    _px = 1000.0
+    _orig_lp = _last_price
+    globals()["_last_price"] = lambda p, t=None: _px
+    try:
+        class _Manual(FakeExchange):
+            def __init__(self, coins, idr=50000.0):
+                super().__init__(idr=idr)
+                self.coins = coins
+
+        # a) manual buy, no local position  -> ADOPTED, with real levels
+        s17 = {"position": None, "tick": 1.0}
+        r17 = sync_with_exchange(s17, framework="C", tick=1.0,
+                                 client=_Manual({"hype": 20.0}))
+        assert r17["action"] == "ADOPTED", r17["action"]
+        p17 = r17["position"]
+        assert p17["adopted"] is True and p17["entry_source"] == "market_at_adoption"
+        assert p17["coins"] == 20.0 and p17["entry_price"] == _px
+        # C is +5% / -10%: levels must be built from the adoption price
+        assert p17["exit_levels"]["target_price"] == 1050.0, p17["exit_levels"]
+        assert p17["exit_levels"]["stop_trigger_price"] == 900.0, p17["exit_levels"]
+        assert p17["exit_levels"]["target_price"] > _px > p17["exit_levels"]["stop_trigger_price"]
+        print("[PASS] a manual buy is adopted and gets a real target and stop")
+
+        # b) dust stays dust -> not adopted, hunting continues
+        r18 = sync_with_exchange({"position": None, "tick": 1.0},
+                                 framework="C", tick=1.0,
+                                 client=_Manual({"shib": 0.75}))
+        assert r18["action"] == "FLAT", r18["action"]
+        print("[PASS] dust is not adopted, so it cannot block a hunt")
+
+        # c) nothing held -> hunt
+        r19 = sync_with_exchange({"position": None, "tick": 1.0},
+                                 framework="C", tick=1.0, client=_Manual({}))
+        assert r19["action"] == "FLAT", r19["action"]
+        print("[PASS] an empty account hunts normally")
+
+        # d) a resting order at the exchange -> wait, do not adopt, do not hunt
+        class _WithOrder(_Manual):
+            def open_orders(self, pair=None):
+                return {"success": 1, "return": {"orders": {"hype_idr": [
+                    {"order_id": "1", "type": "buy", "status": "open"}]}}}
+
+        r20 = sync_with_exchange({"position": None, "tick": 1.0},
+                                 framework="C", tick=1.0,
+                                 client=_WithOrder({"hype": 20.0}))
+        assert r20["action"] == "ORDER_PENDING", r20["action"]
+        assert r20["position"] is None
+        print("[PASS] a resting order is watched, not adopted over")
+
+        # e) never adopt on top of a position the bot already tracks
+        r21 = sync_with_exchange(
+            {"position": {"symbol": "HYPEIDR", "coins": 20.0}, "tick": 1.0},
+            framework="C", tick=1.0, client=_Manual({"hype": 20.0}))
+        assert r21["action"] == "KEPT", r21["action"]
+        print("[PASS] an existing position is kept, never re-adopted")
+
+        # f) the largest holding is adopted, the rest reported as unmanaged
+        r22 = sync_with_exchange({"position": None, "tick": 1.0},
+                                 framework="C", tick=1.0,
+                                 client=_Manual({"hype": 5.0, "btc": 100.0}))
+        assert r22["action"] == "ADOPTED", r22["action"]
+        assert r22["position"]["symbol"] == "BTCIDR", r22["position"]["symbol"]
+        assert r22["unmanaged"] == {"HYPE": 5.0}, r22.get("unmanaged")
+        print("[PASS] the largest holding is adopted, the rest reported")
+
+        # g) paper mode must never reach this path
+        assert "sync_with_exchange" not in open(
+            os.path.join(os.path.dirname(__file__), "run_hunter.py")).read().split(
+            'if ctrl.get("exec") == "LIVE":')[0]
+        print("[PASS] adoption is unreachable in paper mode")
+    finally:
+        globals()["_last_price"] = _orig_lp
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 
