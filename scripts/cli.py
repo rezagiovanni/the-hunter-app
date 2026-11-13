@@ -551,6 +551,12 @@ def cmd_setup(args):
     return onboarding.run(force=getattr(args, "force", False))
 
 
+def cmd_signout(args):
+    """Disconnect API credentials and sign out. Trade history is saved to account profile."""
+    import lifecycle
+    return lifecycle.cmd_signout(assume_yes=getattr(args, "yes", False), as_json=getattr(args, "json", False))
+
+
 def cmd_doctor(args):
     """Diagnose the install and name any specific fault."""
     import doctor
@@ -779,6 +785,7 @@ COMMANDS = {
     "start": (cmd_start, "start hunting (enables the scanning job)"),
     "stop": (cmd_stop, "stop hunting (market-sells an open position first)"),
     "setup": (cmd_setup, "enter or replace your Indodax API key"),
+    "signout": (cmd_signout, "sign out and disconnect API keys; trade history is kept"),
     "doctor": (cmd_doctor, "diagnose the install and name any fault"),
     "upgrade": (cmd_upgrade, "replace the app code; data and settings are kept"),
     "uninstall": (cmd_uninstall, "remove the program; trade history is kept"),
@@ -818,6 +825,9 @@ def build_parser():
         if name == "setup":
             sp.add_argument("--force", action="store_true",
                             help="replace credentials that are already saved")
+        if name == "signout":
+            sp.add_argument("-y", "--yes", action="store_true",
+                            help="do not prompt for confirmation")
         if name == "dashboard":
             dsub = sp.add_subparsers(dest="action", metavar="<action>")
             dsub.add_parser("status", help="is it installed, running, and why not?")

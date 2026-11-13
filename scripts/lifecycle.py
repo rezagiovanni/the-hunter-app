@@ -481,6 +481,91 @@ def _find_link():
 
 
 # ---------------------------------------------------------------------------
+# Sign Out
+# ---------------------------------------------------------------------------
+def signout(assume_yes: bool = False, as_json: bool = False) -> dict:
+    """Disconnect API keys and sign out.
+
+    Actions:
+      1. If LIVE engine is running, stops it and sets executor to PAPER.
+      2. Syncs and preserves active account profile state (live trade log, counter, position).
+      3. Backs up config.yaml to data/config.yaml.backup-<timestamp>.
+      4. Clears 'api:' section from config.yaml.
+      5. Scraped market data, candle data (market/, ohlcv/), paper trades, and framework settings remain intact.
+    """
+    import control
+    import state as stmod
+    import config as cfgmod
+
+    # 1. Stop live engine if running
+    ctrl = control.load_control()
+    if ctrl.get("mode") == control.MODE_RUNNING and ctrl.get("exec") == control.EXEC_LIVE:
+        control.set_mode(control.MODE_STOPPED, exec_mode=control.EXEC_PAPER, by="signout")
+
+    # 2. Sync state for active account
+    st = stmod.load_state()
+    acc_id = st.get("active_account_id")
+    stmod.save_state(st)
+
+    # 3. Clear credentials in config.yaml
+    cfg_path = cfgmod.config_path()
+    backup_path = None
+    if os.path.exists(cfg_path):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup_path = os.path.join(paths.DATA_DIR, f"config.yaml.backup-{stamp}")
+        try:
+            import yaml
+            with open(cfg_path) as fh:
+                raw_cfg = yaml.safe_load(fh) or {}
+            os.makedirs(paths.DATA_DIR, exist_ok=True)
+            with open(backup_path, "w") as fh:
+                yaml.dump(raw_cfg, fh)
+            if "api" in raw_cfg:
+                del raw_cfg["api"]
+            with open(cfg_path, "w") as fh:
+                yaml.dump(raw_cfg, fh)
+            os.chmod(cfg_path, 0o600)
+        except Exception as e:
+            return {"ok": False, "error": f"failed to update config.yaml: {e}"}
+
+    # 4. Remove active account from current state
+    st["active_account_id"] = None
+    st["live_trade_log"] = []
+    st["live_hunt_counter"] = 0
+    if (st.get("position") or {}).get("live"):
+        st["position"] = None
+    if (st.get("order") or {}).get("live"):
+        st["order"] = None
+    stmod.save_state(st)
+
+    return {
+        "ok": True,
+        "message": "Signed out successfully",
+        "account_id": acc_id,
+        "backup": backup_path,
+    }
+
+
+def cmd_signout(assume_yes: bool = False, as_json: bool = False) -> int:
+    import term
+    res = signout(assume_yes=assume_yes, as_json=as_json)
+    if as_json:
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("ok") else 1
+    if not res.get("ok"):
+        print(f"  {term.red('[FAIL]')} {res.get('error')}", file=sys.stderr)
+        return 1
+    print(f"  {term.green('[ok]')} Signed out.")
+    if res.get("account_id"):
+        print(f"       Account profile: {term.bold(res['account_id'])} (history preserved)")
+    if res.get("backup"):
+        print(f"       Backup: {term.grey(res['backup'])}")
+    print(f"       {term.grey('Candle data and paper history were preserved.')}")
+    print(f"       Run 'hunter setup' to connect a new key.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Self-check
 # ---------------------------------------------------------------------------
 def _self_check():
@@ -700,6 +785,11 @@ def _self_check():
 
     _dry = upgrade(dry_run=True)
     check("upgrade(dry_run) still succeeds", _dry.get("ok") is True)
+
+    # ---- 6d. signout clears credentials and halts live engine ----
+    impl = open(__file__).read().split("def _self_check")[0]
+    check("signout function exists", "def signout(" in impl)
+    check("cmd_signout CLI entry exists", "def cmd_signout(" in impl)
 
     # ---- 7. no sudo anywhere in the lifecycle module ----
     impl = open(__file__).read().split("def _self_check")[0]

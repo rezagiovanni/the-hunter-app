@@ -1064,6 +1064,62 @@ def _trading_log_section(state: dict) -> str:
     """
 
 
+def _account_panel() -> str:
+    """Render the Account Connection / Sign Out panel in Settings."""
+    import onboarding
+    import live_api
+    has_creds = onboarding.has_credentials()
+    acc_id = None
+    masked = ""
+    ver = "v2"
+    if has_creds:
+        try:
+            key, secret = live_api.load_credentials()
+            acc_id = live_api.account_id(key)
+            masked = onboarding.mask(key)
+            ver = live_api.detect_key_version(key, secret)
+        except Exception:
+            has_creds = False
+
+    if has_creds:
+        return f"""
+<div class="panel" id="accountPanel">
+  <h2>Account &amp; API Connection</h2>
+  <div class="su-banner ok">
+    Connected to Indodax <b>{ver.upper()}</b> · Profile: <b>{acc_id}</b> · Key: <code>{masked}</code>
+  </div>
+  <p style="font-size: 0.85em; color: var(--text-secondary); margin: 8px 0 14px 0;">
+    Your live trade history and active positions are safely stored under this account profile.
+    Signing out saves this profile and allows connecting a different API key without losing any history or candle data.
+  </p>
+  <button class="su-btn" style="background:#ef4444; border-color:#ef4444; color:#fff;" onclick="signOutAccount(this)">SIGN OUT</button>
+</div>
+"""
+    else:
+        return f"""
+<div class="panel" id="accountPanel">
+  <h2>Account &amp; API Connection</h2>
+  <div class="su-banner warn">
+    Not connected — enter your Indodax API Key and Secret (v2 or v1).
+  </div>
+  <p style="font-size: 0.85em; color: var(--text-secondary); margin: 8px 0 14px 0;">
+    Connecting an API key loads its dedicated trade history profile. Scraped candle data is shared and never deleted.
+  </p>
+  <div style="display:flex; flex-direction:column; gap:10px; max-width:480px; margin-bottom:14px;">
+    <div>
+      <label style="font-size:0.75em; color:var(--text-secondary); text-transform:uppercase;">API Key</label>
+      <input type="text" id="inputApiKey" placeholder="Paste Indodax API Key" style="width:100%; height:38px; background:var(--bg-primary); color:var(--text-primary); border:1px solid var(--border); border-radius:4px; padding:0 8px; font-family:inherit;">
+    </div>
+    <div>
+      <label style="font-size:0.75em; color:var(--text-secondary); text-transform:uppercase;">API Secret</label>
+      <input type="password" id="inputApiSecret" placeholder="Paste Indodax API Secret" style="width:100%; height:38px; background:var(--bg-primary); color:var(--text-primary); border:1px solid var(--border); border-radius:4px; padding:0 8px; font-family:inherit;">
+    </div>
+  </div>
+  <button class="su-btn" onclick="signInAccount(this)">CONNECT &amp; SIGN IN</button>
+</div>
+"""
+
+
 def _settings_panel() -> str:
     """SETTINGS panel: run first-time setup actions from the web UI.
 
@@ -1138,9 +1194,12 @@ def _settings_panel() -> str:
         lock = (f"<div class='su-dim'>One heavy job at a time: "
                 f"<b>{S.ACTIONS[busy]['label']}</b> is running.</div>")
 
+    account_html = _account_panel()
     cron_html = _cron_switches_html()
 
     return f"""
+{account_html}
+
 <div class="panel" id="settingsPanel">
   <h2>Settings — First-Time Setup</h2>
   {banner}
@@ -3962,6 +4021,61 @@ PAGE_JS = """
             });
     }
 
+    function signOutAccount(btn) {
+        var msg = 'Sign out from this Indodax account?' + String.fromCharCode(10, 10);
+        msg += 'Your live trade history and position for this account will be preserved in its profile.' + String.fromCharCode(10);
+        msg += 'You can reconnect it anytime to resume viewing and trading.';
+        if (!confirm(msg)) return;
+        if (btn) { btn.disabled = true; btn.textContent = 'SIGNING OUT...'; }
+        fetch('/api/account/signout', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d.ok) {
+                    showToast('Signed out. Account profile saved.');
+                    setTimeout(function () { location.reload(); }, 1000);
+                } else {
+                    showToast('Sign out failed: ' + (d.error || 'unknown'));
+                    if (btn) { btn.disabled = false; btn.textContent = 'SIGN OUT'; }
+                }
+            })
+            .catch(function (e) {
+                showToast('Sign out failed: ' + e);
+                if (btn) { btn.disabled = false; btn.textContent = 'SIGN OUT'; }
+            });
+    }
+
+    function signInAccount(btn) {
+        var keyInput = document.getElementById('inputApiKey');
+        var secretInput = document.getElementById('inputApiSecret');
+        var key = keyInput ? keyInput.value.trim() : '';
+        var secret = secretInput ? secretInput.value.trim() : '';
+        if (!key || !secret) {
+            alert('Please enter both your API Key and Secret.');
+            return;
+        }
+        if (btn) { btn.disabled = true; btn.textContent = 'CONNECTING...'; }
+        fetch('/api/account/signin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: key, secret: secret })
+        })
+            .then(function (r) { return r.json().then(function (d) { return { status: r.status, d: d }; }); })
+            .then(function (res) {
+                var d = res.d || {};
+                if (res.status === 200 && d.ok) {
+                    showToast('Connected (' + (d.version || 'v2').toUpperCase() + ')! Profile: ' + (d.account_id || ''));
+                    setTimeout(function () { location.reload(); }, 1200);
+                } else {
+                    showToast('Connection failed: ' + (d.error || 'Check key and secret'));
+                    if (btn) { btn.disabled = false; btn.textContent = 'CONNECT & SIGN IN'; }
+                }
+            })
+            .catch(function (e) {
+                showToast('Connection failed: ' + e);
+                if (btn) { btn.disabled = false; btn.textContent = 'CONNECT & SIGN IN'; }
+            });
+    }
+
     function sellNow(symbol, btn) {
         var msg = 'Market sell ' + symbol + ' now?';
         msg += String.fromCharCode(10, 10);
@@ -4646,6 +4760,65 @@ async def api_position_buy(request: Request):
     if not result.get("ok"):
         return JSONResponse(result, status_code=400)
     return result
+
+
+@app.get("/api/account/status")
+async def api_account_status():
+    """Current connection status, masked key, and account profile ID."""
+    import onboarding
+    import live_api
+    has_creds = onboarding.has_credentials()
+    if not has_creds:
+        return {"signed_in": False, "account_id": None, "masked_key": "", "version": None}
+    try:
+        k, s = live_api.load_credentials()
+        acc_id = live_api.account_id(k)
+        masked = onboarding.mask(k)
+        ver = live_api.detect_key_version(k, s)
+        return {"signed_in": True, "account_id": acc_id, "masked_key": masked, "version": ver}
+    except Exception as e:
+        return {"signed_in": False, "account_id": None, "masked_key": "", "error": str(e)}
+
+
+@app.post("/api/account/signout")
+async def api_account_signout():
+    """Disconnect API credentials and preserve account trade profile."""
+    import lifecycle
+    res = lifecycle.signout()
+    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+
+
+@app.post("/api/account/signin")
+async def api_account_signin(req: Request):
+    """Connect new or replacement Indodax API credentials."""
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    key = str(body.get("key") or "").strip()
+    secret = str(body.get("secret") or "").strip()
+    if not key or not secret:
+        return JSONResponse({"ok": False, "error": "Both API Key and Secret are required."}, status_code=400)
+
+    import onboarding
+    ok, msg, info = onboarding.validate_key(key, secret)
+    if not ok:
+        return JSONResponse({"ok": False, "error": msg}, status_code=400)
+
+    try:
+        onboarding.write_config(key, secret)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"Failed to save credentials: {exc}"}, status_code=500)
+
+    import live_api
+    acc_id = live_api.account_id(key)
+    # Reload state to activate new account profile
+    import state as _state
+    st = _state.load_state()
+    _state.save_state(st)
+
+    ver = (info or {}).get("version", "v2")
+    return {"ok": True, "account_id": acc_id, "version": ver, "balances": (info or {}).get("balances", {})}
 
 
 @app.post("/api/trades/clear")

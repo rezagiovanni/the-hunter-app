@@ -112,6 +112,46 @@ def validate_key(api_key, secret):
     if not secret or len(secret) < 10:
         return False, "that secret looks too short", None
 
+    # 1. Try v2 first
+    now_ms = int(time.time() * 1000)
+    p = {"timestamp": str(now_ms), "recvWindow": "5000"}
+    encoded = urllib.parse.urlencode(p)
+    sig = hmac.new(secret.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256).hexdigest()
+    req = urllib.request.Request(f"https://api.indodax.com/api/v2/account?{encoded}", method="GET")
+    req.add_header("Accept", "application/json")
+    req.add_header("X-APIKEY", api_key)
+    req.add_header("Sign", sig)
+    req.add_header("User-Agent", "the-hunter/0.1")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            info = {
+                "version": "v2",
+                "canTrade": data.get("canTrade", True),
+                "balances": {},
+                "server_time": int(time.time()),
+            }
+            for b in data.get("balances", []):
+                try:
+                    amt = float(b.get("free") or 0)
+                    if amt > 0:
+                        info["balances"][b["asset"].lower()] = amt
+                except (ValueError, TypeError):
+                    continue
+            return True, "accepted", info
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace") if hasattr(exc, "read") else ""
+        if "-2015" not in raw and "Invalid TAPI version key" not in raw:
+            try:
+                err_json = json.loads(raw)
+                err_msg = err_json.get("msg") or err_json.get("error") or raw
+            except Exception:
+                err_msg = raw[:140]
+            return False, f"HTTP {exc.code}: {err_msg}", None
+    except Exception:
+        pass
+
+    # 2. Fallback to v1 (classic TAPI)
     ok, payload = _post_tapi(api_key, secret, "getInfo")
     if not ok:
         return False, str(payload), None
@@ -120,6 +160,7 @@ def validate_key(api_key, secret):
         return True, "accepted", {}
 
     info = {
+        "version": "v1",
         "balances": {},
         "server_time": payload.get("server_time"),
     }

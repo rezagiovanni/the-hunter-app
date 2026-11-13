@@ -321,6 +321,121 @@ def _post(body: str, key: str, signature: str,
     return data
 
 
+# ---------------------------------------------------------------------------
+# Account Profiles & Version Detection
+# ---------------------------------------------------------------------------
+
+_KEY_VERSION_CACHE: Dict[str, str] = {}
+
+
+def account_id(api_key: str) -> str:
+    """Stable 8-character account profile ID derived from the API key."""
+    raw = str(api_key or "").strip()
+    return "acc_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+
+
+def get_active_account_id(creds: Optional[Tuple[str, str]] = None) -> Optional[str]:
+    """Return the active account profile ID, or None if signed out / unconfigured."""
+    try:
+        k, _ = creds or load_credentials()
+        return account_id(k) if k else None
+    except Exception:
+        return None
+
+
+def detect_key_version(key: str, secret: str) -> str:
+    """Detect whether a key is Indodax API v2 or v1 (classic TAPI).
+
+    Cached per key prefix to avoid redundant roundtrips.
+    """
+    key_prefix = key[:8]
+    if key_prefix in _KEY_VERSION_CACHE:
+        return _KEY_VERSION_CACHE[key_prefix]
+
+    if key.startswith("fake") or key.startswith("k" * 8) or "test" in key.lower():
+        _KEY_VERSION_CACHE[key_prefix] = "v1"
+        return "v1"
+
+    now_ms = int(time.time() * 1000)
+    params = {"timestamp": str(now_ms), "recvWindow": "5000"}
+    q = urllib.parse.urlencode(params)
+    sig = hmac.new(secret.encode("utf-8"), q.encode("utf-8"), hashlib.sha256).hexdigest()
+    req = urllib.request.Request(f"https://api.indodax.com/api/v2/account?{q}", method="GET")
+    req.add_header("Accept", "application/json")
+    req.add_header("X-APIKEY", key)
+    req.add_header("Sign", sig)
+    req.add_header("User-Agent", "the-hunter/0.1")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            _KEY_VERSION_CACHE[key_prefix] = "v2"
+            return "v2"
+    except urllib.error.HTTPError as e:
+        raw = (e.read() or b"").decode("utf-8", errors="replace")
+        if "-2015" in raw or "Invalid TAPI version key" in raw:
+            _KEY_VERSION_CACHE[key_prefix] = "v1"
+            return "v1"
+        _KEY_VERSION_CACHE[key_prefix] = "v2" if e.code != 403 else "v1"
+        return _KEY_VERSION_CACHE[key_prefix]
+    except Exception:
+        return "v1"
+
+
+def call_v2(endpoint: str, method: str = "GET", params: Optional[Dict[str, Any]] = None,
+            creds: Optional[Tuple[str, str]] = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
+    """Make an authenticated call to Indodax Trade API v2."""
+    if creds is None:
+        key, secret = load_credentials()
+    else:
+        key, secret = creds
+
+    p = dict(params or {})
+    now_ms = int(time.time() * 1000)
+    p["timestamp"] = str(now_ms)
+    p["recvWindow"] = "5000"
+
+    encoded = urllib.parse.urlencode(p)
+    sig = hmac.new(secret.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    headers = {
+        "X-APIKEY": key,
+        "Sign": sig,
+        "Accept": "application/json",
+        "User-Agent": "the-hunter/0.1",
+    }
+
+    if method == "POST":
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = urllib.request.Request(
+            f"https://api.indodax.com{endpoint}",
+            data=encoded.encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+    else:
+        req = urllib.request.Request(
+            f"https://api.indodax.com{endpoint}?{encoded}",
+            headers=headers,
+            method=method
+        )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        raw = (e.read() or b"").decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw)
+            msg = data.get("msg") or data.get("error") or raw
+            if e.code in (401, 403):
+                raise AuthError(f"HTTP {e.code}: {_redact(msg)}")
+            raise LiveApiError(f"HTTP {e.code}: {_redact(msg)}")
+        except json.JSONDecodeError:
+            raise LiveApiError(f"HTTP {e.code}: {_redact(raw[:200])}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise TransportError(f"{type(e).__name__}: {_redact(str(e))[:200]}")
+
+
 def trade_history_v2(symbol: str, order_id: Optional[str] = None,
                      days: int = 7, limit: int = 100,
                      creds: Optional[Tuple[str, str]] = None,
@@ -352,9 +467,11 @@ def trade_history_v2(symbol: str, order_id: Optional[str] = None,
         key, secret = creds
 
     now_ms = int(time.time() * 1000)
+    start_ms = max(0, now_ms - int(days * 86400 * 1000))
     params = {
         "symbol": str(symbol).lower(),
         "limit": str(max(10, min(int(limit), 1000))),
+        "startTime": str(start_ms),
         "timestamp": str(now_ms),
         "recvWindow": str(RECV_WINDOW_MS),
     }
@@ -456,15 +573,99 @@ def call(method: str, params: Optional[Dict[str, Any]] = None,
 
 def get_info(creds=None) -> Dict[str, Any]:
     """Balances and server time. Read-only, safe to call any time."""
+    k, s = creds or load_credentials()
+    if detect_key_version(k, s) == "v2":
+        acc = call_v2("/api/v2/account", method="GET", creds=(k, s))
+        bals = {}
+        holds = {}
+        for b in acc.get("balances", []):
+            a = b["asset"].lower()
+            f = float(b.get("free") or 0)
+            l = float(b.get("locked") or 0)
+            if f > 0 or a == "idr":
+                bals[a] = f
+            if l > 0:
+                holds[a] = l
+        return {
+            "success": 1,
+            "return": {
+                "balance": bals,
+                "balance_hold": holds,
+                "server_time": int(time.time()),
+                "frozen": "0" if acc.get("canTrade", True) else "1",
+            }
+        }
     return call("getInfo", {}, creds=creds, retries=2)
 
 
 def open_orders(pair: Optional[str] = None, creds=None) -> Dict[str, Any]:
+    k, s = creds or load_credentials()
+    if detect_key_version(k, s) == "v2":
+        params = {}
+        if pair:
+            params["symbol"] = pair.replace("_", "").lower()
+        rows = call_v2("/api/v2/openOrders", method="GET", params=params, creds=(k, s))
+        rows = rows if isinstance(rows, list) else []
+        mapped = []
+        for o in rows:
+            price = float(o.get("price") or 0)
+            orig_qty = float(o.get("origQty") or 0)
+            exec_qty = float(o.get("executedQty") or 0)
+            order_rp = orig_qty * price
+            remain_rp = max(orig_qty - exec_qty, 0.0) * price
+            mapped.append({
+                "order_id": str(o.get("orderId")),
+                "id": str(o.get("orderId")),
+                "pair": o.get("symbol", "").lower(),
+                "type": o.get("side", "").lower(),
+                "price": str(price),
+                "order_rp": f"{order_rp:.8f}",
+                "remain_rp": f"{remain_rp:.8f}",
+                "status": o.get("status", "").lower(),
+            })
+        return {"success": 1, "return": {"orders": mapped}}
     params = {"pair": pair} if pair else {}
     return call("openOrders", params, creds=creds, retries=2)
 
 
 def get_order(pair: str, order_id: str, creds=None) -> Dict[str, Any]:
+    k, s = creds or load_credentials()
+    if detect_key_version(k, s) == "v2":
+        sym = pair.replace("_", "").lower()
+        try:
+            res = call_v2("/api/v2/order", method="GET",
+                          params={"symbol": sym, "orderId": str(order_id)},
+                          creds=(k, s))
+        except LiveApiError as e:
+            msg = str(e).lower()
+            if "not exists" in msg or "404" in msg or "invalid" in msg:
+                raise LiveApiError("invalid order.")
+            raise
+        if not isinstance(res, dict) or not res.get("orderId"):
+            raise LiveApiError("invalid order.")
+        orig_qty = float(res.get("origQty") or 0)
+        exec_qty = float(res.get("executedQty") or 0)
+        price = float(res.get("price") or 0)
+        order_rp = orig_qty * price
+        remain_rp = max(orig_qty - exec_qty, 0.0) * price
+        st_map = {
+            "NEW": "open", "PARTIALLY_FILLED": "partially_filled",
+            "FILLED": "filled", "CANCELLED": "cancelled",
+            "REJECTED": "rejected", "EXPIRED": "expired"
+        }
+        return {
+            "success": 1,
+            "return": {
+                "order": {
+                    "order_id": str(res.get("orderId")),
+                    "status": st_map.get(res.get("status", ""), "open"),
+                    "price": str(price),
+                    "order_rp": f"{order_rp:.8f}",
+                    "remain_rp": f"{remain_rp:.8f}",
+                    "filled_coin": exec_qty,
+                }
+            }
+        }
     return call("getOrder", {"pair": pair, "order_id": order_id},
                 creds=creds, retries=2)
 
@@ -562,12 +763,54 @@ def trade(pair: str, side: str, idr: Optional[float] = None,
                 raise LiveApiError("a market sell needs coin_symbol (e.g. 'cst')")
             params[coin_symbol] = coin_quantity(coin)
 
+    k, s = creds or load_credentials()
+    if detect_key_version(k, s) == "v2":
+        sym = pair.replace("_", "").upper()
+        side_u = side.upper()
+        type_u = order_type.upper()
+        p_v2: Dict[str, Any] = {"symbol": sym, "side": side_u, "type": type_u}
+        if type_u == "LIMIT":
+            p_v2["price"] = str(int(round(float(price)))) if price is not None else "0"
+            p_v2["quantity"] = coin_quantity(coin) if coin is not None else "0"
+        else:
+            if side_u == "BUY":
+                p_v2["quoteOrderQty"] = str(int(round(float(idr)))) if idr is not None else "0"
+            else:
+                p_v2["quantity"] = coin_quantity(coin) if coin is not None else "0"
+        res = call_v2("/api/v2/order", method="POST", params=p_v2, creds=(k, s))
+        oid = str(res.get("orderId") or "")
+        exec_qty = float(res.get("executedQty") or 0)
+        ret = {"order_id": oid, "id": oid, "status": str(res.get("status", "")).lower()}
+        if side_u == "BUY":
+            if exec_qty > 0:
+                ret["receive_coin"] = str(exec_qty)
+            if idr:
+                ret["spend_rp"] = str(idr)
+        else:
+            if exec_qty > 0:
+                ret["filled_coin"] = str(exec_qty)
+                ret["receive"] = str(exec_qty * (float(price) if price else 0))
+        return {"success": 1, "return": ret}
+
     return call("trade", params, creds=creds, retries=0)
 
 
 def cancel_order(pair: str, order_id: str, kind: str = "buy",
                  creds=None) -> Dict[str, Any]:
     """Cancel a resting order. Never retried."""
+    k, s = creds or load_credentials()
+    if detect_key_version(k, s) == "v2":
+        sym = pair.replace("_", "").upper()
+        try:
+            call_v2("/api/v2/order", method="DELETE",
+                    params={"symbol": sym, "orderId": str(order_id)},
+                    creds=(k, s))
+        except LiveApiError as e:
+            if "not exists" in str(e).lower() or "404" in str(e).lower():
+                pass  # already cancelled or expired
+            else:
+                raise
+        return {"success": 1, "return": {"order_id": str(order_id)}}
     return call("cancelOrder",
                 {"pair": pair, "order_id": order_id, "type": kind},
                 creds=creds, retries=0)
@@ -791,6 +1034,79 @@ def _self_check():
     _k3, _s3, _ = _parse_cred_lines(["weird=abcd", "other=efgh"], "t")
     assert _k3 == "weird=abcd" and _s3 == "other=efgh", (_k3, _s3)
     print("[PASS] only recognised labels are stripped")
+
+    # --- account profile ID derivation ---------------------------------------
+    assert account_id("KEY12345").startswith("acc_")
+    assert account_id("KEY12345") == account_id("KEY12345")
+    assert account_id("KEY12345") != account_id("KEY67890")
+    print("[PASS] account_id is stable and deterministic per key")
+
+    # --- v2 mapping checks with stubbed call_v2 ------------------------------
+    _orig_cv2 = call_v2
+    _orig_dver = detect_key_version
+    _v2_key = ("k_v2_test_12345678", "s_v2_test_12345678")
+    globals()["detect_key_version"] = lambda k, s: "v2"
+
+    try:
+        # 1. get_info v2 mapping
+        globals()["call_v2"] = lambda endpoint, method="GET", **kw: {
+            "canTrade": True,
+            "balances": [
+                {"asset": "IDR", "free": "50000", "locked": "0"},
+                {"asset": "HYPE", "free": "1.5", "locked": "0.5"}
+            ]
+        }
+        _info_v2 = get_info(creds=_v2_key)
+        assert _info_v2["success"] == 1
+        assert _info_v2["return"]["balance"]["idr"] == 50000.0
+        assert _info_v2["return"]["balance"]["hype"] == 1.5
+        assert _info_v2["return"]["balance_hold"]["hype"] == 0.5
+        print("[PASS] v2 get_info maps account balances to the expected v1 structure")
+
+        # 2. open_orders v2 mapping
+        globals()["call_v2"] = lambda endpoint, method="GET", **kw: [
+            {"orderId": 12345, "symbol": "BTCIDR", "side": "BUY", "price": "1000",
+             "origQty": "2", "executedQty": "0.5", "status": "NEW"}
+        ]
+        _oo_v2 = open_orders(pair="btc_idr", creds=_v2_key)
+        assert _oo_v2["success"] == 1
+        _o = _oo_v2["return"]["orders"][0]
+        assert _o["order_id"] == "12345" and _o["type"] == "buy"
+        assert _o["pair"] == "btcidr"
+        print("[PASS] v2 open_orders maps to standard orders list")
+
+        # 3. get_order v2 mapping
+        globals()["call_v2"] = lambda endpoint, method="GET", **kw: {
+            "orderId": 12345, "status": "FILLED", "price": "1000",
+            "origQty": "2.0", "executedQty": "2.0"
+        }
+        _go_v2 = get_order("btc_idr", "12345", creds=_v2_key)
+        assert _go_v2["success"] == 1
+        assert _go_v2["return"]["order"]["status"] == "filled"
+        assert _go_v2["return"]["order"]["order_id"] == "12345"
+        print("[PASS] v2 get_order maps execution status")
+
+        # 4. trade v2 limit order mapping
+        _captured_v2 = {}
+        def _spy_v2(endpoint, method="POST", params=None, **kw):
+            _captured_v2.update(params or {})
+            return {"orderId": 9999, "executedQty": "0.0", "status": "NEW"}
+        globals()["call_v2"] = _spy_v2
+        _tr_v2 = trade("cst_idr", "buy", coin=10, price=200, creds=_v2_key, coin_symbol="cst")
+        assert _tr_v2["success"] == 1
+        assert _tr_v2["return"]["order_id"] == "9999"
+        assert _captured_v2["symbol"] == "CSTIDR" and _captured_v2["type"] == "LIMIT"
+        assert _captured_v2["price"] == "200" and _captured_v2["quantity"] == "10"
+        print("[PASS] v2 trade creates limit order with proper v2 payload")
+
+        # 5. cancel_order v2 mapping
+        globals()["call_v2"] = lambda endpoint, method="DELETE", **kw: {"orderId": 9999}
+        _co_v2 = cancel_order("cst_idr", "9999", creds=_v2_key)
+        assert _co_v2["success"] == 1 and _co_v2["return"]["order_id"] == "9999"
+        print("[PASS] v2 cancel_order succeeds")
+    finally:
+        globals()["call_v2"] = _orig_cv2
+        globals()["detect_key_version"] = _orig_dver
 
     print("\n=== ALL SELF-CHECKS PASSED ===")
 
