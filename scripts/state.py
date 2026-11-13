@@ -54,8 +54,12 @@ def _default_state() -> dict:
         "live_trade_log": [],        # completed LIVE trades (empty until live executor)
         "hunt_counter": 0,           # monotonic hunt id counter (H-0001, ...)
         "live_hunt_counter": 0,      # live hunt counter (L-00001, ...)
-        "accounts": {},              # account_id -> {live_trade_log, live_hunt_counter, position, order}
+        "accounts": {},              # account_id -> profile dict (paper + live isolated)
     }
+
+
+PAPER_ISOLATED_FIELDS = ("trade_log", "hunt_counter")
+LIVE_ISOLATED_FIELDS = ("live_trade_log", "live_hunt_counter", "position", "order")
 
 
 def active_account_id() -> Optional[str]:
@@ -105,10 +109,10 @@ def load_state() -> dict:
     Crash rule: never raise on a bad file — always return a usable state.
 
     ACCOUNT ISOLATION:
-    Live trade logs and live positions are scoped per active account ID.
+    Live AND paper trade logs are scoped per active account ID.
     Switching from key1 to key2 loads key2's own trade log. Switching back
     to key1 restores key1's trades and position.
-    Paper trades, candle data, and framework configs remain shared and global.
+    Candle data and framework configs remain shared and global.
     """
     if not os.path.exists(STATE_FILE):
         state = _default_state()
@@ -126,18 +130,30 @@ def load_state() -> dict:
     if acc_id:
         accounts = state.setdefault("accounts", {})
         if acc_id not in accounts:
-            existing_log = state.get("live_trade_log") or []
-            existing_cnt = state.get("live_hunt_counter") or 0
+            # First migration: seed the new account profile from the global keys
+            # that used to hold everything, but only for the first account seen.
+            is_first = len(accounts) == 0
+            seed_live_log = state.get("live_trade_log") or []
+            seed_live_cnt = state.get("live_hunt_counter") or 0
+            seed_paper_log = state.get("trade_log") or []
+            seed_paper_cnt = state.get("hunt_counter") or 0
             accounts[acc_id] = {
                 "account_id": acc_id,
-                "live_trade_log": existing_log if len(accounts) == 0 else [],
-                "live_hunt_counter": existing_cnt if len(accounts) == 0 else 0,
+                "live_trade_log": seed_live_log if is_first else [],
+                "live_hunt_counter": seed_live_cnt if is_first else 0,
+                "paper_trade_log": seed_paper_log if is_first else [],
+                "hunt_counter": seed_paper_cnt if is_first else 0,
                 "position": state.get("position") if (state.get("position") or {}).get("live") else None,
                 "order": state.get("order") if (state.get("order") or {}).get("live") else None,
             }
         acc_data = accounts[acc_id]
+        # Live fields
         state["live_trade_log"] = list(acc_data.get("live_trade_log") or [])
         state["live_hunt_counter"] = int(acc_data.get("live_hunt_counter") or 0)
+        # Paper fields
+        state["trade_log"] = list(acc_data.get("paper_trade_log") or [])
+        state["hunt_counter"] = int(acc_data.get("hunt_counter") or 0)
+        # Position/order (live only, shared phase/balance remain global)
         if acc_data.get("position"):
             state["position"] = acc_data["position"]
         elif (state.get("position") or {}).get("live"):
@@ -147,8 +163,11 @@ def load_state() -> dict:
         elif (state.get("order") or {}).get("live"):
             state["order"] = None
     elif state.get("accounts"):
+        # Signed out: blank all account-scoped data
         state["live_trade_log"] = []
         state["live_hunt_counter"] = 0
+        state["trade_log"] = []
+        state["hunt_counter"] = 0
         if (state.get("position") or {}).get("live"):
             state["position"] = None
         if (state.get("order") or {}).get("live"):
@@ -166,8 +185,12 @@ def save_state(state: dict) -> None:
     if acc_id:
         acc_data = state.setdefault("accounts", {}).setdefault(acc_id, {})
         acc_data["account_id"] = acc_id
+        # Live fields
         acc_data["live_trade_log"] = list(state.get("live_trade_log") or [])
         acc_data["live_hunt_counter"] = int(state.get("live_hunt_counter") or 0)
+        # Paper fields (per-request, paper history is now isolated per key too)
+        acc_data["paper_trade_log"] = list(state.get("trade_log") or [])
+        acc_data["hunt_counter"] = int(state.get("hunt_counter") or 0)
         if (state.get("position") or {}).get("live"):
             acc_data["position"] = state.get("position")
         else:
@@ -396,8 +419,188 @@ if __name__ == "__main__":
         assert st_a2_restored["live_trade_log"][0]["symbol"] == "UAIIDR"
 
         print("[PASS] account profiles: live history isolated per key, restored on switch")
+
+        # f) Paper isolation too
+        globals()["active_account_id"] = lambda: "acc_paper_1"
+        st1 = load_state()
+        st1["trade_log"].append({"hunt_id": "H-0001", "symbol": "BTCIDR", "net_pnl_idr": 1000})
+        st1["hunt_counter"] = 1
+        save_state(st1)
+
+        globals()["active_account_id"] = lambda: "acc_paper_2"
+        st2 = load_state()
+        st2["trade_log"].append({"hunt_id": "H-0001", "symbol": "ETHIDR", "net_pnl_idr": 500})
+        st2["hunt_counter"] = 1
+        save_state(st2)
+
+        globals()["active_account_id"] = lambda: "acc_paper_1"
+        st1r = load_state()
+        assert len(st1r["trade_log"]) == 1 and st1r["trade_log"][0]["symbol"] == "BTCIDR"
+        assert st1r["hunt_counter"] == 1
+
+        globals()["active_account_id"] = lambda: "acc_paper_2"
+        st2r = load_state()
+        assert len(st2r["trade_log"]) == 1 and st2r["trade_log"][0]["symbol"] == "ETHIDR"
+        assert st2r["hunt_counter"] == 1
+
+        print("[PASS] account profiles: paper history isolated per key, restored on switch")
     finally:
         globals()["active_account_id"] = _orig_aid
 
     shutil.rmtree(_sandbox, ignore_errors=True)
     print("\n=== ALL CHECKS PASSED ===")
+
+if __name__ == "__main__":
+    # ------------------------------------------------------------------
+    # Self-checks run against a TEMP file, never the live state.
+    # The tests historically wrote straight to STATE_FILE, which wiped a
+    # real paper balance + trade log when the module was run for a check.
+    # ------------------------------------------------------------------
+    import shutil
+
+    _LIVE_STATE = STATE_FILE
+    _sandbox = tempfile.mkdtemp(prefix="hunter_state_test_")
+    STATE_FILE = os.path.join(_sandbox, "hunter_state.json")
+    LOCK_FILE = os.path.join(_sandbox, "hunter_state.lock")
+    KILL_FILE = os.path.join(_sandbox, "hunter_stop")
+
+    print("=== state.py self-check ===")
+    print(f"(sandbox: {_sandbox})\n")
+
+    # 1. Round-trip
+    s = _default_state()
+    s["balance_idr"] = 99_000
+    s["cooldowns"]["NEARIDR"] = time.time() + 3600
+    save_state(s)
+    s2 = load_state()
+    assert s2["balance_idr"] == 99_000, "round-trip balance fail"
+    assert "NEARIDR" in s2["cooldowns"], "round-trip cooldown fail"
+    print("[PASS] round-trip: save → load returns identical state")
+
+    # 2. Corrupt file → clean default
+    with open(STATE_FILE, "w") as f:
+        f.write("{broken json")
+    s3 = load_state()
+    assert s3["phase"] == "HUNTING", "corrupt recovery fail"
+    print("[PASS] corrupt file → clean default, no crash")
+
+    # 3. Missing file → clean default
+    os.remove(STATE_FILE)
+    s4 = load_state()
+    assert s4["phase"] == "HUNTING", "missing file fail"
+    print("[PASS] missing file → clean default")
+
+    # 4. Atomicity: tmp + rename, no partial state
+    save_state(_default_state())  # ensure STATE_FILE exists
+    save_state({"phase": "HUNTING", "balance_idr": 77_000,
+                "position": None, "cooldowns": {}, "gate_stats": {}})
+    s5 = load_state()
+    assert s5["balance_idr"] == 77_000, "atomic write fail"
+    print("[PASS] atomic write: tmp + rename, no partial state")
+
+    # 5. Flock — acquire twice, second returns None
+    fd1 = acquire_lock()
+    assert fd1 is not None, "first acquire fail"
+    fd2 = acquire_lock()
+    assert fd2 is None, "second acquire should return None (busy)"
+    release_lock(fd1)
+    fd3 = acquire_lock()
+    assert fd3 is not None, "re-acquire after release fail"
+    release_lock(fd3)
+    print("[PASS] flock: two concurrent acquires → second skipped")
+
+    # 6. Kill switch
+    open(KILL_FILE, "w").close()
+    try:
+        check_kill_switch()
+        assert False, "HaltSignal not raised"
+    except HaltSignal:
+        pass
+    os.remove(KILL_FILE)
+    check_kill_switch()  # should not raise
+    print("[PASS] kill switch: raises HaltSignal when file present")
+
+    # 7. Cooldown helpers
+    now = time.time()
+    s6 = _default_state()
+    set_cooldown(s6, "PEPEIDR", hours=4, now=now)
+    assert is_on_cooldown(s6, "PEPEIDR", now=now + 1), "cooldown active fail"
+    assert not is_on_cooldown(s6, "PEPEIDR", now=now + 4 * 3600 + 1), "cooldown expired fail"
+    assert not is_on_cooldown(s6, "BTCIDR", now=now), "missing cooldown fail"
+    print("[PASS] cooldown helpers: set, active, expired, missing")
+
+    # 8. Live state untouched by the run above
+    assert STATE_FILE != _LIVE_STATE, "sandbox escaped into the live state path"
+    print(f"[PASS] live state untouched ({_LIVE_STATE})")
+
+    # 9. Account profile isolation (live + paper)
+    _orig_aid = globals()["active_account_id"]
+    try:
+        # a) Account 1 logs a live trade
+        globals()["active_account_id"] = lambda: "acc_test_1"
+        st_a1 = load_state()
+        st_a1["live_trade_log"].append({"hunt_id": "L-00001", "symbol": "HYPEIDR", "net_pnl_idr": 500})
+        st_a1["live_hunt_counter"] = 1
+        save_state(st_a1)
+
+        # b) Sign out: live trade log is empty
+        globals()["active_account_id"] = lambda: None
+        st_out = load_state()
+        assert st_out["live_trade_log"] == [], st_out["live_trade_log"]
+        assert st_out["live_hunt_counter"] == 0
+
+        # c) Account 2 signs in: fresh trade log, independent counter
+        globals()["active_account_id"] = lambda: "acc_test_2"
+        st_a2 = load_state()
+        assert st_a2["live_trade_log"] == [], "account 2 must not see account 1 trades"
+        assert st_a2["live_hunt_counter"] == 0
+        st_a2["live_trade_log"].append({"hunt_id": "L-00001", "symbol": "UAIIDR", "net_pnl_idr": -200})
+        st_a2["live_hunt_counter"] = 1
+        save_state(st_a2)
+
+        # d) Switch back to Account 1: full history restored!
+        globals()["active_account_id"] = lambda: "acc_test_1"
+        st_a1_restored = load_state()
+        assert len(st_a1_restored["live_trade_log"]) == 1
+        assert st_a1_restored["live_trade_log"][0]["symbol"] == "HYPEIDR"
+        assert st_a1_restored["live_trade_log"][0]["net_pnl_idr"] == 500
+        assert st_a1_restored["live_hunt_counter"] == 1
+
+        # e) Switch back to Account 2: its history also intact
+        globals()["active_account_id"] = lambda: "acc_test_2"
+        st_a2_restored = load_state()
+        assert len(st_a2_restored["live_trade_log"]) == 1
+        assert st_a2_restored["live_trade_log"][0]["symbol"] == "UAIIDR"
+
+        print("[PASS] account profiles: live history isolated per key, restored on switch")
+
+        # f) Paper isolation too
+        globals()["active_account_id"] = lambda: "acc_paper_1"
+        st1 = load_state()
+        st1["trade_log"].append({"hunt_id": "H-0001", "symbol": "BTCIDR", "net_pnl_idr": 1000})
+        st1["hunt_counter"] = 1
+        save_state(st1)
+
+        globals()["active_account_id"] = lambda: "acc_paper_2"
+        st2 = load_state()
+        st2["trade_log"].append({"hunt_id": "H-0001", "symbol": "ETHIDR", "net_pnl_idr": 500})
+        st2["hunt_counter"] = 1
+        save_state(st2)
+
+        globals()["active_account_id"] = lambda: "acc_paper_1"
+        st1r = load_state()
+        assert len(st1r["trade_log"]) == 1 and st1r["trade_log"][0]["symbol"] == "BTCIDR"
+        assert st1r["hunt_counter"] == 1
+
+        globals()["active_account_id"] = lambda: "acc_paper_2"
+        st2r = load_state()
+        assert len(st2r["trade_log"]) == 1 and st2r["trade_log"][0]["symbol"] == "ETHIDR"
+        assert st2r["hunt_counter"] == 1
+
+        print("[PASS] account profiles: paper history isolated per key, restored on switch")
+    finally:
+        globals()["active_account_id"] = _orig_aid
+
+    shutil.rmtree(_sandbox, ignore_errors=True)
+    print("\n=== ALL CHECKS PASSED ===")
+

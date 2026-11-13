@@ -44,6 +44,7 @@ sys.path.insert(0, HERE)
 
 import paths  # noqa: E402
 import term  # noqa: E402
+import crontab_manager  # noqa: E402
 
 
 class LifecycleError(RuntimeError):
@@ -491,7 +492,8 @@ def signout(assume_yes: bool = False, as_json: bool = False) -> dict:
       2. Syncs and preserves active account profile state (live trade log, counter, position).
       3. Backs up config.yaml to data/config.yaml.backup-<timestamp>.
       4. Clears 'api:' section from config.yaml.
-      5. Scraped market data, candle data (market/, ohlcv/), paper trades, and framework settings remain intact.
+      5. Only disables the scanning (hunting) cron; all other crons stay active.
+      6. Scraped market data, candle data (market/, ohlcv/), framework settings remain intact.
     """
     import control
     import state as stmod
@@ -507,7 +509,13 @@ def signout(assume_yes: bool = False, as_json: bool = False) -> dict:
     acc_id = st.get("active_account_id")
     stmod.save_state(st)
 
-    # 3. Clear credentials in config.yaml
+    # 3. Disable only the hunting/scanning cron so data collection continues
+    try:
+        crontab_manager.set_job("scanning", False)
+    except Exception:
+        pass  # best effort; control file already stops hunting
+
+    # 4. Clear credentials in config.yaml
     cfg_path = cfgmod.config_path()
     backup_path = None
     if os.path.exists(cfg_path):
@@ -528,10 +536,12 @@ def signout(assume_yes: bool = False, as_json: bool = False) -> dict:
         except Exception as e:
             return {"ok": False, "error": f"failed to update config.yaml: {e}"}
 
-    # 4. Remove active account from current state
+    # 5. Remove active account from current state
     st["active_account_id"] = None
     st["live_trade_log"] = []
     st["live_hunt_counter"] = 0
+    st["trade_log"] = []
+    st["hunt_counter"] = 0
     if (st.get("position") or {}).get("live"):
         st["position"] = None
     if (st.get("order") or {}).get("live"):
