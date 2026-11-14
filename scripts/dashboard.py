@@ -1117,19 +1117,38 @@ def _account_panel() -> str:
 """
 
 
-def _settings_panel() -> str:
-    """SETTINGS panel: run first-time setup actions from the web UI.
+def _signout_panel() -> str:
+    """Sign Out panel at the very bottom of Settings."""
+    return """
+<div class="section" id="signOutPanel" style="margin-top:20px;">
+  <h2>Sign Out</h2>
+  <p style="font-size: 0.85em; color: var(--text-secondary); margin: 8px 0 14px 0;">
+    Disconnect the current Indodax API key. Your account profile history is preserved and can be restored by signing in again with the same key. Candle data and scheduled pipelines continue to run.
+  </p>
+  <button class="signout-btn" onclick="signOutAccount(this)">SIGN OUT</button>
+</div>
+"""
 
-    Every heavy operation is a button, not something that happens by itself.
-    State lives in data/setup_state.json, so the panel shows the truth after a
-    restart rather than starting from blank. Buttons are rendered server-side
-    from live state and updated by a small poller, so a page reload mid-backfill
-    still shows it running.
-    """
+
+def _settings_panel() -> str:
+    """SETTINGS panel: unified setup tasks and scheduled background jobs."""
+    import html as _html
+    import crontab_manager as cm
     import setup_state as S
 
     r = S.readiness()
     acts = r["actions"]
+
+    try:
+        crontab_err = cm.crontab_read_error()
+    except AttributeError:
+        crontab_err = ""
+    try:
+        cron_states = cm.job_states() or {}
+    except Exception:
+        cron_states = {}
+
+    cron_schedules = {name: sched for name, sched, _ in cm.JOBS}
 
     STATE_TAG = {
         "not_run": ("<span class='su-tag su-idle'>not run</span>"),
@@ -1145,7 +1164,6 @@ def _settings_panel() -> str:
         state = a.get("state", "not_run")
         tag = STATE_TAG.get(state, STATE_TAG["not_run"])
 
-        # a short line of detail: progress while running, the reason on failure
         detail = ""
         prog = a.get("progress")
         if state == "running" and prog and prog.get("total"):
@@ -1158,132 +1176,107 @@ def _settings_panel() -> str:
         elif state == "done" and a.get("finished_at"):
             import datetime as _dt
             when = _dt.datetime.fromtimestamp(a["finished_at"]).strftime("%m-%d %H:%M")
-            detail = f"<span class='su-dim'>{when}</span>"
+            detail = f"<span class='su-dim'>Last run: {when}</span>"
 
         busy = r.get("busy")
         disabled = (state == "running") or (busy is not None and busy != name)
         btn_label = {"not_run": "RUN", "failed": "RETRY", "done": "RUN AGAIN",
                      "running": "RUNNING"}.get(state, "RUN")
 
+        cron_sched = cron_schedules.get(name, "")
+        cron_on = bool(cron_states.get(name))
+        cron_checked = " checked" if cron_on else ""
+        sched_badge = f" · <code>{cron_sched}</code>" if cron_sched else ""
+
         rows.append(
             f"<div class='su-row'>"
             f"<div class='su-main'>"
             f"<div class='su-name'>{meta['label']} {tag}</div>"
-            f"<div class='su-desc'>{meta['desc']}</div>"
+            f"<div class='su-desc'>{meta['desc']}{sched_badge}</div>"
             f"{detail}"
+            f"</div>"
+            f"<div class='su-actions'>"
+            f"<div class='su-cron-ctrl'>"
+            f"<span class='su-cron-label'>Auto (Cron)</span>"
+            f"<label class='cron-switch'>"
+            f"<input type='checkbox'{cron_checked} onchange=\"toggleCron('{name}', this)\">"
+            f"<span class='cron-slider'></span>"
+            f"</label>"
             f"</div>"
             f"<button class='su-btn' onclick=\"runSetup('{name}')\""
             f"{' disabled' if disabled else ''}>{btn_label}</button>"
             f"</div>"
+            f"</div>"
         )
 
+    # Strategy engine scanning job
+    scanning_on = bool(cron_states.get("scanning"))
+    scanning_checked = " checked" if scanning_on else ""
+    scanning_sched = cron_schedules.get("scanning", "* * * * *")
+    scanning_row = (
+        f"<div class='su-row'>"
+        f"<div class='su-main'>"
+        f"<div class='su-name'>Strategy Engine Tick <span class='su-tag {'su-done' if scanning_on else 'su-idle'}'>{'active' if scanning_on else 'paused'}</span></div>"
+        f"<div class='su-desc'>Executes the trading strategy every minute · <code>{scanning_sched}</code></div>"
+        f"</div>"
+        f"<div class='su-actions'>"
+        f"<div class='su-cron-ctrl'>"
+        f"<span class='su-cron-label'>Auto (Cron)</span>"
+        f"<label class='cron-switch'>"
+        f"<input type='checkbox'{scanning_checked} onchange=\"toggleCron('scanning', this)\">"
+        f"<span class='cron-slider'></span>"
+        f"</label>"
+        f"</div>"
+        f"</div>"
+        f"</div>"
+    )
+
     if r["ready"]:
-        banner = ("<div class='su-banner ok'>Setup complete — every data "
-                  "action has finished.</div>")
+        banner = ("<div class='su-banner ok'>Setup complete — all data pipelines ready.</div>")
     else:
         missing = ", ".join(r["missing_labels"])
-        banner = (f"<div class='su-banner warn'>Setup incomplete — still to do: "
-                  f"{missing}</div>")
+        banner = (f"<div class='su-banner warn'>Setup incomplete — still to do: {missing}</div>")
 
     busy = r.get("busy")
     lock = ""
     if busy:
-        lock = (f"<div class='su-dim'>One heavy job at a time: "
+        lock = (f"<div class='su-dim' style='margin-bottom:10px;'>One heavy job at a time: "
                 f"<b>{S.ACTIONS[busy]['label']}</b> is running.</div>")
 
+    cron_banner = ""
+    if crontab_err:
+        esc = _html.escape(crontab_err[:200])
+        cron_banner = (f"<div class='su-banner fail'>Could not read crontab: <code>{esc}</code>. "
+                       f"If permission error, run <code>sudo loginctl enable-linger $USER</code>.</div>")
+
     account_html = _account_panel()
-    cron_html = _cron_switches_html()
 
     return f"""
 {account_html}
 
-<div class="panel" id="settingsPanel">
-  <h2>Settings — First-Time Setup</h2>
+<div class="section" id="settingsPanel">
+  <h2>Pipelines &amp; Scheduled Tasks</h2>
   {banner}
+  {cron_banner}
   {lock}
   <div class="su-list">
     {''.join(rows)}
+    {scanning_row}
   </div>
-  <div class="su-dim" style="margin-top:10px">
-    Nothing here runs by itself. Each button starts one job; you can close the
-    page and it keeps going.
+  <div id="cronStatus" class="su-dim" style="margin-top:10px;"></div>
+  <div class="su-dim" style="margin-top:10px;">
+    Toggle <b>Auto (Cron)</b> to enable scheduled background execution, or click <b>RUN</b> to execute a task immediately.
   </div>
-</div>
-
-{cron_html}
-
-<div class="panel" id="signOutPanel">
-  <h2>Sign Out</h2>
-  <p style="font-size: 0.85em; color: var(--text-secondary); margin: 8px 0 14px 0;">
-    Disconnect the current Indodax API key. Your account profile history is preserved and can be restored by signing in again with the same key. Candle data and other crons continue to run.
-  </p>
-  <button class="signout-btn" onclick="signOutAccount(this)">SIGN OUT</button>
 </div>
 """
 
 
 def _cron_switches_html() -> str:
-    """Render toggle switches for every managed cron job."""
-    import crontab_manager as cm
-    try:
-        crontab_err = cm.crontab_read_error()
-    except AttributeError:
-        crontab_err = ""
-    try:
-        states = cm.job_states() or {}
-    except Exception:
-        states = {}
-
-    if crontab_err:
-        import html as _html
-        esc = _html.escape(crontab_err[:200])
-        return (""
-            + "<div class=\"panel\" id=\"cronPanel\">"
-            + "  <h2>Cron Jobs</h2>"
-            + "  <div class=\"su-banner fail\">Could not read the crontab.</div>"
-            + "  <p class=\"su-dim\"><code>" + esc + "</code></p>"
-            + "  <p class=\"su-dim\">If it mentions permission, run this on the server, then reload:</p>"
-            + "  <pre style=\"background:#1f2937;padding:8px;border-radius:6px;overflow:auto;\">"
-            + "sudo loginctl enable-linger $USER</pre>"
-            + "</div>"
-        )
-
-    rows = []
-    for name, schedule, desc in cm.JOBS:
-        on = bool(states.get(name))
-        checked = " checked" if on else ""
-        rows.append(
-            f"<div class='su-row'>"
-            f"<div class='su-main'>"
-            f"<div class='su-name'>{name}</div>"
-            f"<div class='su-desc'>{desc} · <code>{schedule}</code></div>"
-            f"</div>"
-            f"<label class='cron-switch'>"
-            f"<input type='checkbox'{checked} onchange=\"toggleCron('{name}', this)\">"
-            f"<span class='cron-slider'></span>"
-            f"</label>"
-            f"</div>"
-        )
-
-    rows_html = "\n".join(rows)
-    return (
-        "<div class=\"panel\" id=\"cronPanel\">"
-        "  <h2>Cron Jobs</h2>"
-        "  <p class=\"su-dim\">Toggle each scheduled job on or off. "
-        "The <b>scanning</b> job runs the trading engine; keep it off while you are fetching data.</p>"
-        "  <div class=\"su-list\">" + rows_html + "</div>"
-        "  <div id=\"cronStatus\" class=\"su-dim\" style=\"margin-top:8px\"></div>"
-        "</div>"
-    )
-
+    """Empty placeholder kept for backward compatibility."""
+    return ""
 
 def _framework_panel(state: dict, control: dict) -> str:
-    """FRAMEWORKS panel: per-framework cards with accumulated stats.
-
-    Stats accumulate forever (Reza, 2026-11-03): grouping by the framework
-    field on each trade means switching never erases history, so A and B stay
-    comparable. Rows predating framework tracking are counted under A.
-    """
+    """FRAMEWORKS panel: per-framework cards with accumulated stats."""
     from frameworks import list_frameworks
 
     active = control.get("framework", "A")
@@ -1304,16 +1297,16 @@ def _framework_panel(state: dict, control: dict) -> str:
         d = by_fw.get(name)
         if not d or d["n"] == 0:
             return ("<div class='fw-stats'>"
-                    "<div><div class='k'>hunts</div><div class='v'>0</div></div>"
-                    "<div><div class='k'>winrate</div><div class='v'>—</div></div>"
-                    "<div><div class='k'>net pnl</div><div class='v'>—</div></div></div>")
+                    "<div><div class='k'>Hunts</div><div class='v'>0</div></div>"
+                    "<div><div class='k'>Winrate</div><div class='v'>—</div></div>"
+                    "<div><div class='k'>Net PnL</div><div class='v'>—</div></div></div>")
         wr = d["w"] / d["n"] * 100
         pnl_cls = "pass" if d["pnl"] >= 0 else "fail"
         sign = "+" if d["pnl"] >= 0 else ""
         return (f"<div class='fw-stats'>"
-                f"<div><div class='k'>hunts</div><div class='v'>{d['n']}</div></div>"
-                f"<div><div class='k'>winrate</div><div class='v'>{wr:.0f}%</div></div>"
-                f"<div><div class='k'>net pnl</div>"
+                f"<div><div class='k'>Hunts</div><div class='v'>{d['n']}</div></div>"
+                f"<div><div class='k'>Winrate</div><div class='v'>{wr:.0f}%</div></div>"
+                f"<div><div class='k'>Net PnL</div>"
                 f"<div class='v {pnl_cls}'>{sign}{d['pnl']:,.0f}</div></div></div>")
 
     cards = ""
@@ -1329,13 +1322,17 @@ def _framework_panel(state: dict, control: dict) -> str:
         else:
             dis = "" if can_switch else "disabled"
             action = (f"<button class='fw-activate' {dis} "
-                      f"onclick=\"activateFramework('{f['name']}')\">[ ACTIVATE ]</button>")
+                      f"onclick=\"activateFramework('{f['name']}')\">ACTIVATE FRAMEWORK</button>")
         cards += (
             f"<div class='fw-card{' active' if is_active else ''}'>"
-            f"<div class='fw-name'>{f['label']} <span style='color:#6b7280;font-size:0.8em'>"
-            f"FW {f['name']}</span>{badges}</div>"
+            f"<div class='fw-header'>"
+            f"  <div>"
+            f"    <div class='fw-name'>{f['label']}</div>"
+            f"    <div class='fw-sub'>Framework {f['name']} · v{f['version']}</div>"
+            f"  </div>"
+            f"  <div class='fw-badges'>{badges}</div>"
+            f"</div>"
             f"<div class='fw-desc'>{f['description']}</div>"
-            f"<div class='fw-meta'>v{f['version']}</div>"
             f"{_stats_html(f['name'])}"
             f"{action}</div>"
         )
@@ -1345,7 +1342,7 @@ def _framework_panel(state: dict, control: dict) -> str:
             "STOP liquidates any open position first.</p>")
 
     return f"""
-        <div class="section">
+        <div class="section" id="frameworksSection">
             <h2>Frameworks — Entry, Exit &amp; Indicators</h2>
             <p class="board-note">Each framework bundles its own entry indicators, exit
             levels and runner management. Switching applies to <b>new</b> hunts only;
@@ -1355,7 +1352,6 @@ def _framework_panel(state: dict, control: dict) -> str:
             {hint}
         </div>
     """
-
 
 def _winner_card(winner, rows):
     """Render a big CLI-style winner card."""
@@ -1644,7 +1640,9 @@ def _style():
         .ctrl-switch.busy { opacity: 0.55; pointer-events: none; }
         .ctrl-switch.ctrl-live { border-color: var(--accent-red); color: var(--accent-red); }
         .ctrl-switch.live { background: var(--accent-red); border-color: var(--accent-red); color: #fff; }
-        .row-buy { display: none; padding: 4px 10px; border: 1px solid var(--accent-red); border-radius: 6px; background: transparent; color: var(--accent-red); font-family: inherit; font-size: 0.72em; font-weight: 700; letter-spacing: 0.06em; cursor: pointer; white-space: nowrap; }
+        .row-buy { display: inline-block; padding: 5px 12px; border: 1px solid var(--accent-red); border-radius: 6px; background: transparent; color: var(--accent-red); font-family: inherit; font-size: 0.72em; font-weight: 700; letter-spacing: 0.06em; cursor: pointer; white-space: nowrap; transition: all 0.15s ease; }
+        .row-buy:hover:not(:disabled) { background: var(--accent-red); color: #fff; }
+        .row-buy:disabled { opacity: 0.35; cursor: not-allowed; border-color: var(--border-strong); color: var(--text-muted); }
         .row-buy:hover { background: var(--accent-red); color: #fff; }
         .row-buy:disabled { opacity: 0.5; cursor: wait; }
         .board td.act { text-align: center; min-width: 62px; }
@@ -1848,6 +1846,200 @@ def _style():
         .signin-error { color: var(--accent-red); font-size: 0.85em; margin-top: 12px; }
         .signin-status { color: var(--text-secondary); font-size: 0.85em; margin-top: 12px; }
         .signout-bottom { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+        
+        /* Frameworks panel */
+        .fw-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 14px;
+            margin-top: 14px;
+        }
+        .fw-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            transition: all 0.2s ease;
+            position: relative;
+        }
+        .fw-card:hover {
+            border-color: var(--border-strong);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+        }
+        .fw-card.active {
+            border-color: var(--accent-2);
+            box-shadow: 0 0 0 1px var(--accent-2), 0 8px 24px rgba(52, 211, 153, 0.12);
+            background: linear-gradient(180deg, rgba(52, 211, 153, 0.04) 0%, var(--bg-card) 100%);
+        }
+        .fw-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .fw-name {
+            font-size: 1.15em;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        .fw-sub {
+            font-size: 0.75em;
+            color: var(--text-muted);
+            margin-top: 2px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .fw-badges {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .fw-desc {
+            font-size: 0.82em;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            flex: 1;
+        }
+        .fw-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px;
+            text-align: center;
+        }
+        .fw-stats .k {
+            font-size: 0.65em;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 2px;
+        }
+        .fw-stats .v {
+            font-size: 1.05em;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        .fw-stats .v.pass { color: var(--accent-2); }
+        .fw-stats .v.fail { color: var(--accent-red); }
+        .fw-badge-active {
+            font-size: 0.65em;
+            padding: 3px 8px;
+            background: rgba(52, 211, 153, 0.15);
+            color: var(--accent-2);
+            border: 1px solid var(--accent-2);
+            border-radius: 6px;
+            letter-spacing: 0.6px;
+            font-weight: 700;
+        }
+        .fw-badge-exp {
+            font-size: 0.65em;
+            padding: 3px 8px;
+            background: rgba(251, 191, 36, 0.15);
+            color: var(--accent-amber);
+            border: 1px solid var(--accent-amber);
+            border-radius: 6px;
+            letter-spacing: 0.6px;
+            font-weight: 700;
+        }
+        .fw-activate {
+            width: 100%;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 0.85em;
+            font-weight: 700;
+            cursor: pointer;
+            border: 1px solid var(--accent-2);
+            background: transparent;
+            color: var(--accent-2);
+            transition: all 0.15s ease;
+        }
+        .fw-activate:hover:not(:disabled) {
+            background: var(--accent-2);
+            color: #0b0f19;
+        }
+        .fw-activate:disabled {
+            border-color: var(--border);
+            color: var(--text-muted);
+            background: transparent;
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+        .fw-card.active .fw-activate {
+            background: rgba(52, 211, 153, 0.15);
+            color: var(--accent-2);
+            border-color: var(--accent-2);
+            cursor: default;
+            opacity: 1;
+        }
+
+        /* 1-row OHLCV cards */
+        .cards.ohlcv-cards {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        @media (max-width: 900px) {
+            .cards.ohlcv-cards {
+                grid-template-columns: repeat(5, minmax(110px, 1fr));
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                padding-bottom: 4px;
+            }
+        }
+
+        /* Chart zoom controls */
+        .chart-zoom-bar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .zoom-btn {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 0.85em;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .zoom-btn:hover {
+            background: var(--border-strong);
+            color: var(--accent);
+        }
+        #chart {
+            cursor: crosshair;
+        }
+
+        /* Setup & Cron unified row */
+        .su-actions {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .su-cron-ctrl {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .su-cron-label {
+            font-size: 0.72em;
+            color: var(--text-secondary);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
         .signout-btn { width: 100%; height: 46px; border: 1px solid var(--accent-red); border-radius: 8px; background: transparent; color: var(--accent-red); font-weight: 700; cursor: pointer; }
         .signout-btn:hover { background: rgba(239,68,68,0.1); }
     
@@ -1948,7 +2140,12 @@ CHART_JS = """
             return;
         }
 
-        const candles = data.candles;
+        if (!data._view || data._view.total !== data.candles.length) {
+            data._view = { start: 0, end: data.candles.length, total: data.candles.length };
+        }
+        const vStart = Math.max(0, Math.min(data.candles.length - 10, Math.floor(data._view.start)));
+        const vEnd = Math.max(vStart + 10, Math.min(data.candles.length, Math.ceil(data._view.end)));
+        const candles = data.candles.slice(vStart, vEnd);
         const tf = data.tf;
         const padL = 8, padR = 72, padT = 12, padB = 26, volH = 70;
         const chartW = W - padL - padR;
@@ -2151,6 +2348,31 @@ CHART_JS = """
         }
     }
 
+    function zoomChart(dir, target) {
+        const data = target ? boardChartData : chartData;
+        if (!data || !data.candles || data.candles.length < 15) return;
+        if (!data._view) data._view = { start: 0, end: data.candles.length, total: data.candles.length };
+        const total = data.candles.length;
+        const curSpan = data._view.end - data._view.start;
+        const factor = dir > 0 ? 0.75 : 1.33;
+        const newSpan = Math.max(10, Math.min(total, curSpan * factor));
+        const mid = (data._view.start + data._view.end) / 2;
+        let newStart = mid - newSpan / 2;
+        let newEnd = mid + newSpan / 2;
+        if (newStart < 0) { newStart = 0; newEnd = newSpan; }
+        if (newEnd > total) { newEnd = total; newStart = Math.max(0, total - newSpan); }
+        data._view.start = newStart;
+        data._view.end = newEnd;
+        drawChart(null, target);
+    }
+
+    function resetChartZoom(target) {
+        const data = target ? boardChartData : chartData;
+        if (!data || !data.candles) return;
+        data._view = { start: 0, end: data.candles.length, total: data.candles.length };
+        drawChart(null, target);
+    }
+
     function resetFilters() {
         document.getElementById('pairSelect').value = "BTCIDR";
         document.getElementById('tfSelect').value = "15m";
@@ -2165,17 +2387,148 @@ CHART_JS = """
             const rect = canvas.getBoundingClientRect();
             drawChart(clientX - rect.left);
         }
-        canvas.addEventListener('mousemove', e => updateHover(e.clientX));
-        canvas.addEventListener('mouseleave', () => drawChart());
 
-        // Smartphone touch interaction for candlestick inspection
-        canvas.addEventListener('touchstart', e => {
-            if (e.touches && e.touches.length > 0) updateHover(e.touches[0].clientX);
-        }, {passive: true});
-        canvas.addEventListener('touchmove', e => {
-            if (e.touches && e.touches.length > 0) updateHover(e.touches[0].clientX);
-        }, {passive: true});
-        canvas.addEventListener('touchend', () => drawChart(), {passive: true});
+        let isDragging = false;
+        let dragStartX = 0;
+        let dragStartView = null;
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            isDragging = true;
+            dragStartX = e.clientX;
+            if (chartData && chartData.candles) {
+                if (!chartData._view) chartData._view = { start: 0, end: chartData.candles.length, total: chartData.candles.length };
+                dragStartView = { start: chartData._view.start, end: chartData._view.end };
+            }
+            canvas.style.cursor = 'grabbing';
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (isDragging && chartData && chartData.candles && dragStartView) {
+                const rect = canvas.getBoundingClientRect();
+                const padL = 8, padR = 72;
+                const chartW = canvas.clientWidth - padL - padR;
+                const curSpan = dragStartView.end - dragStartView.start;
+                const dx = e.clientX - dragStartX;
+                const barDx = (dx / Math.max(1, chartW)) * curSpan;
+                const total = chartData.candles.length;
+
+                let newStart = dragStartView.start - barDx;
+                let newEnd = dragStartView.end - barDx;
+                if (newStart < 0) { newStart = 0; newEnd = curSpan; }
+                if (newEnd > total) { newEnd = total; newStart = Math.max(0, total - curSpan); }
+                chartData._view.start = newStart;
+                chartData._view.end = newEnd;
+                drawChart(e.clientX - rect.left);
+            } else if (e.target === canvas) {
+                updateHover(e.clientX);
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            if (isDragging) {
+                isDragging = false;
+                canvas.style.cursor = 'crosshair';
+            }
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            if (!isDragging) drawChart();
+        });
+
+        canvas.addEventListener('dblclick', () => {
+            resetChartZoom();
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            if (!chartData || !chartData.candles || chartData.candles.length < 15) return;
+            if (!chartData._view) chartData._view = { start: 0, end: chartData.candles.length, total: chartData.candles.length };
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const padL = 8, padR = 72;
+            const chartW = canvas.clientWidth - padL - padR;
+            const ratio = Math.max(0, Math.min(1, (mouseX - padL) / Math.max(1, chartW)));
+
+            const total = chartData.candles.length;
+            const curSpan = chartData._view.end - chartData._view.start;
+            const factor = e.deltaY < 0 ? 0.8 : 1.25;
+            const newSpan = Math.max(10, Math.min(total, curSpan * factor));
+
+            const centerIdx = chartData._view.start + curSpan * ratio;
+            let newStart = centerIdx - newSpan * ratio;
+            let newEnd = newStart + newSpan;
+            if (newStart < 0) { newStart = 0; newEnd = newSpan; }
+            if (newEnd > total) { newEnd = total; newStart = Math.max(0, total - newSpan); }
+            chartData._view.start = newStart;
+            chartData._view.end = newEnd;
+            drawChart(mouseX);
+        }, { passive: false });
+
+        // Touch pan & pinch zoom
+        let touchStartX = null;
+        let touchStartDist = null;
+        let touchStartView = null;
+
+        canvas.addEventListener('touchstart', (e) => {
+            if (!chartData || !chartData.candles) return;
+            if (!chartData._view) chartData._view = { start: 0, end: chartData.candles.length, total: chartData.candles.length };
+            touchStartView = { start: chartData._view.start, end: chartData._view.end };
+
+            if (e.touches.length === 1) {
+                touchStartX = e.touches[0].clientX;
+                touchStartDist = null;
+                updateHover(e.touches[0].clientX);
+            } else if (e.touches.length === 2) {
+                touchStartDist = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY
+                );
+            }
+        }, { passive: true });
+
+        canvas.addEventListener('touchmove', (e) => {
+            if (!chartData || !chartData.candles || !chartData._view || !touchStartView) return;
+            const total = chartData.candles.length;
+            const curSpan = touchStartView.end - touchStartView.start;
+            const rect = canvas.getBoundingClientRect();
+            const padL = 8, padR = 72;
+            const chartW = canvas.clientWidth - padL - padR;
+
+            if (e.touches.length === 1 && touchStartX !== null) {
+                const dx = e.touches[0].clientX - touchStartX;
+                const barDx = (dx / Math.max(1, chartW)) * curSpan;
+                let newStart = touchStartView.start - barDx;
+                let newEnd = touchStartView.end - barDx;
+                if (newStart < 0) { newStart = 0; newEnd = curSpan; }
+                if (newEnd > total) { newEnd = total; newStart = Math.max(0, total - curSpan); }
+                chartData._view.start = newStart;
+                chartData._view.end = newEnd;
+                drawChart(e.touches[0].clientX - rect.left);
+            } else if (e.touches.length === 2 && touchStartDist !== null) {
+                const dist = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY
+                );
+                const factor = touchStartDist / Math.max(1, dist);
+                const newSpan = Math.max(10, Math.min(total, curSpan * factor));
+                const mid = (touchStartView.start + touchStartView.end) / 2;
+                let newStart = mid - newSpan / 2;
+                let newEnd = mid + newSpan / 2;
+                if (newStart < 0) { newStart = 0; newEnd = newSpan; }
+                if (newEnd > total) { newEnd = total; newStart = Math.max(0, total - newSpan); }
+                chartData._view.start = newStart;
+                chartData._view.end = newEnd;
+                drawChart();
+            }
+        }, { passive: true });
+
+        canvas.addEventListener('touchend', () => {
+            touchStartX = null;
+            touchStartDist = null;
+            touchStartView = null;
+            drawChart();
+        }, { passive: true });
 
         window.addEventListener('resize', () => drawChart());
         window.addEventListener('orientationchange', () => setTimeout(drawChart, 150));
@@ -2455,34 +2808,53 @@ CHART_JS = """
     }
 
     function refreshBuyButton() {
-        // A manual buy only exists meaningfully in LIVE with nothing open: in
-        // paper it would be a simulated order dressed as a real one, and a
-        // second position is refused by the engine anyway.
-        var can = (ctrlState.exec === 'LIVE')
-                  && (ctrlState.mode === 'RUNNING')
-                  && !(ctrlState.position && ctrlState.position.symbol)
-                  && !ctrlState.blocked;
+        var isLive = (ctrlState.exec === 'LIVE') && (ctrlState.mode === 'RUNNING');
+        var isHolding = !!(ctrlState.position && ctrlState.position.symbol);
+        var can = isLive && !isHolding && !ctrlState.blocked;
 
         var b = document.getElementById('buyNow');
         if (b) {
-            b.style.display = can ? 'inline-flex' : 'none';
-            if (can) b.title = 'Market buy at the best ask. Real money.';
+            b.style.display = isLive ? 'inline-flex' : 'none';
+            b.disabled = !can;
+            if (isHolding) {
+                b.title = 'Cannot buy: position already open on ' + ctrlState.position.symbol;
+            } else if (!isLive) {
+                b.title = 'Start LIVE mode to buy';
+            } else {
+                b.title = 'Market buy at the best ask. Real money.';
+            }
         }
 
-        // One BUY per row in the filter board, same rule. Shown for EVERY pair,
-        // not just the eligible ones - choosing a pair the funnel rejected is
-        // the operator's decision to make, and the engine re-checks the caps
-        // regardless of what the table thinks.
+        // Always show BUY buttons in the table. If holding, disable them; if empty, clickable.
         Array.from(document.querySelectorAll('.row-buy')).forEach(function (rb) {
-            rb.style.display = can ? 'inline-block' : 'none';
-            if (can && !rb.title) {
-                rb.title = 'Market buy ' + rb.getAttribute('data-sym')
-                           + ' at the best ask. Real money.';
+            rb.style.display = 'inline-block';
+            var sym = rb.getAttribute('data-sym');
+            if (isHolding) {
+                rb.disabled = true;
+                rb.title = 'Holding ' + ctrlState.position.symbol + ' · close position before buying ' + sym;
+            } else if (!isLive) {
+                rb.disabled = true;
+                rb.title = 'Start LIVE mode to enable manual buy';
+            } else if (ctrlState.blocked) {
+                rb.disabled = true;
+                rb.title = 'Live trading is currently blocked';
+            } else {
+                rb.disabled = false;
+                rb.title = 'Market buy ' + sym + ' at the best ask. Real money.';
             }
         });
+
         var note = document.getElementById('actionNote');
         if (note) {
-            note.style.display = can ? 'none' : 'block';
+            if (isHolding) {
+                note.textContent = 'BUY buttons disabled: currently holding ' + ctrlState.position.symbol + '.';
+                note.style.display = 'block';
+            } else if (!isLive) {
+                note.textContent = 'BUY buttons are active when LIVE mode is running and no position is open.';
+                note.style.display = 'block';
+            } else {
+                note.style.display = 'none';
+            }
         }
     }
 
@@ -4724,25 +5096,31 @@ async def dashboard():
     <div id="pageSettings" style="display:none;">
         {_settings_panel()}
         {_framework_panel(state, control)}
+        {_signout_panel()}
     </div>
 
     <!-- PAGE B: OTHERS VIEW -->
     <div id="pageOthers" style="display:none;">
         <div class="section">
             <h2>OHLCV Data Summary</h2>
-            <div class="cards">
+            <div class="cards ohlcv-cards">
                 <div class="card total"><span class="num">{total}</span><span class="label">Total Pairs</span></div>
                 <div class="card complete"><span class="num">{complete}</span><span class="label">Complete</span></div>
                 <div class="card stale"><span class="num">{stale}</span><span class="label">Stale</span></div>
-            </div>
-            <div class="cards">
                 <div class="card size"><span class="num">{depth_size}</span><span class="label">Depth Folder</span></div>
                 <div class="card size"><span class="num">{ohlcv_size}</span><span class="label">OHLCV Folder</span></div>
             </div>
         </div>
 
         <div class="section">
-            <h2>Candlestick Chart</h2>
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px; border-bottom:1px solid var(--border); padding-bottom:10px;">
+                <h2 style="border:none; margin:0; padding:0;">Candlestick Chart</h2>
+                <div class="chart-zoom-bar">
+                    <button type="button" class="zoom-btn" onclick="zoomChart(-1)" title="Zoom Out (-)">−</button>
+                    <button type="button" class="zoom-btn" onclick="zoomChart(1)" title="Zoom In (+)">+</button>
+                    <button type="button" class="zoom-btn" onclick="resetChartZoom()" title="Reset View (⟲)">⟲ Reset</button>
+                </div>
+            </div>
             <div class="chart-controls">
                 <div class="ctrl-group">
                     <label for="pairSelect">Pair</label>
@@ -4767,6 +5145,9 @@ async def dashboard():
             <div class="chart-wrap">
                 <canvas id="chart"></canvas>
                 <div id="tooltip"></div>
+            </div>
+            <div class="chart-sub-hint" style="font-size:0.75em; color:var(--text-muted); margin-top:8px;">
+                💡 Scroll mouse wheel or pinch to zoom in/out · Drag canvas to pan left/right · Double-click to reset view
             </div>
         </div>
 
