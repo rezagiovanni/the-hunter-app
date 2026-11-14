@@ -233,8 +233,14 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
     # net_pnl_idr = None. It must NOT be counted as zero: that would drag the
     # average toward breakeven and count it as a loss against the win rate.
     # It is excluded from every P&L statistic and reported separately.
+    # Rows from the exchange that haven't been reconciled yet have
+    # net_pnl_idr=None but a real exit_reason (pending reconciliation).
+    # Only EXIT_EXTERNAL_SELL is truly unscored.
+    pending = [t for t in log
+               if t.get("net_pnl_idr") is None
+               and (t.get("exit_reason") or '') not in ('EXIT_EXTERNAL_SELL', '')]
     scored = [t for t in log if t.get("net_pnl_idr") is not None]
-    unknown = n - len(scored)
+    unknown = n - len(scored) - len(pending)  # truly unresolvable
 
     net = sum(t.get("net_pnl_idr") or 0.0 for t in scored)
     wins = sum(1 for t in scored if (t.get("net_pnl_idr") or 0.0) > 0)
@@ -273,8 +279,12 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
     wr_cls = "pass" if winrate >= 50 else "fail"
 
     cards = (
-        '<div class="stats-tile"><div class="label">Total Hunts</div><div class="value">{}{}</div></div>'.format(
-            n, f"<span class='unknown-n' title='sold outside the bot: P&L not known, excluded from the stats'>{unknown} unknown</span>" if unknown else "") +
+        '<div class="stats-tile"><div class="label">Total Hunts</div><div class="value">{}{}{}</div></div>'.format(
+            n,
+            f" <span class='unknown-n pending-n' title='P&amp;L pending exchange reconciliation — upgrade &amp; repair'>{len(pending)} pending</span>"
+            if pending else "",
+            f" <span class='unknown-n' title='sold outside the bot: P&amp;L not resolvable'>{unknown} unknown</span>"
+            if unknown else "") +
         '<div class="stats-tile"><div class="label">PnL</div><div class="value {0}">{1}IDR {2:,.0f}</div></div>'.format(net_cls, pnl_sign, net) +
         '<div class="stats-tile"><div class="label">Winrate</div><div class="value {0}">{1:.1f}%</div></div>'.format(wr_cls, winrate) +
         '<div class="stats-tile"><div class="label">Max Drawdown</div><div class="value neg">{:.1f}%</div></div>'.format(max_dd_pct) +
@@ -898,8 +908,17 @@ def _trading_log_section(state: dict) -> str:
                 pct_cell = f"<b>{sign}{float(pct or 0):.2f}%</b>"
             else:
                 pnl_cls = "unknown"
-                pnl_cell = "<b title='sold outside the bot; the exit price is not known'>unknown</b>"
-                pct_cell = "<b>—</b>"
+                # Three distinct states: (a) pending reconciliation — the
+                # bot placed the sell but the exchange reply hasn't come back
+                # yet; (b) sold externally — no data at all; (c) repaired row
+                # with real values. Only (b) is truly "unknown".
+                _reason = t.get('exit_reason') or ''
+                if _reason and _reason not in ('EXIT_EXTERNAL_SELL',):
+                    pnl_cell = "<b title='P\u0026L pending reconciliation — upgrade the bot and run repair'>pending</b>"
+                    pct_cell = "<b title='P\u0026L pending reconciliation'>—</b>"
+                else:
+                    pnl_cell = "<b title='sold outside the bot; the exit price is not known'>unknown</b>"
+                    pct_cell = "<b>—</b>"
             hidden = "" if idx <= TRADES_PER_PAGE else " style='display:none;'"
             hold = _fmt_duration(t.get("entry_time"), t.get("exit_time"))
             out += (
@@ -910,7 +929,7 @@ def _trading_log_section(state: dict) -> str:
                 + _fw_cell(t) +
                 f"<td class='num'>{hold}</td>"
                 f"<td class='num'>{t.get('entry_price', 0):,.0f}</td>"
-                f"<td class='num'>{t.get('exit_price', 0):,.0f}</td>"
+                f"<td class='num'>{ '{:,.0f}'.format(t['exit_price']) if t.get('exit_price') else '—' }</td>"
                 f"<td class='num'>{t.get('quantity') or t.get('coins') or 0}</td>"
                 f"<td class='num {pnl_cls}'>{pnl_cell}</td>"
                 f"<td class='num {pnl_cls}'>{pct_cell}</td>"
@@ -1774,6 +1793,54 @@ def _style():
         .pager { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 10px; font-size: 0.8em; color: var(--text-secondary); }
         .pager button { background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-primary); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
         .pager button:disabled { opacity: 0.4; cursor: not-allowed; }
+        /* Pagination bar */
+        .pagination-wrap { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding: 6px 2px; }
+        .pg-info { font-size: 0.75em; color: var(--text-muted); }
+        .pg-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+        .pg-btn {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            border-radius: 7px;
+            padding: 5px 12px;
+            font-size: 0.78em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s, color 0.15s;
+            outline: none;
+        }
+        .pg-btn:hover:not(:disabled) {
+            background: var(--bg-hover, #2a2a3a);
+            border-color: var(--accent);
+            color: var(--text-primary);
+        }
+        .pg-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+        .pg-btn.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+        }
+        .pg-btn.clear-live {
+            background: transparent;
+            border-color: var(--accent-red, #ef4444);
+            color: var(--accent-red, #ef4444);
+            margin-left: 10px;
+        }
+        .pg-btn.clear-live:hover {
+            background: rgba(239,68,68,.12);
+            border-color: #f87171;
+            color: #f87171;
+        }
+        .unknown-n, .pending-n {
+            font-size: 0.72em;
+            font-weight: 600;
+            padding: 1px 7px;
+            border-radius: 20px;
+            margin-left: 6px;
+            vertical-align: middle;
+        }
+        .unknown-n { background: rgba(107,114,128,.18); color: var(--text-secondary); }
+        .pending-n { background: rgba(234,179,8,.15); color: #ca8a04; }
         .scroll-hint { display: none; font-size: 0.7em; color: var(--text-muted); margin-bottom: 6px; text-align: right; }
         @media (max-width: 768px) {
             .scroll-hint { display: block; }
