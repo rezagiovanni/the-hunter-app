@@ -699,6 +699,11 @@ def execute_live_sell(position: dict, best_bid: float, exit_reason: str,
         "exit_ask": None,
         "framework": position.get("framework", "A"),
         "framework_version": position.get("framework_version"),
+        # Carried onto the closed record so history can still say whether the
+        # bot placed the entry or the position was adopted from a manual buy.
+        # Without this every closed trade looked bot-placed.
+        "adopted": bool(position.get("adopted")),
+        "entry_source": position.get("entry_source"),
         "target_pct": (position.get("exit_levels") or {}).get("target_pct"),
         "stop_pct": (position.get("exit_levels") or {}).get("stop_pct"),
         "ratchet_armed": (position.get("exit_levels") or {}).get("ratchet_armed", False),

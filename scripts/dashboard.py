@@ -737,8 +737,7 @@ def _trading_log_section(state: dict) -> str:
             # it. Say so plainly - the entry price is the price at adoption, not
             # what was actually paid, so any P&L shown against it is measured
             # from here and must not be read as the trade's real result.
-            status_badge = ('<span class="badge-status holding">'
-                            '● HOLDING · ADOPTED</span>')
+            status_badge = '<span class="badge-status holding">● HOLDING</span>'
         else:
             status_badge = '<span class="badge-status holding">● HOLDING</span>'
         _lv = pos.get("exit_levels", {})
@@ -747,15 +746,9 @@ def _trading_log_section(state: dict) -> str:
             f"Target: <b>{_lv.get('target_price', 0):,} IDR</b> (+{_lv.get('target_pct', 0)*100:.0f}%) · "
             f"Stop: <b>{_lv.get('stop_trigger_price', 0):,} IDR</b> (-{_lv.get('stop_pct', 0)*100:.0f}%)"
         )
-        if pos.get("adopted"):
-            _src = ("the current market price" if pos.get("entry_source") ==
-                    "market_at_adoption" else "the price you entered")
-            status_detail += (
-                f" · Adopted at {_src} on "
-                f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(pos.get('adopted_at') or 0))} WIB"
-                f" - the bot did not see the original fill, so P&L runs from "
-                f"here, not from what you paid."
-            )
+        # The SOURCE column in the trade table already says whether this
+        # position was bought by the bot or by hand, so the banner does not
+        # repeat it here.
     elif order and order.get("live") and _order_gone(order):
         # The order is gone from the book but the engine has not ticked yet.
         # Show NOTHING about it. The operator knows the order is not open - they
@@ -781,6 +774,20 @@ def _trading_log_section(state: dict) -> str:
                              "<b>LIVE</b> · real balance on the exchange panel")
         else:
             status_detail = f"Scanning 20 IDR Pairs · Virtual Balance: <b>IDR {balance:,.0f}</b> · engine ready"
+
+    def _source_cell(adopted):
+        """Which side placed the entry: the bot, or the operator by hand.
+
+        This replaced inline ADOPTED tags scattered across the table, which made
+        the pair name read as "UAIIDR ADOPTED". One dedicated column, one label,
+        no ambiguity about what the pair column contains.
+        """
+        if adopted:
+            return ("<td class='num'><span class='src-tag manual' "
+                    "title='entry placed by hand on Indodax; the bot adopted the "
+                    "position and only manages the exit'>MANUAL</span></td>")
+        return ("<td class='num'><span class='src-tag bot' "
+                "title='entry placed by the bot'>BOT</span></td>")
 
     def _open_row(p, o):
         """Live position/order row (pinned above the paginated history).
@@ -830,21 +837,12 @@ def _trading_log_section(state: dict) -> str:
             # The EXIT column is the price it left at, so an open position has no
             # exit price. It used to print the TARGET there, which read as if the
             # trade had already closed at its target.
-            # Tags go on the Hunt ID cell, not on the pair name cell.
-            # Putting ADOPTED next to 'UAIIDR' made the pair name read as
-            # 'UAIIDR ADOPTED', confusing the pair with its status.
-            _id_tags = []
-            if p.get("adopted"):
-                _id_tags.append("<span class='open-tag'>ADOPTED</span>")
-            if p.get("entry_source") == "market_at_adoption":
-                _id_tags.append("<span class='open-tag est' title='estimated from the "
-                               "market price when the bot noticed the coins'>EST.</span>")
-            hid_html_full = hid_html + ("".join(_id_tags))
             return (
                 f"<tr class='open-trade'>"
-                f"<td class='num'>{hid_html_full}</td>"
+                f"<td class='num'>{hid_html}</td>"
                 f"<td>OPEN NOW</td>"
                 f"<td><b>{p.get('symbol', '—')}</b></td>"
+                + _source_cell(p.get('adopted')) +
                 f"<td class='num'><span class='fw-tag {'fw-exp' if p.get('framework','A') != 'A' else 'fw-a'}'>{p.get('framework','A')}</span></td>"
                 f"<td class='num'>{hold_txt}</td>"
                 f"<td class='num'>{entry_price:,.0f}</td>"
@@ -929,7 +927,8 @@ def _trading_log_section(state: dict) -> str:
                 f"<td class='num'><span class='hunt-link' onclick=\"openHuntPage('{t.get('hunt_id') or ''}', this)\">{t.get('hunt_id') or '—'}</span></td>"
                 f"<td>{_fmt_epoch(ts)}</td>"
                 f"<td><b>{t.get('symbol', '—')}</b></td>"
-                + _fw_cell(t) +
+                + _source_cell(t.get('adopted')) +
+                _fw_cell(t) +
                 f"<td class='num'>{hold}</td>"
                 f"<td class='num'>{t.get('entry_price', 0):,.0f}</td>"
                 f"<td class='num'>{ '{:,.0f}'.format(t['exit_price']) if t.get('exit_price') else '—' }</td>"
@@ -1054,7 +1053,7 @@ def _trading_log_section(state: dict) -> str:
             <div class="table-wrap">
                 <table class="board" id="paperTradeTable">
                     <thead><tr>
-                        <th>Hunt ID</th><th>Time (WIB)</th><th>Symbol</th><th>FW</th><th>Hold</th><th>Entry (IDR)</th>
+                        <th>Hunt ID</th><th>Time (WIB)</th><th>Symbol</th><th>Source</th><th>FW</th><th>Hold</th><th>Entry (IDR)</th>
                         <th>Exit (IDR)</th><th>Qty</th><th>Net PnL (IDR)</th><th>Return %</th>
                         <th>Exit Reason</th>
                     </tr></thead>
@@ -1080,7 +1079,7 @@ def _trading_log_section(state: dict) -> str:
             <div class="table-wrap">
                 <table class="board" id="liveTradeTable">
                     <thead><tr>
-                        <th>Hunt ID</th><th>Time (WIB)</th><th>Symbol</th><th>FW</th><th>Hold</th><th>Entry (IDR)</th>
+                        <th>Hunt ID</th><th>Time (WIB)</th><th>Symbol</th><th>Source</th><th>FW</th><th>Hold</th><th>Entry (IDR)</th>
                         <th>Exit (IDR)</th><th>Qty</th><th>Net PnL (IDR)</th><th>Return %</th>
                         <th>Exit Reason</th>
                     </tr></thead>
@@ -1842,6 +1841,17 @@ def _style():
             margin-left: 6px;
             vertical-align: middle;
         }
+        .src-tag {
+            display: inline-block;
+            font-size: 0.66em;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            padding: 2px 8px;
+            border-radius: 20px;
+            border: 1px solid transparent;
+        }
+        .src-tag.bot { background: rgba(34,197,94,.12); color: #4ade80; border-color: rgba(34,197,94,.25); }
+        .src-tag.manual { background: rgba(234,179,8,.12); color: #eab308; border-color: rgba(234,179,8,.25); }
         .unknown-n { background: rgba(107,114,128,.18); color: var(--text-secondary); }
         .pending-n { background: rgba(234,179,8,.15); color: #ca8a04; }
         .scroll-hint { display: none; font-size: 0.7em; color: var(--text-muted); margin-bottom: 6px; text-align: right; }
