@@ -830,18 +830,21 @@ def _trading_log_section(state: dict) -> str:
             # The EXIT column is the price it left at, so an open position has no
             # exit price. It used to print the TARGET there, which read as if the
             # trade had already closed at its target.
-            _tags = []
+            # Tags go on the Hunt ID cell, not on the pair name cell.
+            # Putting ADOPTED next to 'UAIIDR' made the pair name read as
+            # 'UAIIDR ADOPTED', confusing the pair with its status.
+            _id_tags = []
             if p.get("adopted"):
-                _tags.append("<span class='open-tag'>ADOPTED</span>")
+                _id_tags.append("<span class='open-tag'>ADOPTED</span>")
             if p.get("entry_source") == "market_at_adoption":
-                _tags.append("<span class='open-tag est' title='estimated from the "
-                             "market price when the bot noticed the coins'>EST.</span>")
+                _id_tags.append("<span class='open-tag est' title='estimated from the "
+                               "market price when the bot noticed the coins'>EST.</span>")
+            hid_html_full = hid_html + ("".join(_id_tags))
             return (
                 f"<tr class='open-trade'>"
-                f"<td class='num'>{hid_html}</td>"
+                f"<td class='num'>{hid_html_full}</td>"
                 f"<td>OPEN NOW</td>"
-                f"<td><b>{p.get('symbol', '—')}</b>"
-                + ("".join(_tags)) + "</td>"
+                f"<td><b>{p.get('symbol', '—')}</b></td>"
                 f"<td class='num'><span class='fw-tag {'fw-exp' if p.get('framework','A') != 'A' else 'fw-a'}'>{p.get('framework','A')}</span></td>"
                 f"<td class='num'>{hold_txt}</td>"
                 f"<td class='num'>{entry_price:,.0f}</td>"
