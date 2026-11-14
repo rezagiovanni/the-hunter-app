@@ -781,6 +781,10 @@ def trade(pair: str, side: str, idr: Optional[float] = None,
         oid = str(res.get("orderId") or "")
         exec_qty = float(res.get("executedQty") or 0)
         ret = {"order_id": oid, "id": oid, "status": str(res.get("status", "")).lower()}
+        # fullOrderId (e.g. "uaiidr-market-17484876") is the id myTrades reports;
+        # the numeric orderId is NOT usable for a fill lookup there.
+        if res.get("fullOrderId"):
+            ret["full_order_id"] = str(res.get("fullOrderId"))
         if side_u == "BUY":
             if exec_qty > 0:
                 ret["receive_coin"] = str(exec_qty)
@@ -1113,3 +1117,78 @@ def _self_check():
 
 if __name__ == "__main__":
     _self_check()
+
+
+def resolve_fill(symbol: str, order_id: str, full_order_id: Optional[str] = None,
+                 is_buy: bool = True, attempts: int = 6, delay: float = 0.8,
+                 creds=None) -> Dict[str, Any]:
+    """Ask the exchange what a just-accepted order ACTUALLY filled.
+
+    A successful POST /api/v2/order only means "accepted". The response carries
+    executedQty=0 for an order that has not matched yet - including every MARKET
+    order, which matches a moment later. Reading that zero and concluding "no
+    coins received" is the bug that made a real buy report as unreconciled.
+
+    Strategy, cheapest and most accurate first:
+      1. GET /api/v2/order  -> executedQty (base units), status
+      2. GET /api/v2/myTrades?orderId=<fullOrderId> -> the actual fills, which
+         carry price, qty and quoteQty per fill (authoritative for a MARKET
+         order, whose `price` field is meaningless)
+
+    Returns {} if nothing can be learned; the caller must then say "unknown"
+    rather than invent a number.
+    """
+    k, s = creds or load_credentials()
+
+    def _poll_order():
+        try:
+            res = call_v2("/api/v2/order", method="GET",
+                          params={"symbol": symbol.lower(), "orderId": str(order_id)},
+                          creds=(k, s))
+        except Exception:                                     # noqa: BLE001
+            return None
+        if not isinstance(res, dict):
+            return None
+        qty = float(res.get("executedQty") or 0)
+        price = float(res.get("price") or 0)
+        if qty <= 0:
+            return None
+        return {"coins": qty, "price": price, "idr": qty * price if price else 0.0,
+                "status": str(res.get("status") or ""), "source": "get_order"}
+
+    def _poll_trades():
+        ref = full_order_id or order_id
+        if not ref:
+            return None
+        try:
+            rows = trade_history_v2(symbol, order_id=ref, limit=20, creds=(k, s))
+        except Exception:                                     # noqa: BLE001
+            return None
+        if not rows:
+            return None
+        want_buy = bool(is_buy)
+        fills = [r for r in rows
+                 if r.get("isBuyer") is want_buy
+                 and str(r.get("orderId") or r.get("clientOrderId") or "") == str(ref)]
+        if not fills:
+            # the orderId filter may be ignored by the server; fall back to any
+            # fill on the right side that is newer than a minute
+            fills = [r for r in rows if r.get("isBuyer") is want_buy]
+        if not fills:
+            return None
+        qty = sum(float(r.get("qty") or 0) for r in fills)
+        quote = sum(float(r.get("quoteQty") or 0) for r in fills)
+        fee = sum(float(r.get("commission") or 0)
+                  for r in fills if (r.get("commissionAsset") or "").lower() == "idr")
+        if qty <= 0:
+            return None
+        return {"coins": qty, "idr": quote, "price": (quote / qty) if qty else 0.0,
+                "fee_idr": fee, "fills": len(fills), "source": "myTrades"}
+
+    for i in range(max(1, attempts)):
+        got = _poll_trades() or _poll_order()
+        if got:
+            return got
+        if i < attempts - 1:
+            time.sleep(delay)
+    return {}

@@ -942,18 +942,33 @@ def _trading_log_section(state: dict) -> str:
             f'</div>'
         )
 
-    paper_rows = (open_row or "") + _rows(paper_log)
+    # The pinned OPEN row belongs to the ledger that actually owns the position.
+    # It used to be prepended to the PAPER table only, so in LIVE mode an open
+    # live position appeared in neither table: the history holds COMPLETED
+    # trades, and the only row describing the position was being rendered into
+    # the hidden paper table. The operator saw "HOLDING UAIIDR" in the header
+    # and an empty Live table underneath, and asked - correctly - where it went.
+    _pos_is_live = bool((pos or {}).get("live"))
+    paper_prepend = open_row if (open_row and not _pos_is_live) else ""
+    live_prepend = open_row if (open_row and _pos_is_live) else ""
+
+    paper_rows = (paper_prepend or "") + _rows(paper_log)
     if not paper_rows.strip():
         paper_rows = (
             "<tr><td colspan='12' style='text-align:center; color:#9ca3af; padding:24px;'>"
             f"No completed round-trip trades yet. Engine phase: <b>{phase}</b>.</td></tr>"
         )
 
-    live_rows = _rows(live_log)
+    live_rows = (live_prepend or "") + _rows(live_log)
     if not live_rows.strip():
+        # Say what is actually true: the engine trades live, there is simply
+        # nothing on the ledger yet. The old text claimed real trading was
+        # disabled until paper validation, which stopped being true when the
+        # live executor shipped.
         live_rows = (
             "<tr><td colspan='12' style='text-align:center; color:#9ca3af; padding:20px;'>"
-            "No live trades recorded. Real capital trading disabled until paper phase validation.</td></tr>"
+            f"No completed live trades yet. Engine phase: <b>{phase}</b> · "
+            "an open position or resting order is pinned above this table.</td></tr>"
         )
 
     paper_pager = _pager("paper", paper_total)
@@ -4101,7 +4116,10 @@ async def api_hunt(hunt_id: str):
     Used by the per-hunt PnL performance graph.
     """
     hid = hunt_id.strip().upper()
-    if not re.fullmatch(r"H-\d{4,}", hid):
+    # Live hunts carry an L- prefix (L-00001 ...). The old pattern accepted only
+    # H-####, so every live row in the table was unclickable: the click went to
+    # this endpoint and came back 400 "bad hunt id". Both ledgers are valid.
+    if not re.fullmatch(r"[HL]-\d{4,}", hid):
         return JSONResponse({"error": f"bad hunt id '{hunt_id}'"}, status_code=400)
 
     tick_path = HUNT_TICKS_DIR / f"{hid}.jsonl"
@@ -4130,15 +4148,50 @@ async def api_hunt(hunt_id: str):
         except Exception:
             state = {}
     trade = None
-    for t in state.get("trade_log", []):
-        if (t.get("hunt_id") or "").upper() == hid:
-            trade = t
+    # Both ledgers: an L-#### hunt lives in live_trade_log, so searching only
+    # trade_log meant a live hunt resolved to "no data" even when it existed.
+    for _ledger in ("live_trade_log", "trade_log"):
+        for t in (state.get(_ledger) or []):
+            if not isinstance(t, dict):
+                continue
+            if (t.get("hunt_id") or "").upper() == hid:
+                trade = t
+                break
+        if trade:
             break
 
     if not ticks and not trade:
         return JSONResponse({"error": f"no data for {hid}"}, status_code=404)
 
     symbol = (ticks[0].get("symbol") if ticks else trade.get("symbol")) or "—"
+
+    # Adopted positions (and any hunt whose per-minute log is missing) have no
+    # tick file, which made the graph say "no data" for a trade that plainly
+    # happened. Rebuild the path from the stored 15m candles for the window the
+    # trade was open, so every closed hunt has a graph.
+    ticks_from_candles = False
+    if not ticks and trade and trade.get("entry_time") and trade.get("exit_time"):
+        try:
+            entry_px = float(trade.get("entry_price") or 0) or None
+            rows, _n = _read_candles(str(symbol), n=600)
+            if rows and entry_px:
+                lo = float(trade["entry_time"]) - 900
+                hi = float(trade["exit_time"]) + 900
+                for bar in rows:
+                    bt = float(bar.get("t") or 0)
+                    if bt < lo or bt > hi:
+                        continue
+                    px = float(bar.get("c") or 0)
+                    if px <= 0:
+                        continue
+                    ticks.append({
+                        "t": bt, "last": px, "bid": px, "ask": px,
+                        "pct": round((px - entry_px) / entry_px * 100.0, 4),
+                    })
+                ticks_from_candles = bool(ticks)
+        except Exception:                                    # noqa: BLE001
+            ticks_from_candles = False
+
     entry_price = (ticks[0].get("entry_price") if ticks
                    else (trade or {}).get("entry_price"))
     coins = (trade or {}).get("quantity")
@@ -4162,6 +4215,14 @@ async def api_hunt(hunt_id: str):
         # every recorded tick: t, last, bid, ask, pct  (pct = gross % from entry)
         "ticks": [{k: r.get(k) for k in ("t", "last", "bid", "ask", "pct")}
                   for r in ticks],
+        "ticks_source": ("candles_15m" if ticks_from_candles else "tick_log"),
+        # fees and prices straight from the exchange's own fills
+        "exit_price": (trade or {}).get("exit_price"),
+        "buy_fee_idr": (trade or {}).get("buy_fee_idr"),
+        "sell_fee_idr": (trade or {}).get("sell_fee_idr"),
+        "fees_idr": (trade or {}).get("fees_idr"),
+        "pnl_source": (trade or {}).get("pnl_source"),
+        "adopted": (trade or {}).get("adopted"),
         # How long until price reached +5% above entry, from the 15m candles (the
         # tick log STOPS at exit, so it cannot answer this once the bot has sold).
         # Reported whether or not the trade hit its own TP: the point is to expose

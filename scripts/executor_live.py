@@ -365,11 +365,31 @@ def create_live_market_buy(symbol: str, idr: float, pair_info: dict,
                         coin_symbol=coin_sym, order_type="market")
     ret = resp.get("return") or {}
     order_id = str(ret.get("order_id") or ret.get("id") or "")
+    full_order_id = str(ret.get("full_order_id") or "")
 
     coins = _f(ret.get("receive_coin") or ret.get("get_coin") or ret.get("coin"))
     spent = _f(ret.get("spend_rp") or ret.get("spend") or ret.get("idr")) or float(idr)
-    reconciled = coins > 0
 
+    # A 202-accepted MARKET order reports executedQty=0 in the POST response -
+    # the match happens a moment later. Treating that zero as "no coins" made a
+    # real fill look unreconciled, and the operator was told to go check Indodax
+    # by hand while the bot refused to track the position it had just bought.
+    # Ask the exchange what ACTUALLY filled before deciding.
+    if coins <= 0 and order_id:
+        try:
+            got = live_api.resolve_fill(symbol, order_id,
+                                        full_order_id=full_order_id or None,
+                                        is_buy=True)
+        except Exception:                                     # noqa: BLE001
+            got = {}
+        if got.get("coins"):
+            coins = float(got["coins"])
+            if got.get("idr"):
+                spent = float(got["idr"])
+            if got.get("source") == "myTrades" and got.get("fee_idr"):
+                ret["_fee_idr"] = float(got["fee_idr"])
+
+    reconciled = coins > 0
     entry_price = (spent / coins) if reconciled and coins else 0.0
 
     order = {
@@ -398,7 +418,8 @@ def create_live_market_buy(symbol: str, idr: float, pair_info: dict,
         "filled_coins": coins,
         "filled_idr": spent,
         "reconciled": reconciled,
-        "fees_paid_idr": spent * float(pair_info.get("trade_fee_percent_taker", 0.2)) / 100.0,
+        "fees_paid_idr": float(ret.get("_fee_idr")
+                               or spent * float(pair_info.get("trade_fee_percent_taker", 0.2)) / 100.0),
     }
     fill = {"coins": coins, "idr": spent, "entry_price": entry_price,
             "reconciled": reconciled}
@@ -606,6 +627,25 @@ def execute_live_sell(position: dict, best_bid: float, exit_reason: str,
     received = _f(ret.get("receive") or ret.get("idr_received")
                   or ret.get("filled_idr"))
     filled_coins = _f(ret.get("filled_coin")) or coins
+    full_order_id = str(ret.get("full_order_id") or "")
+
+    # A v2 sell response carries neither `receive` nor `filled_coin` - the POST
+    # acknowledgment only has orderId/executedQty. Leaving exit_price at 0 then
+    # produced a net_pnl of  -cost  i.e. a fabricated -100.00% loss on a trade
+    # that actually made +262 IDR. Resolve the real fill before pricing it.
+    if received <= 0 and order_id:
+        try:
+            got = live_api.resolve_fill(position["symbol"], order_id,
+                                        full_order_id=full_order_id or None,
+                                        is_buy=False)
+        except Exception:                                     # noqa: BLE001
+            got = {}
+        if got.get("idr"):
+            received = float(got["idr"])
+        if got.get("coins"):
+            filled_coins = float(got["coins"])
+        if got.get("fee_idr"):
+            ret["_fee_idr"] = float(got["fee_idr"])
 
     if received > 0:
         exit_price = received / filled_coins if filled_coins else 0.0
@@ -615,12 +655,21 @@ def execute_live_sell(position: dict, best_bid: float, exit_reason: str,
         pending = True
 
     gross = received if received > 0 else 0.0
-    fees = gross * fee_pct / 100.0 if gross else 0.0
+    fees = float(ret.get("_fee_idr") or (gross * fee_pct / 100.0 if gross else 0.0))
     net = gross - fees
     cost = float(position.get("filled_idr")
                  or position["entry_price"] * coins)
-    net_pnl_idr = net - cost
-    net_pnl_pct = (net_pnl_idr / cost * 100.0) if cost else 0.0
+    if pending:
+        # The sell happened but the exchange has not told us the proceeds yet.
+        # A number here would be invented: 0 - cost reads as -100%. Record the
+        # P&L as UNKNOWN (None), exactly like an external sell, and let the
+        # reconciler fill it in once myTrades reports the fill.
+        net_pnl_idr = None
+        net_pnl_pct = None
+        exit_price = None
+    else:
+        net_pnl_idr = net - cost
+        net_pnl_pct = (net_pnl_idr / cost * 100.0) if cost else 0.0
 
     trade_record = {
         "hunt_id": position.get("hunt_id"),
@@ -632,8 +681,13 @@ def execute_live_sell(position: dict, best_bid: float, exit_reason: str,
         "entry_price": position["entry_price"],
         "exit_price": exit_price,
         "quantity": coins,
-        "gross_pnl_idr": gross - cost,
+        "gross_pnl_idr": (None if pending else gross - cost),
         "fees_idr": fees,
+        # Split, both from the exchange: the buy fee was paid at entry (and is
+        # already inside cost when known), the sell fee is on this fill.
+        "buy_fee_idr": float(position.get("entry_fee_idr") or 0.0),
+        "sell_fee_idr": float(ret.get("_fee_idr") or fees or 0.0),
+        "pnl_source": ("myTrades" if ret.get("_fee_idr") else "computed"),
         "net_pnl_idr": net_pnl_idr,
         "net_pnl_pct": net_pnl_pct,
         "entry_time": position.get("entry_time"),
@@ -1121,17 +1175,53 @@ def sync_with_exchange(state: dict, framework: str, tick: float,
         out["reason"] = f"cannot price {coin}, so it cannot be adopted safely"
         return out
 
-    hunt_id = f"L-ADOPT-{coin}"
+    # The operator reads these ids as "which hunt is this" -- L-00001 is the
+    # first live hunt. A fabricated "L-ADOPT-UAI" broke that sequence and, worse,
+    # could not be opened as a graph because no tick file is named after it.
+    # Adoption is a live hunt like any other; it just starts without an entry
+    # the bot chose. The ADOPTED tag on the row already says so.
+    try:
+        from hunt_log import next_hunt_id as _next_id
+        hunt_id = _next_id(state, live=True)
+    except Exception:                                        # noqa: BLE001
+        hunt_id = f"L-{int(state.get('live_hunt_counter') or 0) + 1:05d}"
+        state["live_hunt_counter"] = int(state.get("live_hunt_counter") or 0) + 1
+
+    # #4: ASK THE EXCHANGE FIRST. The market price at adoption is a guess; the
+    # fills are the truth. true_entry_price() walks this account's BUY fills for
+    # the pair and returns the quantity-weighted price plus the IDR fee paid, so
+    # the position starts from what was really paid instead of from whatever the
+    # ticker happened to say when the bot looked.
+    true = {}
+    try:
+        true = true_entry_price(coin, amount)
+    except Exception:                                        # noqa: BLE001
+        true = {}
+
+    if true.get("ok") and true.get("price"):
+        price = float(true["price"])
+        source = "exchange_fills"
+    else:
+        source = "market_at_adoption"
+
     adopted = adopt_position(coin, amount, price, tick, hunt_id, framework,
-                             now=now)
+                             now=now, source=source)
     if adopted.get("error"):
         out["action"] = "UNMANAGED"
         out["reason"] = adopted["error"]
         return out
 
+    if adopted.get("adopted") and true.get("ok"):
+        adopted["entry_fee_idr"] = round(float(true.get("fee_idr") or 0.0), 2)
+        adopted["entry_fills"] = int(true.get("fills") or 0)
+        adopted["cost_idr"] = round(float(amount) * float(adopted["entry_price"])
+                                    + float(true.get("fee_idr") or 0.0), 2)
+        adopted["entry_source"] = "exchange_fills"
+
     out["action"] = "ADOPTED"
     out["position"] = adopted
     out["adopted"] = adopted
+    out["entry_truth"] = true
     out["value_idr"] = value
     out["unmanaged"] = {c: a for c, a in ranked[1:]}
     return out
@@ -1541,10 +1631,22 @@ def _self_check():
             return {"success": 1, "return": {"order_id": f"x{self._n}"}}
 
     ex5 = NoProceeds()
-    rec5, s5 = execute_live_sell(dict(pos4), 990.0, EXIT_HARD_SL, now=3.0, client=ex5)
+    # resolve_fill must not be allowed to reach the network from a self-check.
+    _saved = live_api.resolve_fill
+    live_api.resolve_fill = lambda *a, **k: {}
+    try:
+        rec5, s5 = execute_live_sell(dict(pos4), 990.0, EXIT_HARD_SL,
+                                     now=3.0, client=ex5)
+    finally:
+        live_api.resolve_fill = _saved
     assert s5["pending_reconciliation"] is True, s5
-    assert rec5["exit_price"] == 0.0
-    print("[PASS] a sell without reported proceeds is flagged, not invented")
+    # An unknown fill is UNKNOWN, not zero. Recording 0 here is what produced a
+    # fabricated -100% loss on a trade that actually won.
+    assert rec5["exit_price"] is None, rec5
+    assert rec5["net_pnl_idr"] is None, rec5
+    assert rec5["net_pnl_pct"] is None, rec5
+    print("[PASS] a sell without reported proceeds is flagged as UNKNOWN, "
+          "not as a -100% loss")
 
     # --- 6. preflight blocks when the balance cannot cover the trade --------
     ex6 = FakeExchange(idr=5000.0)
@@ -2119,3 +2221,147 @@ def _self_check():
 
 if __name__ == "__main__":
     _self_check()
+
+
+def repair_live_ledger(state: dict, apply: bool = False,
+                       client=None) -> Dict[str, Any]:
+    """Reprice live trades whose exit price was never learned.
+
+    A v2 sell acknowledgement carries no proceeds. The old code left
+    exit_price at 0 and computed net = 0 - cost, which is exactly -100%: a
+    fabricated total loss. This walks the live ledger, finds rows carrying that
+    signature (no exit price at all, or an impossible -100%), asks the exchange
+    for the real fills of that symbol, and rewrites the row with what actually
+    happened.
+
+    `apply=False` only reports. Nothing is written unless asked, because this
+    edits the record of money that was really spent.
+    """
+    import time as _t
+    out = {"scanned": 0, "repaired": [], "skipped": [], "apply": apply}
+    log = state.get("live_trade_log") or []
+    cache = {}
+
+    for t in log:
+        out["scanned"] += 1
+        if not isinstance(t, dict):
+            continue
+        if t.get("pnl_known") is False:
+            continue
+        exit_price = t.get("exit_price")
+        net = t.get("net_pnl_idr")
+        cost = None
+        try:
+            cost = float(t.get("cost_idr") or 0) or None
+        except (TypeError, ValueError):
+            cost = None
+        if cost is None:
+            try:
+                cost = float(t.get("entry_price") or 0) * float(t.get("quantity") or 0)
+            except (TypeError, ValueError):
+                cost = None
+
+        # signature: no exit price, or a P&L equal to minus the whole cost
+        bad = (not exit_price) or (net is not None and cost and
+                                   abs(float(net) + cost) < max(1.0, cost * 0.001))
+        if not bad:
+            continue
+
+        sym = (t.get("symbol") or "").lower()
+        if not sym:
+            out["skipped"].append({"hunt_id": t.get("hunt_id"), "why": "no symbol"})
+            continue
+        if sym not in cache:
+            try:
+                cache[sym] = live_api.trade_history_v2(sym, limit=50, days=30)
+            except Exception:                                 # noqa: BLE001
+                cache[sym] = []
+        rows = sorted([r for r in cache[sym] if isinstance(r, dict)],
+                      key=lambda r: r.get("time") or 0)
+
+        qty = 0.0
+        try:
+            qty = float(t.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+
+        # match the SELL fills for this quantity, newest-first search
+        sells = [r for r in rows if not r.get("isBuyer")]
+        buys = [r for r in rows if r.get("isBuyer")]
+        pick = None
+        for r in reversed(sells):
+            try:
+                if qty and abs(float(r.get("qty") or 0) - qty) < max(1e-9, qty * 1e-6):
+                    pick = r
+                    break
+            except (TypeError, ValueError):
+                continue
+        if pick is None and sells:
+            pick = sells[-1]
+
+        if pick is None:
+            out["skipped"].append({"hunt_id": t.get("hunt_id"),
+                                   "why": "no matching sell fill on the exchange"})
+            continue
+
+        proceeds = float(pick.get("quoteQty") or 0)
+        fee = float(pick.get("commission") or 0)
+        if (pick.get("commissionAsset") or "").lower() != "idr":
+            fee = 0.0
+        e_qty = float(pick.get("qty") or 0) or qty
+        new_exit = (proceeds / e_qty) if e_qty else None
+
+        # entry side: the matching buy fill, for an honest cost basis
+        new_cost = cost
+        buy_fee_total = 0.0
+        entry_pick = None
+        for r in reversed(buys):
+            try:
+                if qty and abs(float(r.get("qty") or 0) - qty) < max(1e-9, qty * 1e-6):
+                    entry_pick = r
+                    break
+            except (TypeError, ValueError):
+                continue
+        if entry_pick is not None:
+            bq = float(entry_pick.get("quoteQty") or 0)
+            bf = float(entry_pick.get("commission") or 0)
+            if (entry_pick.get("commissionAsset") or "").lower() != "idr":
+                bf = 0.0
+            buy_fee_total = bf
+            new_cost = bq + bf
+
+        net_idr = proceeds - fee - (new_cost or 0)
+        net_pct = (net_idr / new_cost * 100.0) if new_cost else None
+
+        change = {
+            "hunt_id": t.get("hunt_id"),
+            "symbol": t.get("symbol"),
+            "was_exit_price": exit_price,
+            "was_net_pnl_idr": net,
+            "exit_price": round(new_exit, 4) if new_exit else None,
+            "net_pnl_idr": round(net_idr, 2),
+            "net_pnl_pct": round(net_pct, 4) if net_pct is not None else None,
+            "cost_idr": round(new_cost, 2) if new_cost else None,
+            "buy_fee_idr": round(buy_fee_total, 2),
+            "sell_fee_idr": round(fee, 2),
+            "source": "myTrades",
+        }
+        out["repaired"].append(change)
+
+        if apply:
+            t["exit_price"] = change["exit_price"]
+            t["net_pnl_idr"] = change["net_pnl_idr"]
+            t["net_pnl_pct"] = change["net_pnl_pct"]
+            if change["cost_idr"]:
+                t["cost_idr"] = change["cost_idr"]
+            # Both fees, from the exchange's own fills. Leaving these blank
+            # would make the row's arithmetic unverifiable.
+            buy_fee = float(change.get("buy_fee_idr") or 0.0)
+            sell_fee = float(fee or 0.0)
+            t["buy_fee_idr"] = round(buy_fee, 2)
+            t["sell_fee_idr"] = round(sell_fee, 2)
+            t["fees_idr"] = round(buy_fee + sell_fee, 2)
+            t["pnl_known"] = True
+            t["pnl_source"] = "myTrades"
+            t["repaired_at"] = _t.time()
+    return out

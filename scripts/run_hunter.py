@@ -1843,6 +1843,9 @@ def main():
     if "--clear-stale-order" in sys.argv:
         run_clear_stale_order(force=("--force" in sys.argv))
         return
+    if "--repair-live-ledger" in sys.argv:
+        run_repair_live_ledger(apply=("--apply" in sys.argv))
+        return
     if "--buy-now" in sys.argv:
         # --buy-now SYMBOL [--paper]
         args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -1966,6 +1969,31 @@ def run_sell_now():
     except Exception as e:                                  # noqa: BLE001
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
         sys.exit(1)
+    finally:
+        release_lock(lock_fd)
+    sys.exit(0)
+
+
+def run_repair_live_ledger(apply: bool = False):
+    """Reprice live trades whose proceeds were never learned.
+
+    A v2 sell acknowledgement carries no proceeds, and the old code turned that
+    into exit_price=0 / net=-cost, i.e. a fabricated -100% loss on a winning
+    trade. This asks myTrades for the real fills and rewrites the row.
+
+    Dry run by default: it prints what it would change. Pass --apply to write.
+    """
+    import executor_live
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "error": "engine tick in progress"}))
+        sys.exit(2)
+    try:
+        state = load_state()
+        res = executor_live.repair_live_ledger(state, apply=apply)
+        if apply and res.get("repaired"):
+            save_state(state)
+        print(json.dumps(res, indent=2))
     finally:
         release_lock(lock_fd)
     sys.exit(0)
