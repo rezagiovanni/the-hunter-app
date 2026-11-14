@@ -849,7 +849,8 @@ def _trading_log_section(state: dict) -> str:
                 f"<td class='num' title='still open: no exit price yet'>—</td>"
                 f"<td class='num'>{coins}</td>"
                 f"{pnl_cells}"
-                f"<td><button class='sell-now' type='button'"
+                f"<td class='act'><button class='sell-now' type='button'"
+                f" title='market sell {p.get('symbol','')} now'"
                 f" onclick=\"sellNow('{p.get('symbol','')}', this)\">SELL NOW</button></td></tr>"
             )
         if o:
@@ -1832,6 +1833,67 @@ def _style():
             background: rgba(239,68,68,.12);
             border-color: #f87171;
             color: #f87171;
+        }
+        /* SELL NOW — destructive action inside the pinned open-position row */
+        .board td.act { white-space: nowrap; }
+        .sell-now {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 12px;
+            border-radius: 999px;
+            border: 1px solid rgba(239,68,68,.35);
+            background: rgba(239,68,68,.08);
+            color: #f87171;
+            font-family: inherit;
+            font-size: 0.68em;
+            font-weight: 700;
+            letter-spacing: 0.6px;
+            line-height: 1;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: background .15s, border-color .15s, color .15s,
+                        box-shadow .15s, transform .1s;
+        }
+        .sell-now::before {
+            content: "";
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: currentColor;
+            flex: 0 0 auto;
+        }
+        .sell-now:hover:not(:disabled) {
+            background: rgba(239,68,68,.18);
+            border-color: #ef4444;
+            color: #fca5a5;
+            box-shadow: 0 0 0 3px rgba(239,68,68,.10);
+            transform: translateY(-1px);
+        }
+        .sell-now:active:not(:disabled) {
+            transform: translateY(0);
+            background: rgba(239,68,68,.26);
+        }
+        .sell-now:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(239,68,68,.28);
+        }
+        .sell-now:disabled {
+            opacity: 0.6;
+            cursor: progress;
+            background: rgba(239,68,68,.05);
+            border-color: rgba(239,68,68,.2);
+            color: #b45309;
+        }
+        .sell-now:disabled::before {
+            animation: sellPulse 1s ease-in-out infinite;
+        }
+        @keyframes sellPulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.25; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .sell-now, .sell-now::before { transition: none; animation: none; }
         }
         .unknown-n, .pending-n {
             font-size: 0.72em;
