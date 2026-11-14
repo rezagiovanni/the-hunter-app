@@ -1829,9 +1829,99 @@ def _style():
         .mode-btn .dot.live { background: var(--accent-red); }
         .trade-log-container { margin-top: 16px; }
         /* Sign-in page */
-        .signin-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
-        .signin-card { width: 100%; max-width: 420px; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 32px; box-shadow: var(--shadow); }
-        .signin-card h1 { margin-bottom: 6px; font-size: 1.6rem; }
+        .signin-page {
+            position: relative;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            overflow: hidden;
+            background: var(--bg-primary);
+        }
+        .signin-bg {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+            overflow: hidden;
+            background:
+                linear-gradient(180deg, rgba(34,211,238,0.04) 0%, transparent 40%),
+                radial-gradient(ellipse at 50% 120%, rgba(52,211,153,0.06) 0%, transparent 60%),
+                var(--bg-primary);
+        }
+        .signin-bg .grid-overlay {
+            position: absolute;
+            inset: -100px;
+            background-image:
+                linear-gradient(rgba(34,211,238,0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(34,211,238,0.05) 1px, transparent 1px);
+            background-size: 48px 48px;
+            transform: perspective(600px) rotateX(38deg) scale(2.4);
+            transform-origin: center 20%;
+            mask-image: linear-gradient(180deg, transparent 0%, #000 35%, transparent 75%);
+            -webkit-mask-image: linear-gradient(180deg, transparent 0%, #000 35%, transparent 75%);
+            animation: gridScroll 14s linear infinite;
+        }
+        @keyframes gridScroll {
+            0%   { background-position: 0 0, 0 0; }
+            100% { background-position: 0 48px, 48px 0; }
+        }
+        .signin-bg .orb {
+            position: absolute;
+            border-radius: 50%;
+            filter: blur(60px);
+            opacity: 0.35;
+            will-change: transform, opacity;
+        }
+        .signin-bg .orb-1 {
+            width: 340px; height: 340px;
+            background: radial-gradient(circle, #22d3ee 0%, transparent 70%);
+            top: 8%; left: 6%;
+            animation: drift1 22s ease-in-out infinite;
+        }
+        .signin-bg .orb-2 {
+            width: 280px; height: 280px;
+            background: radial-gradient(circle, #34d399 0%, transparent 70%);
+            bottom: 10%; right: 8%;
+            animation: drift2 26s ease-in-out infinite;
+        }
+        .signin-bg .orb-3 {
+            width: 200px; height: 200px;
+            background: radial-gradient(circle, #a78bfa 0%, transparent 70%);
+            top: 55%; left: 38%;
+            animation: drift3 30s ease-in-out infinite;
+            opacity: 0.22;
+        }
+        @keyframes drift1 {
+            0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.30; }
+            50%      { transform: translate(60px, 40px) scale(1.15); opacity: 0.45; }
+        }
+        @keyframes drift2 {
+            0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.28; }
+            50%      { transform: translate(-70px, -50px) scale(1.2); opacity: 0.42; }
+        }
+        @keyframes drift3 {
+            0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.18; }
+            50%      { transform: translate(40px, -60px) scale(1.25); opacity: 0.30; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .signin-bg .grid-overlay,
+            .signin-bg .orb { animation: none; }
+        }
+        .signin-card {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 420px;
+            background: rgba(17, 24, 39, 0.82);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 32px;
+            box-shadow: 0 0 0 1px rgba(34,211,238,0.08), 0 20px 60px rgba(0,0,0,0.55);
+        }
+                        .signin-card h1 { margin-bottom: 6px; font-size: 1.6rem; }
         .signin-card .subtitle { margin-bottom: 24px; color: var(--text-secondary); }
         .field { margin-bottom: 16px; }
         .field label { display: block; font-size: 0.75em; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
@@ -2313,33 +2403,53 @@ CHART_JS = """
                     const c2 = ok === null ? '#94a3b8' : (ok ? '#22c55e' : '#ef4444');
                     const mins = Math.max(0, Math.round((t.exit_time - t.entry_time) / 60));
                     const held = mins >= 60 ? `${(mins / 60).toFixed(1)}h` : `${mins}m`;
+                    // net_pnl_idr is IDR; show it beside the percent, with an
+                    // explicit sign per the honest-PnL rule.
+                    const pnlIdr = t.net_pnl_idr == null ? null
+                        : Math.round(t.net_pnl_idr).toLocaleString();
+                    const pnlIdrTxt = pnlIdr == null ? 'unknown'
+                        : (t.net_pnl_idr >= 0 ? '+' : '-') + 'IDR ' + pnlIdr.replace('-', '');
                     tradeHtml =
-                        `<div style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(148,163,184,.35)">` +
-                        `<b style="color:${c2}">${t.hunt_id}</b> &nbsp;` +
+                        `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(148,163,184,.35)">` +
+                        `<div><b style="color:${c2}">${t.hunt_id}</b> &nbsp;` +
                         // net_pnl_pct is ALREADY a percentage (-5.2249 means
                         // -5.22%), not a fraction. Multiplying by 100 here
                         // printed +128% for a +1.28% trade.
                         `<span style="color:${c2}">${t.net_pnl_pct >= 0 ? '+' : ''}` +
-                        `${t.net_pnl_pct.toFixed(2)}%</span><br>` +
-                        `${t.exit_reason}<br>` +
-                        `held ${held} &nbsp; FW ${t.framework || '?'}` +
+                        `${t.net_pnl_pct.toFixed(2)}%</span>` +
+                        (pnlIdr == null ? '' : ` &nbsp; <span style="color:${c2}">${pnlIdrTxt}</span>`) +
+                        `</div>` +
+                        `<div style="margin-top:2px;">Entry ${t.entry_price ? Math.round(t.entry_price).toLocaleString() : '—'}` +
+                        ` → Exit ${t.exit_price ? Math.round(t.exit_price).toLocaleString() : '—'}</div>` +
+                        `<div style="margin-top:2px;">${t.exit_reason}</div>` +
+                        `<div style="margin-top:2px;">held ${held} &nbsp; FW ${t.framework || '?'}</div>` +
                         `</div>`;
                 }
 
+                // Rich candle tooltip: time, full OHLCV, change %, and
+                // the historical trade under the cursor when one exists.
+                const volNum = Number(c.v);
+                const volStr = volNum >= 1e9
+                    ? (volNum / 1e9).toFixed(2) + 'B'
+                    : volNum >= 1e6
+                        ? (volNum / 1e6).toFixed(2) + 'M'
+                        : volNum >= 1e3
+                            ? (volNum / 1e3).toFixed(1) + 'K'
+                            : fmtPrice(c.v);
                 tooltip.style.display = 'block';
                 tooltip.innerHTML =
-                    `<b>${fmtTime(c.t, tf)} WIB</b><br>` +
-                    `O ${fmtPrice(c.o)} &nbsp; H ${fmtPrice(c.h)}<br>` +
-                    `L ${fmtPrice(c.l)} &nbsp; C <span style="color:${col}">${fmtPrice(c.c)}</span><br>` +
-                    `<span style="color:${col}">${pct >= 0 ? '+' : ''}${pct}%</span> &nbsp; Vol ${fmtPrice(c.v)}` +
+                    `<div style="margin-bottom:4px;"><b>${fmtTime(c.t, tf)} WIB</b></div>` +
+                    `<div>O <b>${fmtPrice(c.o)}</b> &nbsp; H <b>${fmtPrice(c.h)}</b></div>` +
+                    `<div>L <b>${fmtPrice(c.l)}</b> &nbsp; C <b style="color:${col}">${fmtPrice(c.c)}</b></div>` +
+                    `<div>Vol <b>${volStr}</b> &nbsp; <span style="color:${col}">${pct >= 0 ? '+' : ''}${pct}%</span></div>` +
                     tradeHtml;
-                const tipW = hit ? 180 : 160;
+                const tipW = hit ? 190 : 170;
                 let tx = xx + 12;
                 if (tx + tipW > W) {
                     tx = Math.max(4, xx - tipW - 12);
                 }
                 tooltip.style.left = tx + 'px';
-                tooltip.style.top = Math.max(4, Math.min(H - (hit ? 120 : 85), y(c.c) - 10)) + 'px';
+                tooltip.style.top = Math.max(4, Math.min(H - (hit ? 130 : 95), y(c.c) - 10)) + 'px';
             } else {
                 if (tooltip) tooltip.style.display = 'none';
             }
@@ -3198,15 +3308,6 @@ CHART_JS = """
     // Refresh — re-fetch the page from the server without an F5.
     // Preserves page (home/others), trading mode (paper/live) and scroll.
     // ----------------------------------------------------------------------
-    function showToast(msg) {
-        const t = document.getElementById('toast');
-        if (!t) return;
-        t.textContent = msg;
-        t.classList.add('show');
-        clearTimeout(showToast._tid);
-        showToast._tid = setTimeout(() => t.classList.remove('show'), 1600);
-    }
-
     function currentPage() {
         // Every page must be listed here. This knew only about 'others' and
         // 'home', so a refresh pressed while on Settings recorded the page as
@@ -3722,6 +3823,16 @@ CHART_JS = """
 
 
 PAGE_JS = """
+    function showToast(msg) {
+        var t = document.getElementById('toast');
+        if (!t) return;
+        t.textContent = msg;
+        t.classList.add('show');
+        clearTimeout(showToast._tid);
+        showToast._tid = setTimeout(function () {
+            t.classList.remove('show');
+        }, 2200);
+    }
     // ---- Manual market exit ----
     // Sells the open position at the best bid and keeps hunting. NOT the same as
     // STOP: STOP liquidates and parks the engine. A confirmation is deliberate -
@@ -3807,13 +3918,23 @@ PAGE_JS = """
     function signInAccount(btn) {
         var keyInput = document.getElementById('inputApiKey');
         var secretInput = document.getElementById('inputApiSecret');
+        var statusEl = document.getElementById('signinStatus');
         var key = keyInput ? keyInput.value.trim() : '';
         var secret = secretInput ? secretInput.value.trim() : '';
+        function setStatus(msg, isError) {
+            if (statusEl) {
+                statusEl.textContent = msg;
+                statusEl.style.color = isError
+                    ? 'var(--accent-red, #f87171)'
+                    : 'var(--accent-2, #34d399)';
+            }
+        }
         if (!key || !secret) {
-            alert('Please enter both your API Key and Secret.');
+            setStatus('Please enter both your API Key and Secret.', true);
             return;
         }
         if (btn) { btn.disabled = true; btn.textContent = 'CONNECTING...'; }
+        setStatus('Validating key with Indodax...', false);
         fetch('/api/account/signin', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3823,15 +3944,18 @@ PAGE_JS = """
             .then(function (res) {
                 var d = res.d || {};
                 if (res.status === 200 && d.ok) {
-                    showToast('Connected (' + (d.version || 'v2').toUpperCase() + ')! Profile: ' + (d.account_id || ''));
-                    setTimeout(function () { window.location.href = '/'; }, 1200);
+                    setStatus('Connected (' + (d.version || 'v2').toUpperCase() + ') · Profile ' +
+                              (d.account_id || '') + ' · Loading dashboard...', false);
+                    // Redirect immediately — the credentials are saved and
+                    // validated server-side; no reason to wait for a toast.
+                    window.location.replace('/');
                 } else {
-                    showToast('Connection failed: ' + (d.error || 'Check key and secret'));
+                    setStatus('Connection failed: ' + (d.error || 'Check key and secret'), true);
                     if (btn) { btn.disabled = false; btn.textContent = 'CONNECT & SIGN IN'; }
                 }
             })
             .catch(function (e) {
-                showToast('Connection failed: ' + e);
+                setStatus('Connection failed: ' + e, true);
                 if (btn) { btn.disabled = false; btn.textContent = 'CONNECT & SIGN IN'; }
             });
     }
@@ -5054,11 +5178,6 @@ async def dashboard():
                 </div>
             </button>
         </div>
-        <div class="drawer-bottom">
-            <div><b>The Hunter Trading Engine</b></div>
-            <div>Hunting engine · Paper Mode</div>
-            <div>ZeroTier: 10.36.20.175:8082</div>
-        </div>
     </div>
     <div class="nav-overlay" id="navOverlay" onclick="toggleNav()"></div>
 
@@ -5144,7 +5263,7 @@ async def dashboard():
             <div class="chart-tip">Tip: Touch & drag across chart to inspect OHLCV candles. Timeframe auto-sets range (15m→7d, 1h→30d, 1D→full).</div>
             <div class="chart-wrap">
                 <canvas id="chart"></canvas>
-                <div id="tooltip"></div>
+                <div id="tooltip" class="chart-tooltip" style="display:none;"></div>
             </div>
             <div class="chart-sub-hint" style="font-size:0.75em; color:var(--text-muted); margin-top:8px;">
                 💡 Scroll mouse wheel or pinch to zoom in/out · Drag canvas to pan left/right · Double-click to reset view
@@ -5237,6 +5356,12 @@ async def signin_page():
 </head>
 <body>
     <div class="signin-page">
+        <div class="signin-bg" aria-hidden="true">
+            <div class="grid-overlay"></div>
+            <div class="orb orb-1"></div>
+            <div class="orb orb-2"></div>
+            <div class="orb orb-3"></div>
+        </div>
         <div class="signin-card">
             <h1>The Hunter</h1>
             <div class="subtitle">Connect your Indodax API key to open the dashboard</div>
