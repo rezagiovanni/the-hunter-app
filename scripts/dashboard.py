@@ -826,7 +826,7 @@ def _trading_log_section(state: dict) -> str:
             target_txt = f"{target:,.0f}" if target else "—"
             hid_disp = hunt_id or "•"
             hid_html = (
-                f"<span class='hunt-link' onclick=\"openHuntPage('{hunt_id}', this)\">{hid_disp}</span>"
+                f"<span class='hunt-link' data-hunt='{hunt_id}' role='button' tabindex='0'>{hid_disp}</span>"
                 if hunt_id else hid_disp
             )
             # Hold is measured from when the position actually opened. An adopted
@@ -925,7 +925,7 @@ def _trading_log_section(state: dict) -> str:
             hold = _fmt_duration(t.get("entry_time"), t.get("exit_time"))
             out += (
                 f"<tr class='trade-row'{hidden}>"
-                f"<td class='num'><span class='hunt-link' onclick=\"openHuntPage('{t.get('hunt_id') or ''}', this)\">{t.get('hunt_id') or '—'}</span></td>"
+                f"<td class='num'><span class='hunt-link' data-hunt='{t.get('hunt_id') or ''}' role='button' tabindex='0'>{t.get('hunt_id') or '—'}</span></td>"
                 f"<td>{_fmt_epoch(ts)}</td>"
                 f"<td><b>{t.get('symbol', '—')}</b></td>"
                 + _source_cell(t.get('adopted')) +
@@ -1836,6 +1836,40 @@ def _style():
         }
         /* SELL NOW — destructive action inside the pinned open-position row */
         .board td.act { white-space: nowrap; }
+        /* Hunt ID — a real tap target, not a 45x15 text run.
+           On a phone the un-styled span was 15px tall: well under the 44px
+           minimum, and invisible as a control (cursor:auto, no affordance).
+           It also relied on an inline onclick, which some mobile browsers do
+           not deliver because the touch lands during scroll detection. */
+        .hunt-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 44px;
+            min-height: 32px;
+            padding: 6px 10px;
+            margin: -6px -4px;
+            border-radius: 7px;
+            font-variant-numeric: tabular-nums;
+            font-weight: 700;
+            color: var(--accent);
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+            transition: background .14s, color .14s;
+        }
+        .hunt-link:hover { background: rgba(56,189,248,.10); }
+        .hunt-link:active { background: rgba(56,189,248,.20); }
+        .hunt-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        @media (max-width: 768px) {
+            /* phones get the full 44px target and a rule that makes the whole
+               cell tappable */
+            .hunt-link { min-height: 44px; min-width: 64px; margin: -10px -6px; }
+            .board td.num:first-child { padding: 0; }
+        }
+
         .sell-now {
             display: inline-flex;
             align-items: center;
@@ -3532,6 +3566,49 @@ CHART_JS = """
     let huntChartData = null;
     let activeHuntDetailRow = null;
     let activeHuntTrigger = null;
+
+    // Hunt ID activation.
+    //
+    // This is delegated from the document and driven by `pointerup` rather than
+    // an inline onclick. The inline version worked with a mouse but not on a
+    // phone: the Hunt ID was a bare inline span only ~15px tall, so a tap had
+    // to land on a sliver of text, and mobile browsers defer synthetic click
+    // events while they decide whether the gesture is a scroll. pointerup is
+    // delivered as soon as the finger lifts, and one listener covers rows that
+    // are rendered after it was bound.
+    //
+    // A small movement tolerance keeps a scroll-drag across a Hunt ID from
+    // opening a graph the user never meant to open.
+    (function bindHuntLinks() {
+        if (window.__huntLinksBound) return;
+        window.__huntLinksBound = true;
+        let downAt = null;
+        const target = ev => {
+            const el = ev.target && ev.target.closest
+                ? ev.target.closest('.hunt-link') : null;
+            return el && el.dataset.hunt ? el : null;
+        };
+        document.addEventListener('pointerdown', ev => {
+            const el = target(ev);
+            downAt = el ? { x: ev.clientX, y: ev.clientY, el: el } : null;
+        }, { passive: true });
+        document.addEventListener('pointerup', ev => {
+            const el = target(ev);
+            if (!el || !downAt || downAt.el !== el) { downAt = null; return; }
+            const moved = Math.abs(ev.clientX - downAt.x) + Math.abs(ev.clientY - downAt.y);
+            downAt = null;
+            if (moved > 12) return;              // it was a scroll, not a tap
+            openHuntPage(el.dataset.hunt, el);
+        });
+        // keyboard: Enter/Space on the focused Hunt ID
+        document.addEventListener('keydown', ev => {
+            if (ev.key !== 'Enter' && ev.key !== ' ') return;
+            const el = target(ev);
+            if (!el) return;
+            ev.preventDefault();
+            openHuntPage(el.dataset.hunt, el);
+        });
+    }());
 
     function openHuntPage(huntId, trigger) {
         if (!huntId || huntId === '—' || huntId === '•' || !trigger) return;
