@@ -1912,6 +1912,12 @@ def _style():
             outline: none;
             box-shadow: 0 0 0 3px rgba(239,68,68,.28);
         }
+        .sell-now.armed {
+            background: rgba(239,68,68,.30);
+            border-color: #ef4444;
+            color: #fff;
+            box-shadow: 0 0 0 3px rgba(239,68,68,.25);
+        }
         .sell-now:disabled {
             opacity: 0.6;
             cursor: progress;
@@ -4075,6 +4081,38 @@ CHART_JS = """
 
 
 PAGE_JS = """
+    // ------------------------------------------------------------------
+    // FAIL LOUDLY. A JavaScript error in this file silently disables every
+    // handler in it: no console for a phone user, no visual change, and the
+    // buttons simply stop responding. That is exactly how a one-character
+    // string bug left SELL NOW dead with no error shown. Anything uncaught
+    // now surfaces on screen.
+    // ------------------------------------------------------------------
+    (function surfaceErrors() {
+        if (window.__errorsSurfaced) return;
+        window.__errorsSurfaced = true;
+        function show(msg) {
+            var box = document.getElementById('jsErrorBox');
+            if (!box) {
+                box = document.createElement('div');
+                box.id = 'jsErrorBox';
+                box.style.cssText = 'position:fixed;left:8px;right:8px;bottom:8px;z-index:99999;'
+                    + 'background:#7f1d1d;color:#fff;border:1px solid #ef4444;border-radius:8px;'
+                    + 'padding:10px 12px;font:12px/1.4 monospace;box-shadow:0 6px 24px rgba(0,0,0,.5);';
+                document.body.appendChild(box);
+            }
+            box.textContent = 'Dashboard script error: ' + msg;
+            box.style.display = 'block';
+        }
+        window.addEventListener('error', function (e) {
+            if (e && e.message) show(e.message);
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+            var r = e && e.reason;
+            show((r && (r.message || r)) || 'unhandled rejection');
+        });
+    }());
+
     function showToast(msg) {
         var t = document.getElementById('toast');
         if (!t) return;
@@ -4213,12 +4251,33 @@ PAGE_JS = """
     }
 
     function sellNow(symbol, btn) {
-        var msg = 'Market sell ' + symbol + ' now?';
-        msg += String.fromCharCode(10, 10);
-        msg += 'This exits at the best bid, records the trade and sets a cooldown on the pair. ';
-        msg += 'Hunting continues.';
-        if (!confirm(msg)) return;
-        if (btn) { btn.disabled = true; btn.textContent = 'SELLING...'; }
+        // Two-tap confirmation, done in the page.
+        //
+        // This used window.confirm(), which is a silent trap: if the browser
+        // is suppressing dialogs (Chrome offers "Suppress dialogs" after the
+        // first one), confirm() returns false forever. The button then did
+        // nothing at all, with no error and no feedback - indistinguishable
+        // from a broken button. An in-page confirm cannot be suppressed.
+        if (btn && btn.dataset.armed !== '1') {
+            btn.dataset.armed = '1';
+            btn.dataset.label = btn.textContent;
+            btn.textContent = 'CONFIRM?';
+            btn.classList.add('armed');
+            clearTimeout(btn._armTid);
+            btn._armTid = setTimeout(function () {
+                btn.dataset.armed = '';
+                btn.textContent = btn.dataset.label || 'SELL NOW';
+                btn.classList.remove('armed');
+            }, 4000);
+            return;
+        }
+        if (btn) {
+            clearTimeout(btn._armTid);
+            btn.dataset.armed = '';
+            btn.classList.remove('armed');
+            btn.disabled = true;
+            btn.textContent = 'SELLING...';
+        }
         fetch('/api/position/sell', { method: 'POST' })
             .then(function (r) { return r.json().then(function (d) {
                 return { status: r.status, d: d }; }); })
@@ -4237,7 +4296,8 @@ PAGE_JS = """
                     if (/^[A-Za-z]*Error:/.test(why)) {
                         why = 'the bot hit an internal error while selling. '
                             + 'The position is still open on the exchange - '
-                            + 'try again, and check the pair in Indodax.\n\n'
+                            + 'try again, and check the pair in Indodax.'
+                            + String.fromCharCode(10, 10)
                             + why;
                     }
                     window.alert('Sell failed: ' + why);
