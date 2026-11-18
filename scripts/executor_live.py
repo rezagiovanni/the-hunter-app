@@ -677,7 +677,13 @@ def execute_live_sell(position: dict, best_bid: float, exit_reason: str,
         "pair_id": pair_id,
         "side": "sell",
         "live": True,
+        # The exchange's id for THIS sell. Without it the row cannot be
+        # matched to its own fill later, and it stays "pending" forever.
         "order_id": order_id,
+        "full_order_id": full_order_id or None,
+        # False means the proceeds are not known yet and this row is owed a
+        # reconciliation. It is the flag the repair pass looks for.
+        "pnl_known": not pending,
         "entry_price": position["entry_price"],
         "exit_price": exit_price,
         "quantity": coins,
@@ -1610,6 +1616,48 @@ def _self_check():
     assert _rec.get("entry_time") == 1.0, _rec
     print("[PASS] an adopted position sells without KeyError on entry_time")
 
+    # --- 0c. a pending live row heals itself -------------------------------
+    # The sell succeeded but the exchange had not reported the fill when the
+    # order was acknowledged, so the row was stored pnl_known=False. Nothing
+    # retried it, and the repair pass explicitly SKIPPED pnl_known=False rows -
+    # the exact ones it exists to fix. It stayed "pending" forever.
+    _hist = live_api.trade_history_v2
+    live_api.trade_history_v2 = lambda *a, **k: [{
+        "orderId": "beatidr-market-1", "clientOrderId": "beatidr-market-1",
+        "symbol": "beatidr", "price": "1534", "qty": "13.21003963",
+        "quoteQty": "20264", "commission": "83", "commissionAsset": "idr",
+        "isBuyer": False, "time": 1795008736781}]
+    try:
+        _st = {"live_trade_log": [{
+            "hunt_id": "L-00005", "symbol": "BEATIDR", "live": True,
+            "order_id": "beatidr-market-1", "entry_price": 1514.0,
+            "exit_price": None, "quantity": 13.21003963, "net_pnl_idr": None,
+            "pnl_known": False, "exit_time": 1795008736.0, "cost_idr": 20000.0}]}
+        _out = globals()['reconcile_pending_live'](_st, limit=5)
+        _row = _st["live_trade_log"][0]
+    finally:
+        live_api.trade_history_v2 = _hist
+    assert _out["healed"] and _row["pnl_known"] is True, (_out, _row)
+    assert abs(_row["net_pnl_idr"] - 181.0) < 0.01, _row      # 20264-83-20000
+    assert abs(_row["exit_price"] - 20264 / 13.21003963) < 0.01, _row
+    print(f"[PASS] a pending live sell heals to the real fill: "
+          f"{_row['net_pnl_idr']:+.0f} IDR at {_row['exit_price']:,.0f}")
+
+    # --- 0d. backoff: an unmatchable row is not polled every tick ----------
+    live_api.trade_history_v2 = lambda *a, **k: []
+    try:
+        _st2 = {"live_trade_log": [{
+            "hunt_id": "L-9", "symbol": "ZZZIDR", "live": True, "order_id": "zzz-1",
+            "entry_price": 100.0, "exit_price": None, "quantity": 1.0,
+            "net_pnl_idr": None, "pnl_known": False, "exit_time": time.time()}]}
+        _a = globals()['reconcile_pending_live'](_st2, limit=5)          # first attempt
+        _b = globals()['reconcile_pending_live'](_st2, limit=5)          # immediately again
+    finally:
+        live_api.trade_history_v2 = _hist
+    assert _a["attempted"] == 1, _a
+    assert _b["attempted"] == 0, "re-polled inside the backoff window"
+    print("[PASS] an unmatchable pending row backs off instead of polling every tick")
+
     # --- 0b. a position lacking entry_time entirely still sells ------------
     _bare = {"hunt_id": "L-9", "symbol": "XIDR", "pair_id": "xidr",
              "coin_symbol": "x", "coins": 1.0, "entry_price": 1000.0,
@@ -2267,8 +2315,124 @@ def _self_check():
     print("\n=== ALL SELF-CHECKS PASSED ===")
 
 
-if __name__ == "__main__":
-    _self_check()
+def reconcile_pending_live(state: dict, max_age_hours: float = 72,
+                           limit: int = 3, client=None) -> Dict[str, Any]:
+    """Fill in proceeds for live sells the exchange had not reported yet.
+
+    A sell whose fill is not visible the instant the order is acknowledged is
+    recorded with pnl_known=False rather than a fabricated number. That is
+    honest, but "pending" must not be permanent: the fill usually shows up in
+    myTrades seconds later. This is the retry, called from the engine tick so
+    the dashboard heals itself instead of waiting for someone to run a
+    command by hand.
+
+    Deliberately cheap and bounded: at most `limit` rows per tick, only rows
+    newer than `max_age_hours`, and a symbol's fills are fetched once per tick
+    at most. A row that still cannot be matched is left alone and retried on a
+    later tick; one that the exchange will never explain stops being retried
+    once it ages out, so a dead row cannot cost an API call forever.
+    """
+    import time as _t
+    log = state.get("live_trade_log") or []
+    now = _t.time()
+    done = {"attempted": 0, "healed": [], "still_pending": []}
+    cache: Dict[str, list] = {}
+
+    for t in reversed(log):
+        if done["attempted"] >= limit:
+            break
+        if not isinstance(t, dict):
+            continue
+        # pending == proceeds unknown. Older rows have no flag at all.
+        pending = (t.get("pnl_known") is False
+                   or (t.get("exit_price") in (None, 0)
+                       and t.get("net_pnl_idr") is None))
+        if not pending:
+            continue
+        try:
+            age_h = (now - float(t.get("exit_time") or 0)) / 3600.0
+        except (TypeError, ValueError):
+            age_h = 0.0
+        # never, or far too late to be visible: stop burning calls
+        if age_h < 0 or age_h > max_age_hours:
+            done["still_pending"].append({"hunt_id": t.get("hunt_id"),
+                                          "why": "too old to reconcile"})
+            continue
+        # BACKOFF. The engine ticks every 60s; an unmatchable row would cost a
+        # fills lookup every minute for three days. Retry at most every 5
+        # minutes, and give up entirely after 20 attempts.
+        tries = int(t.get("reconcile_attempts") or 0)
+        last_try = float(t.get("last_reconcile_at") or 0)
+        if tries >= 20 or (last_try and now - last_try < 300):
+            continue
+        sym = (t.get("symbol") or "").lower()
+        if not sym:
+            continue
+        done["attempted"] += 1
+        t["reconcile_attempts"] = tries + 1
+        t["last_reconcile_at"] = now
+        if sym not in cache:
+            try:
+                cache[sym] = live_api.trade_history_v2(sym, limit=30, days=3)
+            except Exception:                                # noqa: BLE001
+                cache[sym] = []
+        rows = [r for r in (cache[sym] or []) if isinstance(r, dict)
+                and not r.get("isBuyer")]
+        if not rows:
+            done["still_pending"].append({"hunt_id": t.get("hunt_id"),
+                                          "why": "no sell fills reported yet"})
+            continue
+
+        want_oid = str(t.get("full_order_id") or t.get("order_id") or "")
+        pick = None
+        if want_oid:
+            for r in reversed(rows):
+                if want_oid in (str(r.get("orderId") or ""),
+                                str(r.get("clientOrderId") or "")):
+                    pick = r
+                    break
+        if pick is None:
+            try:
+                qty = float(t.get("quantity") or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            for r in reversed(rows):
+                try:
+                    if qty and abs(float(r.get("qty") or 0) - qty) < max(1e-9, qty * 1e-6):
+                        pick = r
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if pick is None:
+            done["still_pending"].append({"hunt_id": t.get("hunt_id"),
+                                          "why": "no fill matches this trade"})
+            continue
+
+        proceeds = float(pick.get("quoteQty") or 0)
+        fee = 0.0
+        if (pick.get("commissionAsset") or "").lower() == "idr":
+            fee = float(pick.get("commission") or 0)
+        e_qty = float(pick.get("qty") or 0) or float(t.get("quantity") or 0)
+        if proceeds <= 0 or e_qty <= 0:
+            done["still_pending"].append({"hunt_id": t.get("hunt_id"),
+                                          "why": "fill carries no proceeds"})
+            continue
+        t["exit_price"] = round(proceeds / e_qty, 4)
+        cost = float(t.get("cost_idr")
+                     or float(t.get("entry_price") or 0) * e_qty)
+        net = proceeds - fee - cost
+        t["net_pnl_idr"] = round(net, 2)
+        t["net_pnl_pct"] = round((net / cost * 100.0) if cost else 0.0, 4)
+        t["gross_pnl_idr"] = round(proceeds - fee - cost, 2)
+        t["sell_fee_idr"] = round(fee, 2)
+        t["fees_idr"] = round(float(t.get("buy_fee_idr") or 0.0) + fee, 2)
+        t["pnl_known"] = True
+        t["pnl_source"] = "myTrades"
+        t["reconciled_at"] = now
+        done["healed"].append({"hunt_id": t.get("hunt_id"),
+                               "exit_price": t["exit_price"],
+                               "net_pnl_idr": t["net_pnl_idr"]})
+    return done
 
 
 def repair_live_ledger(state: dict, apply: bool = False,
@@ -2294,8 +2458,9 @@ def repair_live_ledger(state: dict, apply: bool = False,
         out["scanned"] += 1
         if not isinstance(t, dict):
             continue
-        if t.get("pnl_known") is False:
-            continue
+        # NOT `if pnl_known is False: continue` - that skipped precisely the
+        # pending rows this pass exists to fix, so a trade whose fill was not
+        # reported at sell time stayed "pending" forever.
         exit_price = t.get("exit_price")
         net = t.get("net_pnl_idr")
         cost = None
@@ -2337,7 +2502,16 @@ def repair_live_ledger(state: dict, apply: bool = False,
         sells = [r for r in rows if not r.get("isBuyer")]
         buys = [r for r in rows if r.get("isBuyer")]
         pick = None
-        for r in reversed(sells):
+        # An exact order id is proof, not inference: use it when the row
+        # carries one (a sell recorded after this change always will).
+        want_oid = str(t.get("full_order_id") or t.get("order_id") or "")
+        if want_oid:
+            for r in reversed(sells):
+                if want_oid in (str(r.get("orderId") or ""),
+                                str(r.get("clientOrderId") or "")):
+                    pick = r
+                    break
+        for r in reversed(sells) if pick is None else []:
             try:
                 if qty and abs(float(r.get("qty") or 0) - qty) < max(1e-9, qty * 1e-6):
                     pick = r
@@ -2413,3 +2587,7 @@ def repair_live_ledger(state: dict, apply: bool = False,
             t["pnl_source"] = "myTrades"
             t["repaired_at"] = _t.time()
     return out
+
+
+if __name__ == "__main__":
+    _self_check()

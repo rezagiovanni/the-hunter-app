@@ -1212,6 +1212,20 @@ def tick(now: Optional[float] = None) -> dict:
             state["phase"] = "HUNTING"
             summary = f"[RESET] Unknown phase {phase} reset to HUNTING."
 
+        # A live sell whose fill was not visible at sell time is recorded as
+        # pending rather than with an invented number. Retry it here, so the
+        # row heals on its own instead of showing "pending" forever.
+        # Bounded: at most a few rows and one fills lookup per symbol per tick.
+        if state.get("live_trade_log"):
+            try:
+                import executor_live
+                _rec = executor_live.reconcile_pending_live(state, limit=3)
+                if _rec.get("healed"):
+                    summary = (summary or "") + " [RECONCILED " + ", ".join(
+                        h["hunt_id"] for h in _rec["healed"] if h.get("hunt_id")) + "]"
+            except Exception:                                # noqa: BLE001
+                pass
+
         save_state(state)
         return {
             "status": "OK",

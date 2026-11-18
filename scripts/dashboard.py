@@ -271,8 +271,14 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
     nets = [t.get("net_pnl_idr") or 0.0 for t in scored]
     best = max(nets) if nets else 0.0
     worst = min(nets) if nets else 0.0
+    # Max Loss is a MAGNITUDE. It was rendered with the sign of the value, so
+    # with a single winning trade (worst = +361) the card read "Max Loss
+    # +IDR 361" - identical to Max Profit and plainly wrong. A card labelled
+    # "Max Loss" always shows one loss as a positive number, or a dash when
+    # nothing actually lost.
     best_sign = "+" if best >= 0 else "-"
     worst_sign = "+" if worst >= 0 else "-"
+    worst_is_loss = worst < 0
 
     pnl_sign = "+" if net >= 0 else ""
     net_cls = "pass" if net >= 0 else "fail"
@@ -290,10 +296,13 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
         '<div class="stats-tile"><div class="label">Max Drawdown</div><div class="value neg">{:.1f}%</div></div>'.format(max_dd_pct) +
         '<div class="stats-tile"><div class="label">Min Duration</div><div class="value">{}</div></div>'.format(min_hold) +
         '<div class="stats-tile"><div class="label">Max Duration</div><div class="value">{}</div></div>'.format(max_hold) +
-        '<div class="stats-tile"><div class="label">Max Profit</div><div class="value {0}">{1}IDR {2:,.0f}</div></div>'.format(
-            "pos" if best >= 0 else "neg", best_sign, abs(best)) +
-        '<div class="stats-tile"><div class="label">Max Loss</div><div class="value {0}">{1}IDR {2:,.0f}</div></div>'.format(
-            "pos" if worst >= 0 else "neg", worst_sign, abs(worst))
+        '<div class="stats-tile"><div class="label">Max Profit</div><div class="value {0}">{1}</div></div>'.format(
+            "pos" if best > 0 else ("neg" if best < 0 else ""),
+            (("+" if best > 0 else "-") + "IDR {:,.0f}".format(abs(best)))
+            if best else "—") +
+        '<div class="stats-tile"><div class="label">Max Loss</div><div class="value {0}">{1}</div></div>'.format(
+            "neg" if worst_is_loss else "",
+            ("-" + "IDR {:,.0f}".format(abs(worst))) if worst_is_loss else "—")
     )
     return f'<div class="stats-strip">{cards}</div>'
 
