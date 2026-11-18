@@ -1974,7 +1974,11 @@ def _style():
         .hunt-close-btn { background: transparent; border: none; color: var(--text-secondary); font-size: 1.3em; cursor: pointer; }
         .hunt-kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-bottom: 12px; font-size: 0.8em; }
         .hunt-kv span { color: var(--text-secondary); }
-        .hunt-chart-wrap { height: 220px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+        /* position:relative is load-bearing: the hover tooltip is a child of
+           this box and is placed with left/top in its coordinates. Without
+           it the tooltip anchors to the nearest positioned ancestor instead
+           and appears far outside the graph. */
+        .hunt-chart-wrap { position: relative; height: 220px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
         .trade-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
         .trade-sub { font-size: 0.8em; color: var(--text-secondary); margin-top: 4px; }
         .mode-control-wrap { display: flex; align-items: center; gap: 10px; }
@@ -3676,6 +3680,10 @@ CHART_JS = """
 
         const data = huntChartData;
         if (!data || !data.ticks || !data.ticks.length) {
+            // Hide any tooltip left over from a previous draw: this returns
+            // before the crosshair block that normally clears it.
+            const _t = activeHuntDetailRow ? activeHuntDetailRow.querySelector('#huntTip') : null;
+            if (_t) _t.style.display = 'none';
             ctx.fillStyle = 'var(--text-muted)';
             ctx.font = '13px monospace';
             ctx.textAlign = 'center';
@@ -3783,11 +3791,21 @@ CHART_JS = """
                 ' · bid ' + Number(tk.bid || 0).toLocaleString('en-US') +
                 ' · ask ' + Number(tk.ask || 0).toLocaleString('en-US');
             tip.style.display = 'block';
-            const tw = tip.offsetWidth || 140;
-            let tx = x + 12;
-            if (tx + tw > W) tx = x - tw - 12;
-            tip.style.left = Math.max(2, tx) + 'px';
-            tip.style.top = Math.max(2, y - 34) + 'px';
+            // Place the tooltip in the chart box's own coordinates and keep it
+            // fully inside: measured width/height, flip to the left of the
+            // cursor when it would overflow the right edge, and clamp both
+            // axes so it never spills out of the graph.
+            const tw = tip.offsetWidth || 150;
+            const th = tip.offsetHeight || 60;
+            const gap = 12;
+            let tx = x + gap;
+            if (tx + tw > W - 2) tx = x - tw - gap;
+            tx = Math.max(2, Math.min(tx, W - tw - 2));
+            let ty = y - th - 10;
+            if (ty < 2) ty = y + 14;              // flip below the cursor near the top
+            ty = Math.max(2, Math.min(ty, H - th - 2));
+            tip.style.left = tx + 'px';
+            tip.style.top = ty + 'px';
         } else if (tip) {
             tip.style.display = 'none';
         }
