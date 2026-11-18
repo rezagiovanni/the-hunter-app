@@ -4229,7 +4229,18 @@ PAGE_JS = """
                     return;
                 }
                 if (!d.ok) {
-                    window.alert('Sell failed: ' + (d.error || 'unknown'));
+                    var why = d.error || 'unknown';
+                    // An internal exception name is not something an operator
+                    // can act on, and it used to reach them verbatim
+                    // ("KeyError: 'entry_time'"). Say what happened to the
+                    // position too, because a failed sell leaves it OPEN.
+                    if (/^[A-Za-z]*Error:/.test(why)) {
+                        why = 'the bot hit an internal error while selling. '
+                            + 'The position is still open on the exchange - '
+                            + 'try again, and check the pair in Indodax.\n\n'
+                            + why;
+                    }
+                    window.alert('Sell failed: ' + why);
                     if (btn) { btn.disabled = false; btn.textContent = 'SELL NOW'; }
                     refreshDashboard();
                     return;

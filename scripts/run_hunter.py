@@ -1912,15 +1912,31 @@ def run_sell_now():
         best_bid = ticker.get("buy") or ticker.get("last") or pos["entry_price"]
         best_ask = ticker.get("sell") or best_bid
 
-        trade_rec, delta = execute_paper_sell(
-            pos,
-            exit_price=best_bid,
-            exit_reason=EXIT_MANUAL_MARKET,
-            now=now,
-            fee_override_pct=pos.get("taker_fee_pct", 0.2),
-            exit_bid=best_bid,
-            exit_ask=best_ask,
-        )
+        # WHICH EXECUTOR. This used to call execute_paper_sell unconditionally,
+        # which on a LIVE position meant: no order was sent to the exchange, a
+        # trade was written with simulated proceeds, and state was set to
+        # HUNTING with the coins still sitting in the account. The next tick
+        # would then find coins against no position and adopt them again. On a
+        # real account that is a phantom sell: the operator presses SELL NOW,
+        # the dashboard says sold, and the coins are still there.
+        if pos.get("live"):
+            import executor_live
+            trade_rec, delta = executor_live.execute_live_sell(
+                pos,
+                best_bid=best_bid,
+                exit_reason=EXIT_MANUAL_MARKET,
+                now=now,
+            )
+        else:
+            trade_rec, delta = execute_paper_sell(
+                pos,
+                exit_price=best_bid,
+                exit_reason=EXIT_MANUAL_MARKET,
+                now=now,
+                fee_override_pct=pos.get("taker_fee_pct", 0.2),
+                exit_bid=best_bid,
+                exit_ask=best_ask,
+            )
         # --- the same config stamping the engine applies on any exit ----------
         trade_rec["framework"] = pos.get("framework", "A")
         trade_rec["framework_version"] = pos.get("framework_version", "?")
@@ -1929,8 +1945,17 @@ def run_sell_now():
         trade_rec["stop_pct"] = levels.get("stop_pct")
         trade_rec["ratchet_armed"] = bool(levels.get("ratchet_armed"))
 
-        state.setdefault("trade_log", []).append(trade_rec)
-        state["balance_idr"] = state.get("balance_idr", 0) + delta["net_proceeds"]
+        # Two ledgers, never summed (same rule the engine applies): a live trade
+        # must not appear in the paper log, or the PnL of the two phases becomes
+        # one unlabelable number.
+        if trade_rec.get("live"):
+            state.setdefault("live_trade_log", []).append(trade_rec)
+            # Real proceeds are already sitting in the exchange account. Adding
+            # them to balance_idr would invent money the paper ledger can never
+            # reconcile against.
+        else:
+            state.setdefault("trade_log", []).append(trade_rec)
+            state["balance_idr"] = state.get("balance_idr", 0) + delta["net_proceeds"]
         state["position"] = None
         state["phase"] = "HUNTING"
 
@@ -1940,25 +1965,31 @@ def run_sell_now():
         state.setdefault("cooldowns", {})[symbol.upper()] = now + hours * 3600
 
         save_state(state)
+        # execute_live_sell knows the price the exchange actually filled at; the
+        # ticker bid was only the pre-trade estimate.
+        _fill = trade_rec.get("exit_price") or best_bid
         try:
             record_hunt_event(symbol, "MANUAL_MARKET_EXIT", {
                 "hunt_id": trade_rec.get("hunt_id"),
-                "exit_price": best_bid,
+                "exit_price": _fill,
                 "net_pnl_idr": trade_rec.get("net_pnl_idr"),
                 "net_pnl_pct": trade_rec.get("net_pnl_pct"),
             })
         except Exception:
             pass
 
+        _pct = trade_rec.get("net_pnl_pct")
+        _pnl = trade_rec.get("net_pnl_idr")
         print(json.dumps({
             "ok": True,
-            "message": (f"sold {symbol} at {best_bid:,.0f} "
-                        f"({trade_rec.get('net_pnl_pct', 0):+.2f}%)"),
+            "message": (f"sold {symbol} at {_fill:,.0f} "
+                        + (f"({_pct:+.2f}%)" if _pct is not None
+                           else "(P&L pending reconciliation)")),
             "hunt_id": trade_rec.get("hunt_id"),
             "symbol": symbol,
-            "exit_price": best_bid,
-            "net_pnl_idr": trade_rec.get("net_pnl_idr"),
-            "net_pnl_pct": trade_rec.get("net_pnl_pct"),
+            "exit_price": _fill,
+            "net_pnl_idr": _pnl,
+            "net_pnl_pct": _pct,
             "balance": state.get("balance_idr"),
             "phase": state.get("phase"),
             "mode": ctrl.get("mode"),

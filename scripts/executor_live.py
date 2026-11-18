@@ -690,7 +690,11 @@ def execute_live_sell(position: dict, best_bid: float, exit_reason: str,
         "pnl_source": ("myTrades" if ret.get("_fee_idr") else "computed"),
         "net_pnl_idr": net_pnl_idr,
         "net_pnl_pct": net_pnl_pct,
-        "entry_time": position.get("entry_time"),
+        # An adopted position carries opened_at; a hunted one carries
+        # entry_time. Reading the key directly raised KeyError inside the sell,
+        # so the operator's SELL NOW failed on exactly the positions they were
+        # most likely to want out of.
+        "entry_time": position.get("entry_time") or position.get("opened_at"),
         "exit_time": now,
         "exit_reason": exit_reason,
         "entry_bid": position.get("entry_bid"),
@@ -987,6 +991,11 @@ def adopt_position(coin: str, amount: float, price: float, tick: float,
         "adopted": True,
         "adopted_at": now,
         "opened_at": now,
+        # entry_time is what the sell path and the trade record read. An adopted
+        # position used to carry only opened_at, so selling it raised
+        # KeyError: 'entry_time'. Both are set: opened_at says when the bot
+        # started watching, entry_time is the timestamp every consumer expects.
+        "entry_time": now,
         "framework": framework,
         "manual": False,
         "live": True,
@@ -1580,6 +1589,40 @@ class FakeExchange:
 
 def _self_check():
     print("=== executor_live.py self-check ===\n")
+
+    # --- 0. an adopted position can be sold --------------------------------
+    # adopt_position built a position with opened_at but no entry_time, and the
+    # sell path read position["entry_time"], so SELL NOW raised
+    # KeyError: 'entry_time' on exactly the positions most likely to need it.
+    _ad = adopt_position("BEAT", 13.21, 1514.0, 1.0, "L-00005", "C", now=1.0)
+    assert _ad.get("adopted") is True, _ad
+    assert "entry_time" in _ad, "an adopted position must carry entry_time"
+    assert _ad["entry_time"] == _ad["opened_at"], _ad
+    _saved_hist = live_api.trade_history_v2
+    live_api.trade_history_v2 = lambda *a, **k: []
+    try:
+        _rec, _summ = execute_live_sell(
+            dict(_ad, pair_id="beatidr", coin_symbol="beat"),
+            best_bid=1500.0, exit_reason="EXIT_MANUAL_MARKET",
+            now=2.0, client=FakeExchange(idr=0.0))
+    finally:
+        live_api.trade_history_v2 = _saved_hist
+    assert _rec.get("entry_time") == 1.0, _rec
+    print("[PASS] an adopted position sells without KeyError on entry_time")
+
+    # --- 0b. a position lacking entry_time entirely still sells ------------
+    _bare = {"hunt_id": "L-9", "symbol": "XIDR", "pair_id": "xidr",
+             "coin_symbol": "x", "coins": 1.0, "entry_price": 1000.0,
+             "live": True, "opened_at": 5.0, "exit_levels": {}}
+    live_api.trade_history_v2 = lambda *a, **k: []
+    try:
+        _rec2, _ = execute_live_sell(_bare, best_bid=1010.0,
+                                     exit_reason="EXIT_MANUAL_MARKET",
+                                     now=6.0, client=FakeExchange(idr=0.0))
+    finally:
+        live_api.trade_history_v2 = _saved_hist
+    assert _rec2.get("entry_time") == 5.0, _rec2
+    print("[PASS] a position with only opened_at still records a valid entry_time")
 
     pair_info = {"id": "btcidr", "tick": 1.0,
                  "trade_fee_percent_maker": 0.1, "trade_fee_percent_taker": 0.2}
