@@ -287,7 +287,7 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
     cards = (
         '<div class="stats-tile"><div class="label">Total Hunts</div><div class="value">{}{}{}</div></div>'.format(
             n,
-            f" <span class='unknown-n pending-n' title='P&amp;L pending exchange reconciliation — upgrade &amp; repair'>{len(pending)} pending</span>"
+            f" <span class='unknown-n pending-n' title='Waiting for Indodax to report the sell fill. Retried automatically - nothing to do.'>{len(pending)} pending</span>"
             if pending else "",
             f" <span class='unknown-n' title='sold outside the bot: P&amp;L not resolvable'>{unknown} unknown</span>"
             if unknown else "") +
@@ -925,8 +925,20 @@ def _trading_log_section(state: dict) -> str:
                 # with real values. Only (b) is truly "unknown".
                 _reason = t.get('exit_reason') or ''
                 if _reason and _reason not in ('EXIT_EXTERNAL_SELL',):
-                    pnl_cell = "<b title='P\u0026L pending reconciliation — upgrade the bot and run repair'>pending</b>"
-                    pct_cell = "<b title='P\u0026L pending reconciliation'>—</b>"
+                    # Not a bare "pending": say what is being waited for, and for how
+                    # long, so a reconciling row never looks like a stuck bot.
+                    _waited = ""
+                    try:
+                        _age = int((time.time() - float(t.get('exit_time') or 0)) / 60)
+                        if _age >= 0:
+                            _waited = (f" ({_age}m ago)" if _age < 120
+                                       else f" ({_age // 60}h ago)")
+                    except (TypeError, ValueError):
+                        pass
+                    _tip = ("Waiting for Indodax to report the sell fill. "
+                            "Retried automatically - the real P&amp;L appears on its own.")
+                    pnl_cell = f"<b title='{_tip}'>pending{_waited}</b>"
+                    pct_cell = f"<b title='{_tip}'>—</b>"
                 else:
                     pnl_cell = "<b title='sold outside the bot; the exit price is not known'>unknown</b>"
                     pct_cell = "<b>—</b>"
@@ -4681,13 +4693,48 @@ async def api_control_get():
     }
 
 
+# When the dashboard last attempted to reconcile pending live sells. Module
+# level, so it survives across requests in the one dashboard process.
+_LAST_RECONCILE = {"at": 0.0}
+
+
 def _dash_state():
-    """The engine state, or {} if it cannot be read. Never raises."""
+    """The engine state, or {} if it cannot be read. Never raises.
+
+    Before returning, pending live sells get a chance to be priced from the
+    exchange's own fills. A sell whose fill was not published at the moment the
+    order was acknowledged is stored with pnl_known=False; that is honest, but
+    the operator should not have to run a command to make the number appear.
+
+    Throttled hard: at most once every 60 seconds per process, and it only does
+    work when a row is actually pending. The engine tick is the primary path;
+    this is the belt-and-braces one for a dashboard-only deployment.
+    """
     try:
         import state as _state
-        return _state.load_state() or {}
+        st = _state.load_state() or {}
     except Exception:                                        # noqa: BLE001
         return {}
+
+    try:
+        log = st.get("live_trade_log") or []
+        pending = [t for t in log if isinstance(t, dict) and (
+            t.get("pnl_known") is False
+            or (t.get("exit_price") in (None, 0)
+                and t.get("net_pnl_idr") is None
+                and (t.get("exit_reason") or "") != "EXIT_EXTERNAL_SELL"))]
+        now = time.time()
+        if pending and now - _LAST_RECONCILE["at"] >= 60:
+            _LAST_RECONCILE["at"] = now
+            import executor_live
+            res = executor_live.reconcile_pending_live(st, limit=3)
+            if res.get("healed"):
+                import state as _st2
+                _st2.save_state(st)
+    except Exception:                                        # noqa: BLE001
+        pass                                                  # never break a page
+
+    return st
 
 
 def _exec_is_live() -> bool:
