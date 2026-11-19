@@ -76,7 +76,8 @@ from exit_strategy import (
     evaluate_exit,
     initialize_exit_levels,
 )
-from hunt_log import next_hunt_id, record_hunt_event, record_hunt_tick
+from hunt_log import (next_hunt_id, peek_hunt_id, record_hunt_event,
+                     record_hunt_tick)
 from executor_paper import (
     check_paper_buy_fill,
     compute_coin_amount,
@@ -431,8 +432,14 @@ def handle_hunting(state: dict, now: float, fw=None) -> str:
             log_gate_rejection(sym, "SIZING", sizing_msg, state=state, now=now)
             continue
 
-        # WINNER ACQUIRED! Allocate a hunt id and place the buy order
-        hunt_id = next_hunt_id(state, live=_live_mode())
+        # WINNER ACQUIRED! Place the buy order, then allocate a hunt id.
+        #
+        # PEEK first: an id must only be spent on a hunt that actually exists.
+        # This used to call next_hunt_id() here, before the order was
+        # attempted, so every rejected order, failed live placement and
+        # never-filled resting order burned a number - the operator saw
+        # L-00003, L-00005, L-00007, L-00010 for four real hunts.
+        hunt_id = peek_hunt_id(state, live=_live_mode())
 
         if _live_mode():
             # REAL ORDER. Every guard that protects the balance lives here,
@@ -461,6 +468,9 @@ def handle_hunting(state: dict, now: float, fw=None) -> str:
                     entry_ask=best_ask,
                     qty_increment=qty_incr,
                 )
+                # The order EXISTS: this hunt is real, so the id is spent now.
+                hunt_id = next_hunt_id(state, live=True)
+                order["hunt_id"] = hunt_id
                 order["framework"] = fw.name
                 order["framework_version"] = getattr(fw, "version", "?")
                 order["exit_levels"] = fw.initialize_exit(limit_price, tick)
@@ -495,6 +505,9 @@ def handle_hunting(state: dict, now: float, fw=None) -> str:
             entry_ask=best_ask,
             qty_increment=qty_incr,
         )
+        # The order EXISTS: spend the id now.
+        hunt_id = next_hunt_id(state, live=_live_mode())
+        order["hunt_id"] = hunt_id
         state["order"] = order
         order["framework"] = fw.name
         order["framework_version"] = getattr(fw, "version", "?")
@@ -1860,6 +1873,10 @@ def main():
     if "--repair-live-ledger" in sys.argv:
         run_repair_live_ledger(apply=("--apply" in sys.argv))
         return
+    if "--renumber-hunts" in sys.argv:
+        run_renumber_hunts(apply=("--apply" in sys.argv),
+                           live=("--paper" not in sys.argv))
+        return
     if "--buy-now" in sys.argv:
         # --buy-now SYMBOL [--paper]
         args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -2014,6 +2031,49 @@ def run_sell_now():
     except Exception as e:                                  # noqa: BLE001
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
         sys.exit(1)
+    finally:
+        release_lock(lock_fd)
+    sys.exit(0)
+
+
+def run_renumber_hunts(apply: bool = False, live: bool = True):
+    """Close gaps in the hunt id sequence.
+
+    Ids used to be allocated before the order was attempted, so rejected
+    orders and never-filled resting orders burned numbers. The trades are
+    complete; only the labels have holes. This renumbers them 1..N in
+    chronological order.
+
+    Refuses while a position is open: hunt ids name the tick and event files,
+    so renumbering mid-hunt would orphan them.
+
+    Dry run by default.
+    """
+    import hunt_log
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "error": "engine tick in progress"}))
+        sys.exit(2)
+    try:
+        state = load_state()
+        if live and state.get("phase") == "HOLDING" and state.get("position"):
+            print(json.dumps({
+                "ok": False,
+                "error": "a live position is open - sell or close it first, so "
+                         "its tick files are not orphaned"}))
+            sys.exit(1)
+        changes = hunt_log.renumber_ledger(state, live=live)
+        if apply and changes:
+            save_state(state)
+        print(json.dumps({
+            "ok": True,
+            "live": live,
+            "apply": apply,
+            "changed": len(changes),
+            "renumbered": [{"from": a, "to": b} for a, b in changes],
+            "counter": (state.get("live_hunt_counter") if live
+                        else state.get("hunt_counter")),
+        }, indent=2))
     finally:
         release_lock(lock_fd)
     sys.exit(0)

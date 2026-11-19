@@ -61,6 +61,19 @@ def format_hunt_id(n: int, live: bool = False) -> str:
     return f"H-{n}"
 
 
+def peek_hunt_id(state: dict, live: bool = False) -> str:
+    """The id the next hunt WOULD get, without consuming it.
+
+    An id must only be spent on a hunt that actually exists. Allocating one
+    before the order is attempted burned ids on every rejected order, every
+    failed live placement and every non-filling resting order, so the operator
+    saw L-00003, L-00005, L-00007, L-00010 for four real hunts. Peeking lets a
+    failure path name the attempt in its log without touching the sequence.
+    """
+    key = "live_hunt_counter" if live else "hunt_counter"
+    return format_hunt_id(int(state.get(key, 0)) + 1, live=live)
+
+
 def next_hunt_id(state: dict, live: bool = False) -> str:
     """Allocate the next hunt id and advance the counter in state.
 
@@ -121,6 +134,44 @@ def record_hunt_event(hunt_id: Optional[str], event: str, payload: dict,
 # ---------------------------------------------------------------------------
 # Self-check (run directly: python3 hunt_log.py)
 # ---------------------------------------------------------------------------
+def renumber_ledger(state: dict, live: bool = True) -> list:
+    """Close the gaps left by ids that were allocated but never used.
+
+    Old builds consumed an id before attempting the order, so a rejected order
+    or a resting order that never filled burned a number. The trades themselves
+    are complete and correctly priced - only their labels have holes.
+
+    Renumbers the ledger in chronological order to 1..N and rewrites the
+    counter to match, returning the (old, new) pairs it changed. Nothing else
+    is touched: prices, quantities, fees and times stay exactly as recorded.
+
+    Call this ONLY while no hunt is open. A hunt id appears in tick files and
+    event logs by name, so renumbering mid-hunt would orphan them.
+    """
+    key = "live_trade_log" if live else "trade_log"
+    log = state.get(key) or []
+    if not live and state.get("position"):
+        raise RuntimeError("refusing to renumber an open paper position")
+
+    idx = sorted(range(len(log)),
+                 key=lambda i: float((log[i] or {}).get("entry_time") or 0))
+    changes = []
+    for seq, i in enumerate(idx, 1):
+        rec = log[i]
+        old_id = rec.get("hunt_id")
+        new_id = format_hunt_id(seq, live=live)
+        if old_id != new_id:
+            rec["hunt_id"] = new_id
+            rec["hunt_id_prev"] = old_id
+            changes.append((old_id, new_id))
+
+    if live:
+        state["live_hunt_counter"] = len(idx)
+    else:
+        state["hunt_counter"] = max(int(state.get("hunt_counter") or 0), len(idx))
+    return changes
+
+
 if __name__ == "__main__":
     import tempfile
     import shutil
@@ -194,4 +245,40 @@ if __name__ == "__main__":
     shutil.rmtree(sandbox, ignore_errors=True)
     print(f"[PASS] live data dir untouched ({TICKS_DIR})")
 
+    # 5. peek must not consume the id
+    _p = {"live_hunt_counter": 4}
+    assert peek_hunt_id(_p, live=True) == "L-00005", peek_hunt_id(_p, live=True)
+    assert _p["live_hunt_counter"] == 4, "peek consumed the counter"
+    assert next_hunt_id(_p, live=True) == "L-00005"
+    assert _p["live_hunt_counter"] == 5
+    print("[PASS] peek_hunt_id shows the next id without consuming it")
+
+    # 6. renumber closes the gaps left by ids burned on failed orders
+    _r = {"live_trade_log": [
+        {"hunt_id": "L-00003", "entry_time": 100.0},
+        {"hunt_id": "L-00005", "entry_time": 200.0},
+        {"hunt_id": "L-00007", "entry_time": 300.0},
+        {"hunt_id": "L-00010", "entry_time": 400.0},
+    ], "live_hunt_counter": 10}
+    _ch = renumber_ledger(_r, live=True)
+    assert [t["hunt_id"] for t in _r["live_trade_log"]] == [
+        "L-00001", "L-00002", "L-00003", "L-00004"], _r["live_trade_log"]
+    assert _r["live_hunt_counter"] == 4, _r["live_hunt_counter"]
+    assert _r["live_trade_log"][0]["hunt_id_prev"] == "L-00003"
+    assert len(_ch) == 4, _ch
+    print("[PASS] renumbering closes gaps and keeps the old id for audit")
+
+    # 7. renumbering must preserve everything except the label
+    _before = {"entry_price": 1514.0, "quantity": 13.2, "net_pnl_idr": 181.0,
+               "exit_time": 400.0, "entry_time": 400.0}
+    _r2 = {"live_trade_log": [dict(_before, hunt_id="L-00010")],
+           "live_hunt_counter": 10}
+    renumber_ledger(_r2, live=True)
+    _after = dict(_r2["live_trade_log"][0])
+    _after.pop("hunt_id"); _after.pop("hunt_id_prev")
+    assert _after == _before, (_after, _before)
+    print("[PASS] renumbering changes only the hunt id, never the money")
+
     print("\n=== ALL CHECKS PASSED ===")
+
+
