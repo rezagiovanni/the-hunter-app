@@ -1334,77 +1334,66 @@ def _cron_switches_html() -> str:
     return ""
 
 def _framework_panel(state: dict, control: dict) -> str:
-    """FRAMEWORKS panel: per-framework cards with accumulated stats."""
+    """FRAMEWORKS panel: per-framework cards with accumulated stats.
+
+    Stats are computed SEPARATELY for the live and paper ledgers and both are
+    rendered into the page, with a switch to toggle between them. The switch is
+    client-side so flipping it does not reload the page or touch the engine -
+    it only shows the numbers that already shipped with the HTML.
+    """
     from frameworks import list_frameworks
 
     active = control.get("framework", "A")
     mode = control.get("mode", "RUNNING")
     can_switch = (mode == "STOPPED")
 
-    # BOTH LEDGERS. This read only trade_log - the PAPER ledger - so with LIVE
-    # armed every card showed Hunts 0 / Winrate — / PnL — no matter how many
-    # real hunts had run under that framework. A live trade is never written to
-    # trade_log, so the panel was structurally blind to live results.
-    trades = list(state.get("live_trade_log") or []) + list(state.get("trade_log") or [])
+    def _tally(records):
+        """Per-framework hunts / wins / net, over COMPLETED trades only.
 
-    by_fw = {}
-    for t in trades:
-        if not isinstance(t, dict):
-            continue
-        k = t.get("framework") or "A"
-        d = by_fw.setdefault(k, {"n": 0, "scored": 0, "w": 0, "pnl": 0.0,
-                                 "live": 0, "paper": 0})
-        d["n"] += 1
-        if t.get("live"):
-            d["live"] += 1
-        else:
-            d["paper"] += 1
-        # A trade whose P&L is unknown (sold by hand, or awaiting a fill
-        # report) is counted as a hunt but must NOT be scored: treating None
-        # as 0 drags the win rate toward zero and the PnL toward breakeven.
-        net = t.get("net_pnl_idr")
-        if net is None:
-            continue
-        d["scored"] += 1
-        d["pnl"] += float(net)
-        if float(net) > 0:
-            d["w"] += 1
+        A hunt is finished when it has left the book: it has an exit time AND
+        a known P&L. An open position is still hunting, and a row awaiting its
+        fill report has no result yet - counting either as a "hunt" inflates
+        the count with trades that have not happened, and scoring a None as 0
+        drags the win rate toward zero.
+        """
+        by = {}
+        for t in records:
+            if not isinstance(t, dict):
+                continue
+            net = t.get("net_pnl_idr")
+            finished = (t.get("exit_time") is not None
+                        and net is not None)
+            if not finished:
+                continue
+            k = t.get("framework") or "A"
+            d = by.setdefault(k, {"n": 0, "w": 0, "pnl": 0.0})
+            d["n"] += 1
+            d["pnl"] += float(net)
+            if float(net) > 0:
+                d["w"] += 1
+        return by
 
-    def _stats_html(name):
-        d = by_fw.get(name)
+    live_by = _tally(state.get("live_trade_log") or [])
+    paper_by = _tally(state.get("trade_log") or [])
+
+    def _stats_html(by, mode_key, name):
+        """One row for ONE framework in ONE mode. Called once per mode per card."""
+        d = by.get(name)
         if not d or d["n"] == 0:
-            return ("<div class='fw-stats'>"
-                    "<div><div class='k'>Hunts</div><div class='v'>0</div></div>"
-                    "<div><div class='k'>Winrate</div><div class='v'>—</div></div>"
-                    "<div><div class='k'>Net PnL</div><div class='v'>—</div></div></div>")
-        # Winrate over SCORED hunts only; show a dash when none are scored yet
-        # rather than a misleading 0%.
-        if d["scored"]:
-            wr_txt = f"{d['w'] / d['scored'] * 100:.0f}%"
-        else:
-            wr_txt = "—"
-        if d["scored"]:
-            pnl_cls = "pass" if d["pnl"] >= 0 else "fail"
-            sign = "+" if d["pnl"] >= 0 else ""
-            pnl_txt = f"<div class='v {pnl_cls}'>{sign}{d['pnl']:,.0f}</div>"
-        else:
-            pnl_txt = "<div class='v'>—</div>"
-        # say where the hunts came from; a mixed card is the common case
-        _mix = ""
-        if d["live"] and d["paper"]:
-            _mix = f" live + paper"
-        elif d["live"]:
-            _mix = " live"
-        _pend = (f" <span class='fw-pend'>{d['n'] - d['scored']} pending</span>"
-                 if d["n"] > d["scored"] else "")
-        return (f"<div class='fw-stats'>"
-                f"<div><div class='k'>Hunts</div><div class='v'>{d['n']}{_pend}</div></div>"
-                f"<div><div class='k'>Winrate</div><div class='v'>{wr_txt}</div></div>"
-                f"<div><div class='k'>Net PnL</div>{pnl_txt}</div></div>"
-                f"<div class='fw-mix'>{_mix.strip()}</div>")
+            return (f"<div class='fw-stat-row' data-mode='{mode_key}'>"
+                    f"<div class='k'>Hunts</div><div class='v'>0</div>"
+                    f"<div class='k'>Winrate</div><div class='v'>—</div>"
+                    f"<div class='k'>Net PnL</div><div class='v'>—</div></div>")
+        wr = d["w"] / d["n"] * 100
+        pnl_cls = "pass" if d["pnl"] >= 0 else "fail"
+        sign = "+" if d["pnl"] >= 0 else ""
+        return (f"<div class='fw-stat-row' data-mode='{mode_key}'>"
+                f"<div class='k'>Hunts</div><div class='v'>{d['n']}</div>"
+                f"<div class='k'>Winrate</div><div class='v'>{wr:.0f}%</div>"
+                f"<div class='k'>Net PnL</div>"
+                f"<div class='v {pnl_cls}'>{sign}{d['pnl']:,.0f}</div></div>")
 
-    cards = ""
-    for f in list_frameworks():
+    def _card(f):
         is_active = (f["name"] == active)
         badges = ""
         if is_active:
@@ -1417,7 +1406,7 @@ def _framework_panel(state: dict, control: dict) -> str:
             dis = "" if can_switch else "disabled"
             action = (f"<button class='fw-activate' {dis} "
                       f"onclick=\"activateFramework('{f['name']}')\">ACTIVATE FRAMEWORK</button>")
-        cards += (
+        return (
             f"<div class='fw-card{' active' if is_active else ''}'>"
             f"<div class='fw-header'>"
             f"  <div>"
@@ -1427,25 +1416,38 @@ def _framework_panel(state: dict, control: dict) -> str:
             f"  <div class='fw-badges'>{badges}</div>"
             f"</div>"
             f"<div class='fw-desc'>{f['description']}</div>"
-            f"{_stats_html(f['name'])}"
+            # both modes ship in the HTML; the switch picks which shows
+            f"<div class='fw-stats'>"
+            f"  {_stats_html(live_by, 'live', f['name'])}"
+            f"  {_stats_html(paper_by, 'paper', f['name'])}"
+            f"</div>"
             f"{action}</div>"
         )
+
+    cards = "".join(_card(f) for f in list_frameworks())
 
     hint = ("" if can_switch else
             "<p class='fw-hint'>⏸ Stop hunting to switch framework. "
             "STOP liquidates any open position first.</p>")
 
     return f"""
-        <div class="section" id="frameworksSection">
+        <div class="section" id="frameworksSection" data-fw-mode="live">
             <h2>Frameworks — Entry, Exit &amp; Indicators</h2>
             <p class="board-note">Each framework bundles its own entry indicators, exit
             levels and runner management. Switching applies to <b>new</b> hunts only;
-            trades already opened keep the framework they started under. Stats accumulate
-            per framework and are never reset.</p>
+            trades already opened keep the framework they started under.</p>
+            <div class="fw-mode-switch" role="tablist" aria-label="Framework stats mode">
+                <button class="fw-mode-btn active" type="button" data-fw-mode="live"
+                        onclick="setFrameworkMode('live')">LIVE</button>
+                <button class="fw-mode-btn" type="button" data-fw-mode="paper"
+                        onclick="setFrameworkMode('paper')">PAPER</button>
+            </div>
+            <p class="board-note fw-mode-note">Showing <b id="fwModeLabel">LIVE</b> results ·
+            <b>completed hunts only</b> — an open position is still hunting, and a trade
+            awaiting its fill report has no result yet.</p>
             <div class="fw-grid">{cards}</div>
-            {hint}
-        </div>
-    """
+            {hint}"""
+
 
 def _winner_card(winner, rows):
     """Render a big CLI-style winner card."""
@@ -2254,15 +2256,53 @@ def _style():
             flex: 1;
         }
         .fw-stats {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 8px;
             background: var(--bg-elevated);
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 10px;
+        }
+        /* One row per mode. Only the row matching the panel's data-fw-mode is
+           shown; the switch flips the attribute, so no reload is needed. */
+        .fw-stat-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
             text-align: center;
         }
+        .fw-stat-row { display: none; }
+        #frameworksSection[data-fw-mode="live"] .fw-stat-row[data-mode="live"],
+        #frameworksSection[data-fw-mode="paper"] .fw-stat-row[data-mode="paper"] {
+            display: grid;
+        }
+        /* Mode switch */
+        .fw-mode-switch {
+            display: inline-flex;
+            gap: 4px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            padding: 3px;
+            margin: 4px 0 10px;
+        }
+        .fw-mode-btn {
+            border: 0;
+            background: transparent;
+            color: var(--text-secondary);
+            font: inherit;
+            font-size: 0.72em;
+            font-weight: 700;
+            letter-spacing: 0.6px;
+            padding: 6px 16px;
+            border-radius: 7px;
+            cursor: pointer;
+            transition: background .15s, color .15s;
+        }
+        .fw-mode-btn:hover { color: var(--text-primary); }
+        .fw-mode-btn.active {
+            background: var(--accent);
+            color: #04121f;
+        }
+        .fw-mode-note b { color: var(--text-primary); }
         .fw-stats .k {
             font-size: 0.65em;
             color: var(--text-muted);
@@ -3409,6 +3449,25 @@ CHART_JS = """
     // ----------------------------------------------------------------------
     // Framework activation (only permitted while STOPPED)
     // ----------------------------------------------------------------------
+    // Framework stats mode (LIVE / PAPER).
+    //
+    // Purely a view toggle: both modes' numbers are already in the DOM, and
+    // CSS decides which row is visible. No fetch, no reload, so switching
+    // cannot disturb a running engine or lose page state.
+    function setFrameworkMode(mode) {
+        var sect = document.getElementById('frameworksSection');
+        if (!sect) return;
+        mode = (mode === 'paper') ? 'paper' : 'live';
+        sect.setAttribute('data-fw-mode', mode);
+        var btns = sect.querySelectorAll('.fw-mode-btn');
+        for (var i = 0; i < btns.length; i++) {
+            btns[i].classList.toggle('active', btns[i].getAttribute('data-fw-mode') === mode);
+        }
+        var lbl = document.getElementById('fwModeLabel');
+        if (lbl) lbl.textContent = mode.toUpperCase();
+        try { localStorage.setItem('hunter-fw-mode', mode); } catch (e) {}
+    }
+
     function activateFramework(name) {
         fetch('/api/frameworks/' + encodeURIComponent(name) + '/activate',
               { method: 'POST' })
@@ -4142,6 +4201,10 @@ CHART_JS = """
     }
 
     document.addEventListener('DOMContentLoaded', () => {
+        try {
+            var _m = localStorage.getItem('hunter-fw-mode');
+            if (_m) setFrameworkMode(_m);
+        } catch (e) {}
         initChart();
         initPagers();
     });
