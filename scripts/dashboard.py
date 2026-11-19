@@ -1341,14 +1341,33 @@ def _framework_panel(state: dict, control: dict) -> str:
     mode = control.get("mode", "RUNNING")
     can_switch = (mode == "STOPPED")
 
-    trades = state.get("trade_log", [])
+    # BOTH LEDGERS. This read only trade_log - the PAPER ledger - so with LIVE
+    # armed every card showed Hunts 0 / Winrate — / PnL — no matter how many
+    # real hunts had run under that framework. A live trade is never written to
+    # trade_log, so the panel was structurally blind to live results.
+    trades = list(state.get("live_trade_log") or []) + list(state.get("trade_log") or [])
+
     by_fw = {}
     for t in trades:
+        if not isinstance(t, dict):
+            continue
         k = t.get("framework") or "A"
-        d = by_fw.setdefault(k, {"n": 0, "w": 0, "pnl": 0.0})
+        d = by_fw.setdefault(k, {"n": 0, "scored": 0, "w": 0, "pnl": 0.0,
+                                 "live": 0, "paper": 0})
         d["n"] += 1
-        d["pnl"] += t.get("net_pnl_idr", 0.0) or 0.0
-        if (t.get("net_pnl_idr", 0.0) or 0.0) > 0:
+        if t.get("live"):
+            d["live"] += 1
+        else:
+            d["paper"] += 1
+        # A trade whose P&L is unknown (sold by hand, or awaiting a fill
+        # report) is counted as a hunt but must NOT be scored: treating None
+        # as 0 drags the win rate toward zero and the PnL toward breakeven.
+        net = t.get("net_pnl_idr")
+        if net is None:
+            continue
+        d["scored"] += 1
+        d["pnl"] += float(net)
+        if float(net) > 0:
             d["w"] += 1
 
     def _stats_html(name):
@@ -1358,14 +1377,31 @@ def _framework_panel(state: dict, control: dict) -> str:
                     "<div><div class='k'>Hunts</div><div class='v'>0</div></div>"
                     "<div><div class='k'>Winrate</div><div class='v'>—</div></div>"
                     "<div><div class='k'>Net PnL</div><div class='v'>—</div></div></div>")
-        wr = d["w"] / d["n"] * 100
-        pnl_cls = "pass" if d["pnl"] >= 0 else "fail"
-        sign = "+" if d["pnl"] >= 0 else ""
+        # Winrate over SCORED hunts only; show a dash when none are scored yet
+        # rather than a misleading 0%.
+        if d["scored"]:
+            wr_txt = f"{d['w'] / d['scored'] * 100:.0f}%"
+        else:
+            wr_txt = "—"
+        if d["scored"]:
+            pnl_cls = "pass" if d["pnl"] >= 0 else "fail"
+            sign = "+" if d["pnl"] >= 0 else ""
+            pnl_txt = f"<div class='v {pnl_cls}'>{sign}{d['pnl']:,.0f}</div>"
+        else:
+            pnl_txt = "<div class='v'>—</div>"
+        # say where the hunts came from; a mixed card is the common case
+        _mix = ""
+        if d["live"] and d["paper"]:
+            _mix = f" live + paper"
+        elif d["live"]:
+            _mix = " live"
+        _pend = (f" <span class='fw-pend'>{d['n'] - d['scored']} pending</span>"
+                 if d["n"] > d["scored"] else "")
         return (f"<div class='fw-stats'>"
-                f"<div><div class='k'>Hunts</div><div class='v'>{d['n']}</div></div>"
-                f"<div><div class='k'>Winrate</div><div class='v'>{wr:.0f}%</div></div>"
-                f"<div><div class='k'>Net PnL</div>"
-                f"<div class='v {pnl_cls}'>{sign}{d['pnl']:,.0f}</div></div></div>")
+                f"<div><div class='k'>Hunts</div><div class='v'>{d['n']}{_pend}</div></div>"
+                f"<div><div class='k'>Winrate</div><div class='v'>{wr_txt}</div></div>"
+                f"<div><div class='k'>Net PnL</div>{pnl_txt}</div></div>"
+                f"<div class='fw-mix'>{_mix.strip()}</div>")
 
     cards = ""
     for f in list_frameworks():
@@ -2290,6 +2326,17 @@ def _style():
             border-color: var(--accent-2);
             cursor: default;
             opacity: 1;
+        }
+
+        .fw-pend {
+            font-size: 0.62em; font-weight: 700; color: #eab308;
+            background: rgba(234,179,8,.14); border-radius: 20px;
+            padding: 1px 6px; margin-left: 4px; vertical-align: middle;
+        }
+        .fw-mix {
+            font-size: 0.6em; color: var(--text-muted);
+            text-transform: uppercase; letter-spacing: 0.5px;
+            margin-top: 6px;
         }
 
         /* 1-row OHLCV cards */
