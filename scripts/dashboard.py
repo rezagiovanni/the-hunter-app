@@ -280,8 +280,18 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
     worst_sign = "+" if worst >= 0 else "-"
     worst_is_loss = worst < 0
 
-    pnl_sign = "+" if net >= 0 else ""
-    net_cls = "pass" if net >= 0 else "fail"
+    # Colour by SIGN, with zero neutral: green strictly positive, red strictly
+    # negative, and the default text colour at exactly 0. Treating 0 as a win
+    # painted a break-even total green, which is a claim the number does not
+    # support.
+    # The sign is placed before "IDR", so the number itself must be printed as
+    # a magnitude - otherwise a loss renders as "-IDR -275".
+    if net > 0:
+        pnl_sign, pnl_abs, net_cls = "+", net, "pass"
+    elif net < 0:
+        pnl_sign, pnl_abs, net_cls = "-", abs(net), "fail"
+    else:
+        pnl_sign, pnl_abs, net_cls = "", 0.0, ""
     wr_cls = "pass" if winrate >= 50 else "fail"
 
     cards = (
@@ -291,7 +301,7 @@ def _trade_stats_html(log, start_balance: float = 100_000.0) -> str:
             if pending else "",
             f" <span class='unknown-n' title='sold outside the bot: P&amp;L not resolvable'>{unknown} unknown</span>"
             if unknown else "") +
-        '<div class="stats-tile"><div class="label">PnL</div><div class="value {0}">{1}IDR {2:,.0f}</div></div>'.format(net_cls, pnl_sign, net) +
+        '<div class="stats-tile"><div class="label">PnL</div><div class="value {0}">{1}IDR {2:,.0f}</div></div>'.format(net_cls, pnl_sign, pnl_abs) +
         '<div class="stats-tile"><div class="label">Winrate</div><div class="value {0}">{1:.1f}%</div></div>'.format(wr_cls, winrate) +
         '<div class="stats-tile"><div class="label">Max Drawdown</div><div class="value neg">{:.1f}%</div></div>'.format(max_dd_pct) +
         '<div class="stats-tile"><div class="label">Min Duration</div><div class="value">{}</div></div>'.format(min_hold) +
