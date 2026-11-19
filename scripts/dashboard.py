@@ -1377,21 +1377,34 @@ def _framework_panel(state: dict, control: dict) -> str:
     paper_by = _tally(state.get("trade_log") or [])
 
     def _stats_html(by, mode_key, name):
-        """One row for ONE framework in ONE mode. Called once per mode per card."""
+        """One row for ONE framework in ONE mode. Called once per mode per card.
+
+        Each figure is emitted as its OWN cell (.st) with the label above the
+        value inside it. Emitting a flat sequence of label,value,label,value
+        into a 3-column grid put a label and its number on different rows -
+        "Hunts | 1 | Winrate" then "100% | Net PnL | +361" - so every value
+        sat under the wrong heading.
+        """
         d = by.get(name)
         if not d or d["n"] == 0:
             return (f"<div class='fw-stat-row' data-mode='{mode_key}'>"
-                    f"<div class='k'>Hunts</div><div class='v'>0</div>"
-                    f"<div class='k'>Winrate</div><div class='v'>—</div>"
-                    f"<div class='k'>Net PnL</div><div class='v'>—</div></div>")
+                    f"<div class='st'><div class='k'>Hunts</div>"
+                    f"<div class='v'>0</div></div>"
+                    f"<div class='st'><div class='k'>Winrate</div>"
+                    f"<div class='v'>\u2014</div></div>"
+                    f"<div class='st'><div class='k'>PnL</div>"
+                    f"<div class='v'>\u2014</div></div></div>")
         wr = d["w"] / d["n"] * 100
         pnl_cls = "pass" if d["pnl"] >= 0 else "fail"
-        sign = "+" if d["pnl"] >= 0 else ""
+        sign = "+" if d["pnl"] >= 0 else "-"
+        pnl_txt = f"{sign}{abs(d['pnl']):,.0f}"
         return (f"<div class='fw-stat-row' data-mode='{mode_key}'>"
-                f"<div class='k'>Hunts</div><div class='v'>{d['n']}</div>"
-                f"<div class='k'>Winrate</div><div class='v'>{wr:.0f}%</div>"
-                f"<div class='k'>Net PnL</div>"
-                f"<div class='v {pnl_cls}'>{sign}{d['pnl']:,.0f}</div></div>")
+                f"<div class='st'><div class='k'>Hunts</div>"
+                f"<div class='v'>{d['n']}</div></div>"
+                f"<div class='st'><div class='k'>Winrate</div>"
+                f"<div class='v'>{wr:.0f}%</div></div>"
+                f"<div class='st'><div class='k'>PnL</div>"
+                f"<div class='v {pnl_cls}'>{pnl_txt}</div></div></div>")
 
     def _card(f):
         is_active = (f["name"] == active)
@@ -2303,18 +2316,25 @@ def _style():
             color: #04121f;
         }
         .fw-mode-note b { color: var(--text-primary); }
+        .fw-stats .st { min-width: 0; }
         .fw-stats .k {
-            font-size: 0.65em;
+            font-size: 0.62em;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            margin-bottom: 2px;
+            line-height: 1.2;
+            margin-bottom: 3px;
+            white-space: nowrap;
         }
         .fw-stats .v {
             font-size: 1.05em;
             font-weight: 700;
             color: var(--text-primary);
+            line-height: 1.1;
+            font-variant-numeric: tabular-nums;
         }
+        .fw-stats .v.pass { color: var(--accent-2); }
+        .fw-stats .v.fail { color: var(--accent-red); }
         .fw-stats .v.pass { color: var(--accent-2); }
         .fw-stats .v.fail { color: var(--accent-red); }
         .fw-badge-active {
