@@ -1469,7 +1469,8 @@ def _framework_panel(state: dict, control: dict) -> str:
             <b>completed hunts only</b> — an open position is still hunting, and a trade
             awaiting its fill report has no result yet.</p>
             <div class="fw-grid">{cards}</div>
-            {hint}"""
+            {hint}
+        </div>"""
 
 
 def _winner_card(winner, rows):
