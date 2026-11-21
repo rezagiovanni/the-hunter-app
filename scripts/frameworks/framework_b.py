@@ -62,7 +62,16 @@ class FrameworkB(Framework):
     def evaluate_entry(self, candles: list, depth: dict) -> dict:
         default = {"eligible": False, "total": 0.0, "direction": "SIDEWAYS",
                    "reasons": ["NO DATA"], "meta": {}}
-        if not candles or len(candles) < MIN_CANDLES:
+
+        # Entry knobs come from config.yaml (frameworks.B.*), falling back to
+        # this module's constants. Read per call so an edit in Settings takes
+        # effect on the next tick without a restart.
+        p = _config.framework_params(_config.current(), self.name)
+        rsi_oversold = p.get("rsi_oversold", RSI_OVERSOLD)
+        score_threshold = p.get("score_threshold", SCORE_THRESHOLD)
+        min_candles = int(p.get("min_candles", MIN_CANDLES))
+
+        if not candles or len(candles) < min_candles:
             return default
 
         closes = [float(c["c"]) for c in candles]
@@ -87,22 +96,25 @@ class FrameworkB(Framework):
         turning_up = gap_now > gap_prev
 
         reasons = []
-        if rsi_val >= RSI_OVERSOLD:
-            reasons.append(f"RSI {rsi_val:.1f} >= {RSI_OVERSOLD:.0f}")
+        if rsi_val >= rsi_oversold:
+            reasons.append(f"RSI {rsi_val:.1f} >= {rsi_oversold:.0f}")
         if not turning_up:
             reasons.append("NOT TURNING UP")
 
         # Score: deeper oversold scores higher, volume confirms the turn.
         # RSI_FULL_DEPTH..RSI_OVERSOLD maps 0..70 pts; <= RSI_FULL_DEPTH gets 70.
-        rsi_depth = (RSI_OVERSOLD - rsi_val) / (RSI_OVERSOLD - RSI_FULL_DEPTH)
+        # The floor moves with the configured band so a tighter band does not
+        # hand out free score: full credit still requires RSI <= 20.
+        rsi_full = min(RSI_FULL_DEPTH, rsi_oversold)
+        rsi_depth = (rsi_oversold - rsi_val) / (rsi_oversold - rsi_full) if rsi_oversold > rsi_full else 0.0
         rsi_component = max(0.0, min(rsi_depth, 1.0)) * 70.0
         vol_component = min(v_ratio / 1.5, 1.0) * 30.0
         total = round(rsi_component + vol_component, 2)
 
-        if total < SCORE_THRESHOLD:
-            reasons.append(f"SCORE {total:.1f} < {SCORE_THRESHOLD:.0f}")
+        if total < score_threshold:
+            reasons.append(f"SCORE {total:.1f} < {score_threshold:.0f}")
 
-        eligible = (rsi_val < RSI_OVERSOLD) and turning_up and (total >= SCORE_THRESHOLD)
+        eligible = (rsi_val < rsi_oversold) and turning_up and (total >= score_threshold)
 
         return {
             "eligible": eligible,

@@ -46,16 +46,25 @@ class FrameworkA(Framework):
     def evaluate_entry(self, candles: list, depth: dict) -> dict:
         r = evaluate_filters(candles)
 
+        # Score threshold comes from config.yaml (frameworks.A.score_threshold),
+        # falling back to the module constant. Read per call so a Settings edit
+        # takes effect on the next tick without a restart.
+        p = _config.framework_params(_config.current(), self.name)
+        score_threshold = p.get("score_threshold", SCORE_THRESHOLD)
+
         reasons = []
         if r.get("direction") != "UP":
             reasons.append("NOT UP")
         if r.get("overextended"):
             reasons.append("EXTENDED")
-        if (r.get("total") or 0.0) < SCORE_THRESHOLD:
-            reasons.append("SCORE < 60")
+        if (r.get("total") or 0.0) < score_threshold:
+            reasons.append(f"SCORE < {score_threshold:.0f}")
 
+        eligible = ((r.get("direction") == "UP")
+                    and not r.get("overextended")
+                    and (r.get("total") or 0.0) >= score_threshold)
         return {
-            "eligible": bool(r.get("eligible")),
+            "eligible": eligible,
             "total": r.get("total"),
             "direction": r.get("direction"),
             "reasons": reasons,
@@ -92,6 +101,21 @@ if __name__ == "__main__":
     print("=== framework_a.py golden test ===\n")
 
     fw = FrameworkA()
+
+    # The golden numbers below assume the CODE defaults (target 2%, stop 4%,
+    # ratchet 1.2%/-0.3%). A user can now change these in Settings, so pin
+    # them back for the test: this suite verifies the arithmetic, not the
+    # current tuning on disk.
+    import config as _cfg
+    import copy as _copy
+    # pin the golden numbers: reload, then overlay the code-default A block
+    # without touching the file on disk (current() merges over DEFAULTS).
+    _cfg._CFG = _copy.deepcopy(_cfg.current())
+    _cfg._CFG["frameworks"]["A"] = {
+        "target_pct": 0.02, "stop_pct": 0.04, "ratchet_enabled": True,
+        "ratchet_trigger_pct": 0.012, "ratchet_stop_pct": -0.003,
+        "score_threshold": 60.0,
+    }
 
     # --- exit levels must match the pre-framework engine exactly ----------
     # These integers are copied from the live Hunt H-0001 (UAIIDR) record:

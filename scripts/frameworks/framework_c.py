@@ -75,16 +75,24 @@ class FrameworkC(Framework):
         """
         r = evaluate_filters(candles)
 
+        # C reads A's entry knob from config (frameworks.C.score_threshold)
+        # so Settings can tune C without touching A.
+        p = _config.framework_params(_config.current(), self.name)
+        score_threshold = p.get("score_threshold", SCORE_THRESHOLD)
+
         reasons = []
         if r.get("direction") != "UP":
             reasons.append("NOT UP")
         if r.get("overextended"):
             reasons.append("EXTENDED")
-        if (r.get("total") or 0.0) < SCORE_THRESHOLD:
-            reasons.append(f"SCORE < {SCORE_THRESHOLD:.0f}")
+        if (r.get("total") or 0.0) < score_threshold:
+            reasons.append(f"SCORE < {score_threshold:.0f}")
 
+        eligible = ((r.get("direction") == "UP")
+                    and not r.get("overextended")
+                    and (r.get("total") or 0.0) >= score_threshold)
         return {
-            "eligible": bool(r.get("eligible")),
+            "eligible": eligible,
             "total": r.get("total"),
             "direction": r.get("direction"),
             "reasons": reasons,

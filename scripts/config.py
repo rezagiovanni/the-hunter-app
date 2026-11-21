@@ -70,6 +70,8 @@ DEFAULTS = {
             "ratchet_enabled": True,
             "ratchet_trigger_pct": 0.012,
             "ratchet_stop_pct": -0.003,
+            # entry knob: minimum combined score A requires (percent scale 0-100)
+            "score_threshold": 60.0,
         },
         "B": {
             "target_pct": 0.015,
@@ -77,6 +79,11 @@ DEFAULTS = {
             "ratchet_enabled": False,
             "ratchet_trigger_pct": 0.012,
             "ratchet_stop_pct": -0.003,
+            # entry knobs: the RSI band B hunts (percent scale) and the
+            # minimum candles before it will even score a pair
+            "rsi_oversold": 35.0,
+            "score_threshold": 60.0,
+            "min_candles": 30,
         },
         "C": {
             # A's entry with the exits stretched: same 0.5:1 payoff, far more
@@ -87,6 +94,8 @@ DEFAULTS = {
             "ratchet_enabled": False,
             "ratchet_trigger_pct": 0.0,
             "ratchet_stop_pct": 0.0,
+            # C runs A's entry verbatim, so it carries A's entry knob too
+            "score_threshold": 60.0,
         },
         "D": {
             # The benchmark rig: trades ONLY the #1 pair by 24h volume, with no
@@ -328,7 +337,8 @@ def framework_params(cfg: dict, name: str) -> dict:
     supplied = ((cfg.get("frameworks") or {}).get(name) or {})
     out = copy.deepcopy(defaults)
 
-    for key in ("target_pct", "stop_pct", "ratchet_trigger_pct", "ratchet_stop_pct"):
+    for key in ("target_pct", "stop_pct", "ratchet_trigger_pct", "ratchet_stop_pct",
+                "score_threshold", "rsi_oversold", "min_candles"):
         v = supplied.get(key, out.get(key))
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             out[key] = float(v)
@@ -337,6 +347,128 @@ def framework_params(cfg: dict, name: str) -> dict:
         out["ratchet_enabled"] = bool(supplied["ratchet_enabled"])
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Editing framework parameters (Settings page)
+# ---------------------------------------------------------------------------
+# What the Settings page may change per framework. Exit geometry is shared by
+# all four; entry knobs exist only where the framework actually reads them
+# (B reads its RSI band from config; A/C/D entry signals are code, not knobs).
+EDITABLE = {
+    "A": ["target_pct", "stop_pct", "ratchet_enabled",
+          "ratchet_trigger_pct", "ratchet_stop_pct", "score_threshold"],
+    "B": ["target_pct", "stop_pct", "ratchet_enabled",
+          "ratchet_trigger_pct", "ratchet_stop_pct", "rsi_oversold",
+          "score_threshold", "min_candles"],
+    "C": ["target_pct", "stop_pct", "ratchet_enabled",
+          "ratchet_trigger_pct", "ratchet_stop_pct", "score_threshold"],
+    "D": ["target_pct", "stop_pct", "ratchet_enabled",
+          "ratchet_trigger_pct", "ratchet_stop_pct"],
+}
+
+# Bounds in PERCENT (the UI works in %; config stores fractions).
+_BOUNDS = {
+    "target_pct": (0.1, 25.0),
+    "stop_pct": (0.1, 50.0),
+    "ratchet_trigger_pct": (0.0, 25.0),
+    "ratchet_stop_pct": (-10.0, 25.0),
+    "score_threshold": (0.0, 100.0),
+    "rsi_oversold": (5.0, 45.0),
+    "min_candles": (20, 500),
+}
+
+
+def validate_framework_params(name: str, edits: dict):
+    """Check a proposed edit. Returns (ok, error_message, clean_edits).
+
+    Rules:
+      * only EDITABLE keys for that framework are accepted
+      * stop_pct must be > 0 (a live bot with no stop is not survivable)
+      * every numeric field is bounds-checked, in PERCENT for *_pct fields
+      * values arrive in percent from the UI and are stored as fractions
+    """
+    name = (name or "").upper()
+    allowed = EDITABLE.get(name)
+    if not allowed:
+        return False, f"unknown framework {name!r}", {}
+
+    clean = {}
+    for key, value in (edits or {}).items():
+        if key not in allowed:
+            return False, f"field {key!r} is not editable on framework {name}", {}
+        if key == "ratchet_enabled":
+            clean[key] = bool(value)
+            continue
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return False, f"{key}: not a number", {}
+        lo, hi = _BOUNDS.get(key, (-1e12, 1e12))
+        if key == "min_candles":
+            num = int(round(num))
+        if not (lo <= num <= hi):
+            return False, f"{key}: {num} outside {lo}..{hi}", {}
+        # percent -> fraction for the four pct fields
+        if key.endswith("_pct"):
+            clean[key] = num / 100.0
+        else:
+            clean[key] = num
+        if key == "stop_pct" and num <= 0:
+            return False, "stop_pct must be greater than 0", {}
+
+    if "stop_pct" in clean and clean["stop_pct"] <= 0:
+        return False, "stop_pct must be greater than 0", {}
+    return True, "", clean
+
+
+def save_framework_params(name: str, edits: dict):
+    """Persist a framework edit to config.yaml. Returns (ok, error).
+
+    Reads the file, applies only this framework's keys, writes it back.
+    The file is rewritten through yaml.safe_dump of the merged tree so a
+    hand-edited comment elsewhere survives as long as it is above the
+    frameworks: block - comments inside the rewritten block are lost, which
+    is acceptable: the numbers are now owned by the dashboard.
+    """
+    import yaml
+
+    ok, err, clean = validate_framework_params(name, edits)
+    if not ok:
+        return False, err
+
+    name = name.upper()
+    path = config_path()
+
+    disk = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as fh:
+                disk = yaml.safe_load(fh) or {}
+        except Exception as exc:                              # noqa: BLE001
+            return False, f"could not read {path}: {exc}"
+        if not isinstance(disk, dict):
+            return False, f"{path} is not a mapping"
+
+    fw = disk.get("frameworks")
+    if not isinstance(fw, dict):
+        fw = {}
+    block = fw.get(name)
+    if not isinstance(block, dict):
+        block = {}
+    block.update(clean)
+    fw[name] = block
+    disk["frameworks"] = fw
+
+    try:
+        with open(path, "w") as fh:
+            yaml.safe_dump(disk, fh, default_flow_style=False, sort_keys=False)
+    except Exception as exc:                                   # noqa: BLE001
+        return False, f"could not write {path}: {exc}"
+
+    reload_config()
+    return True, ""
+
 
 
 # ---------------------------------------------------------------------------

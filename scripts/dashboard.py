@@ -1429,6 +1429,8 @@ def _framework_panel(state: dict, control: dict) -> str:
             dis = "" if can_switch else "disabled"
             action = (f"<button class='fw-activate' {dis} "
                       f"onclick=\"activateFramework('{f['name']}')\">ACTIVATE FRAMEWORK</button>")
+        edit = (f"<button class='fw-edit' "
+                f"onclick=\"editFramework('{f['name']}')\">⚙ EDIT</button>")
         return (
             f"<div class='fw-card{' active' if is_active else ''}'>"
             f"<div class='fw-header'>"
@@ -1444,7 +1446,8 @@ def _framework_panel(state: dict, control: dict) -> str:
             f"  {_stats_html(live_by, 'live', f['name'])}"
             f"  {_stats_html(paper_by, 'paper', f['name'])}"
             f"</div>"
-            f"{action}</div>"
+            f"<div class='fw-actions'>{edit}{action}</div>"
+            f"</div>"
         )
 
     cards = "".join(_card(f) for f in list_frameworks())
@@ -2112,6 +2115,110 @@ def _style():
         .mode-btn .dot.paper { background: var(--accent); }
         .mode-btn .dot.live { background: var(--accent-red); }
         .trade-log-container { margin-top: 16px; }
+        /* Framework editor modal + card edit button */
+        .fw-actions { display: flex; gap: 8px; margin-top: 12px; }
+        .fw-edit {
+            background: transparent; border: 1px solid var(--border, #263042);
+            color: var(--text-secondary); border-radius: 8px;
+            padding: 8px 12px; font-size: 0.75em; font-weight: 700;
+            letter-spacing: .06em; cursor: pointer;
+        }
+        .fw-edit:hover { border-color: var(--accent, #06b6d4); color: var(--accent, #06b6d4); }
+        .fw-modal-overlay {
+            display: none; position: fixed; inset: 0; z-index: 300;
+            background: rgba(3, 7, 14, 0.72); backdrop-filter: blur(4px);
+            align-items: center; justify-content: center; padding: 16px;
+        }
+        .fw-modal-overlay.open { display: flex; }
+        .fw-modal {
+            background: var(--panel, #0d1420); border: 1px solid var(--border, #263042);
+            border-radius: 14px; width: 100%; max-width: 460px;
+            box-shadow: 0 24px 60px rgba(0,0,0,.55);
+        }
+        .fw-modal-head {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 16px 18px 8px 18px;
+        }
+        .fw-modal-head h3 { margin: 0; font-size: 1.05em; }
+        .fw-modal-close {
+            background: none; border: none; color: var(--text-secondary);
+            font-size: 1.1em; cursor: pointer; padding: 4px 8px;
+        }
+        .fw-modal-note {
+            color: var(--text-secondary); font-size: 0.8em;
+            padding: 0 18px 10px 18px; margin: 0;
+        }
+        .fw-modal-body { padding: 4px 18px; max-height: 55vh; overflow-y: auto; }
+        .fw-field { margin-bottom: 14px; }
+        .fw-field label {
+            display: block; font-size: 0.78em; font-weight: 600;
+            color: var(--text-secondary); margin-bottom: 5px;
+            letter-spacing: .04em;
+        }
+        .fw-field input[type="number"] {
+            width: 100%; background: rgba(9,14,24,.9);
+            border: 1px solid var(--border, #263042); border-radius: 8px;
+            color: var(--text, #e7edf5); padding: 9px 11px;
+            font-size: 0.95em;
+        }
+        .fw-field input[type="number"]:focus {
+            outline: none; border-color: var(--accent, #06b6d4);
+        }
+        .fw-field .fw-hintline { font-size: 0.72em; color: var(--text-secondary); margin-top: 3px; }
+        .fw-field .fw-hintline b { color: var(--text, #e7edf5); }
+        .fw-modal-foot {
+            display: flex; justify-content: flex-end; gap: 10px;
+            padding: 12px 18px 16px 18px;
+        }
+        .fw-btn-secondary, .fw-btn-primary {
+            border-radius: 8px; padding: 9px 18px; font-weight: 700;
+            font-size: 0.78em; letter-spacing: .06em; cursor: pointer;
+            border: 1px solid var(--border, #263042);
+        }
+        .fw-btn-secondary { background: transparent; color: var(--text-secondary); }
+        .fw-btn-primary {
+            background: var(--accent, #06b6d4); border-color: var(--accent, #06b6d4);
+            color: #031018;
+        }
+        .fw-btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+        .fw-modal-err {
+            display: none; color: var(--fail, #ef4444); font-size: 0.8em;
+            padding: 0 18px 10px 18px; font-weight: 600;
+        }
+        .fw-modal-err.show { display: block; }
+
+        /* Market analytics (Analytics page) */
+        .analytics-loading {
+            color: var(--text-secondary);
+            font-size: 0.9em;
+            padding: 18px 0;
+            animation: pulse-soft 1.2s ease-in-out infinite;
+        }
+        @keyframes pulse-soft { 0%,100% {opacity:.55} 50% {opacity:1} }
+        .mp-breadth {
+            display: flex; gap: 18px; flex-wrap: wrap;
+            font-size: 0.95em; margin-bottom: 14px; font-weight: 600;
+        }
+        .mp-up   { color: var(--pass, #22c55e); }
+        .mp-down { color: var(--fail, #ef4444); }
+        .mp-flat { color: var(--text-secondary); }
+        .mp-scored { color: var(--text-secondary); font-weight: 400; margin-left: auto; }
+        .mp-cols {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 18px;
+        }
+        @media (max-width: 720px) { .mp-cols { grid-template-columns: 1fr; } }
+        .mp-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+        .mp-table th {
+            text-align: left; color: var(--text-secondary); font-weight: 600;
+            padding: 6px 8px; border-bottom: 1px solid var(--border, #263042);
+        }
+        .mp-table td { padding: 6px 8px; border-bottom: 1px solid rgba(128,140,160,.08); }
+        .mp-table tr:hover td { background: rgba(128,140,160,.05); }
+        .mp-note { color: var(--text-secondary); font-size: 0.85em; margin: 10px 0 6px 0; }
+        .mp-empty { color: var(--text-secondary); padding: 14px 0; font-size: 0.9em; }
+        .mp-table td.pass { color: var(--pass, #22c55e); font-weight: 600; }
+        .mp-table td.fail { color: var(--fail, #ef4444); }
+
         /* Sign-in page */
         .signin-page {
             position: relative;
@@ -3097,6 +3204,7 @@ CHART_JS = """
                 if (typeof drawChart === 'function') {
                     if (!chartData) { loadPair(true); } else { drawChart(); }
                 }
+                if (typeof loadMarketAnalytics === 'function') loadMarketAnalytics();
             }, 60);
         }
 
@@ -4476,6 +4584,232 @@ PAGE_JS = """
             });
     }
 
+    // -- framework parameter editor ----------------------------------------
+    var FW_FIELD_META = {
+        target_pct:        { label: 'TARGET %',   hint: 'take-profit above entry, e.g. 2 = +2%' },
+        stop_pct:          { label: 'STOP %',     hint: 'stop-loss below entry, e.g. 4 = -4% (must be > 0)' },
+        ratchet_enabled:   { label: 'RATCHET',     hint: 'arm breakeven ratchet after trigger' },
+        ratchet_trigger_pct:{label: 'RATCHET TRIGGER %', hint: 'gain that arms the ratchet, e.g. 1.2' },
+        ratchet_stop_pct:  { label: 'RATCHET FLOOR %',  hint: 'stop after arming, e.g. -0.3 = 0.3% below entry' },
+        score_threshold:   { label: 'SCORE THRESHOLD', hint: 'min entry score 0-100' },
+        rsi_oversold:      { label: 'RSI OVERSOLD',    hint: 'entry requires RSI below this (B only)' },
+        min_candles:       { label: 'MIN CANDLES',     hint: 'bars of history required (B only)' }
+    };
+    var fwEditTarget = null;
+
+    function editFramework(name) {
+        fetch('/api/frameworks/' + name + '/params')
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d.ok) { showToast(d.error || 'cannot load params', 'fail'); return; }
+                openFwModal(name, d);
+            })
+            .catch(function (e) { showToast('load failed: ' + e, 'fail'); });
+    }
+
+    function openFwModal(name, d) {
+        fwEditTarget = name;
+        document.getElementById('fwModalTitle').textContent =
+            'Framework ' + name + ' — Entry & Exit Parameters';
+        var note = 'Values in PERCENT. New positions use these levels; an open position keeps the levels it was opened with.';
+        if (d.blocked) note = '⚠ ' + d.blocked_reason;
+        document.getElementById('fwModalNote').textContent = note;
+
+        var body = '';
+        Object.keys(d.params).forEach(function (key) {
+            var v = d.params[key];
+            var meta = FW_FIELD_META[key] || { label: key, hint: '' };
+            body += '<div class="fw-field">';
+            if (key === 'ratchet_enabled') {
+                body += '<label>' + meta.label + '</label>';
+                body += '<select class="fw-num" data-key="ratchet_enabled" style="width:100%;background:rgba(9,14,24,.9);border:1px solid var(--border,#263042);border-radius:8px;color:var(--text,#e7edf5);padding:9px 11px;">';
+                body += '<option value="true"' + (v ? ' selected' : '') + '>enabled</option>';
+                body += '<option value="false"' + (!v ? ' selected' : '') + '>disabled</option>';
+                body += '</select>';
+            } else {
+                var step = (key === 'min_candles' || key === 'score_threshold') ? '1' : '0.1';
+                body += '<label>' + meta.label + '</label>';
+                body += '<input type="number" step="' + step + '" class="fw-num" data-key="' + key + '" value="' + v + '">';
+            }
+            body += '<div class="fw-hintline">' + meta.hint + '</div>';
+            body += '</div>';
+        });
+        document.getElementById('fwModalBody').innerHTML = body;
+
+        var errEl = document.getElementById('fwModalErr');
+        if (errEl) errEl.classList.remove('show');
+        var saveBtn = document.getElementById('fwSaveBtn');
+        saveBtn.disabled = !!d.blocked;
+        saveBtn.onclick = function () { saveFrameworkParams(); };
+
+        document.getElementById('fwModalOverlay').classList.add('open');
+    }
+
+    function closeFwModal() {
+        document.getElementById('fwModalOverlay').classList.remove('open');
+        fwEditTarget = null;
+    }
+
+    function saveFrameworkParams() {
+        if (!fwEditTarget) return;
+        var edits = {};
+        document.querySelectorAll('#fwModalBody .fw-num').forEach(function (el) {
+            var key = el.getAttribute('data-key');
+            if (el.tagName === 'SELECT') {
+                edits[key] = (el.value === 'true');
+            } else {
+                edits[key] = parseFloat(el.value);
+            }
+        });
+        var btn = document.getElementById('fwSaveBtn');
+        btn.disabled = true; btn.textContent = 'SAVING…';
+        fetch('/api/frameworks/' + fwEditTarget + '/params', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(edits)
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+            if (!d.ok) {
+                var errEl = document.getElementById('fwModalErr');
+                if (!errEl) {
+                    errEl = document.createElement('div');
+                    errEl.id = 'fwModalErr'; errEl.className = 'fw-modal-err';
+                    document.getElementById('fwModalBody').before(errEl);
+                }
+                errEl.textContent = d.error || 'save failed';
+                errEl.classList.add('show');
+                btn.disabled = false; btn.textContent = 'SAVE';
+                return;
+            }
+            closeFwModal();
+            showToast('Framework ' + fwEditTarget + ' parameters saved — new positions will use them', 'ok');
+            refreshDashboard();
+        })
+        .catch(function (e) {
+            showToast('save failed: ' + e, 'fail');
+            btn.disabled = false; btn.textContent = 'SAVE';
+        });
+    }
+
+    // close on overlay click
+    document.addEventListener('DOMContentLoaded', function () {
+        var ov = document.getElementById('fwModalOverlay');
+        if (ov) ov.addEventListener('click', function (ev) { if (ev.target === ov) closeFwModal(); });
+    });
+
+    // -- market analytics (Analytics page) ---------------------------------
+    function fmtPct(v, digits) {
+        if (v === null || v === undefined) return '—';
+        var s = (v > 0 ? '+' : '');
+        return s + v.toFixed(digits === undefined ? 2 : digits) + '%';
+    }
+    function fmtIDR(v) {
+        if (v === null || v === undefined) return '—';
+        return 'IDR ' + Number(v).toLocaleString('id-ID', {maximumFractionDigits: 0});
+    }
+    function chgClass(v) { return v > 0 ? 'pass' : (v < 0 ? 'fail' : ''); }
+
+    function renderMarketAnalytics(data) {
+        var pulse = data.pulse, vol = data.volatility, sweep = data.sweep;
+
+        // -- Market Pulse
+        var el = document.getElementById('marketPulseBody');
+        if (el && pulse) {
+            var h = '';
+            h += '<div class="mp-breadth">';
+            h += '<span class="mp-up">▲ ' + pulse.breadth_up + ' up</span>';
+            h += '<span class="mp-down">▼ ' + pulse.breadth_down + ' down</span>';
+            h += '<span class="mp-flat">◆ ' + pulse.breadth_flat + ' flat</span>';
+            h += '<span class="mp-scored">of ' + pulse.scored + ' scored</span>';
+            h += '</div>';
+            function moversTable(rows, title) {
+                if (!rows || !rows.length) return '<div class="mp-empty">No data with 24h history yet.</div>';
+                var t = '<table class="data-table mp-table"><tr><th>' + title + '</th><th>24h</th><th>Last</th><th>ATR%</th></tr>';
+                rows.forEach(function (r) {
+                    t += '<tr><td><b>' + r.pair + '</b></td>' +
+                         '<td class="' + chgClass(r.change_24h) + '">' + fmtPct(r.change_24h) + '</td>' +
+                         '<td>' + fmtIDR(r.last) + '</td>' +
+                         '<td>' + (r.atr_pct === null ? '—' : r.atr_pct.toFixed(2) + '%') + '</td></tr>';
+                });
+                return t + '</table>';
+            }
+            h += '<div class="mp-cols"><div>' + moversTable(pulse.gainers, 'Top Gainers') + '</div>';
+            h += '<div>' + moversTable(pulse.losers, 'Top Losers') + '</div></div>';
+            el.innerHTML = h;
+            el.classList.remove('analytics-loading');
+        }
+
+        // -- Volatility Board
+        el = document.getElementById('volatilityBody');
+        if (el && vol) {
+            if (!vol.length) {
+                el.innerHTML = '<div class="mp-empty">Not enough candle history yet.</div>';
+            } else {
+                var t = '<table class="data-table mp-table"><tr><th>#</th><th>Pair</th><th>ATR%</th><th>24h</th><th>Last</th></tr>';
+                vol.forEach(function (r, i) {
+                    t += '<tr><td>' + (i + 1) + '</td><td><b>' + r.pair + '</b></td>' +
+                         '<td><b>' + r.atr_pct.toFixed(2) + '%</b></td>' +
+                         '<td class="' + chgClass(r.change_24h) + '">' + fmtPct(r.change_24h) + '</td>' +
+                         '<td>' + fmtIDR(r.last) + '</td></tr>';
+                });
+                el.innerHTML = t + '</table>';
+            }
+            el.classList.remove('analytics-loading');
+        }
+
+        // -- Signal Sweep
+        el = document.getElementById('signalSweepBody');
+        if (el && sweep) {
+            var h = '';
+            h += '<div class="mp-note">Framework: <b>' + sweep.framework_label + '</b> · scanned ' + sweep.scanned + ' pairs</div>';
+            if (!sweep.eligible.length) {
+                h += '<div class="mp-empty">No pair qualifies under ' + sweep.framework_label + ' right now.</div>';
+            } else {
+                var t = '<table class="data-table mp-table"><tr><th>Pair</th><th>Score</th><th>Dir</th><th>RSI</th><th>Reason OK</th></tr>';
+                sweep.eligible.forEach(function (r) {
+                    t += '<tr><td><b>' + r.pair + '</b></td><td><b>' + Number(r.total).toFixed(1) + '</b></td>' +
+                         '<td>' + r.direction + '</td>' +
+                         '<td>' + (r.rsi === null || r.rsi === undefined ? '—' : Number(r.rsi).toFixed(1)) + '</td>' +
+                         '<td class="pass">ELIGIBLE</td></tr>';
+                });
+                h += t + '</table>';
+            }
+            if (sweep.near_misses && sweep.near_misses.length) {
+                h += '<div class="mp-note">Near misses (score ≥ 40):</div>';
+                var t2 = '<table class="data-table mp-table"><tr><th>Pair</th><th>Score</th><th>Why not</th></tr>';
+                sweep.near_misses.forEach(function (r) {
+                    t2 += '<tr><td><b>' + r.pair + '</b></td><td>' + Number(r.total).toFixed(1) + '</td>' +
+                          '<td class="fail">' + (r.reasons || []).join(', ') + '</td></tr>';
+                });
+                h += t2 + '</table>';
+            }
+            el.innerHTML = h;
+            el.classList.remove('analytics-loading');
+        }
+    }
+
+    function loadMarketAnalytics() {
+        var any = document.getElementById('marketPulseBody');
+        if (!any || any.dataset.loaded === '1') return;
+        any.dataset.loaded = '1';
+        fetch('/api/analytics/market')
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d.ok) throw new Error(d.error || 'bad response');
+                renderMarketAnalytics(d);
+            })
+            .catch(function (e) {
+                ['marketPulseBody', 'volatilityBody', 'signalSweepBody'].forEach(function (id) {
+                    var el = document.getElementById(id);
+                    if (el) {
+                        el.innerHTML = '<div class="mp-empty">Analytics unavailable: ' + String(e.message || e) + '</div>';
+                        el.classList.remove('analytics-loading');
+                    }
+                });
+            });
+    }
+
     // wire the switch once the document is ready
 
 """
@@ -5489,6 +5823,85 @@ async def api_control_stop(request: Request):
     return result
 
 
+@app.get("/api/analytics/market")
+async def api_market_analytics():
+    """Market-wide analytics computed from scraped candles.
+
+    Pulled separately from the page HTML because the sweep costs ~1s; the
+    Analytics page fetches it async so first paint stays instant.
+    """
+    import market_analysis
+
+    limit = 100
+    pulse = market_analysis.market_pulse(limit=limit)
+    vol = market_analysis.volatility_board(limit=limit, top=15)
+    sweep = market_analysis.signal_sweep(limit=limit, top=20)
+    return {"ok": True, "pulse": pulse, "volatility": vol, "sweep": sweep}
+
+
+@app.get("/api/frameworks/{name}/params")
+async def api_framework_params(name: str):
+    """Current editable parameters for one framework (config over defaults)."""
+    import config as _config
+    from state import load_state
+
+    name = name.upper()
+    if name not in _config.EDITABLE:
+        return JSONResponse({"ok": False, "error": "unknown framework"},
+                            status_code=400)
+    cfg = _config.current()
+    p = _config.framework_params(cfg, name)
+    supplied = ((cfg.get("frameworks") or {}).get(name) or {})
+
+    # report in PERCENT for the *_pct fields (the UI works in %)
+    out = {}
+    for key in _config.EDITABLE[name]:
+        v = supplied.get(key, p.get(key))
+        if key.endswith("_pct") and isinstance(v, (int, float)):
+            out[key] = round(v * 100.0, 3)
+        elif key == "min_candles" and v is not None:
+            out[key] = int(v)
+        else:
+            out[key] = v
+
+    # editing is blocked while a position is open under this framework:
+    # changing the rules of a trade already running would reprice its exits
+    st = load_state()
+    pos = st.get("position") or {}
+    blocked = bool(pos and (pos.get("framework") == name))
+    return {"ok": True, "params": out, "blocked": blocked,
+            "blocked_reason": ("a position is open under this framework - "
+                                "stop the engine and let it close first")
+            if blocked else ""}
+
+
+@app.post("/api/frameworks/{name}/params")
+async def api_framework_params_save(name: str, payload: dict):
+    """Save edited framework parameters to config.yaml."""
+    import config as _config
+    from state import load_state
+
+    name = name.upper()
+    if name not in _config.EDITABLE:
+        return JSONResponse({"ok": False, "error": "unknown framework"},
+                            status_code=400)
+
+    st = load_state()
+    pos = st.get("position") or {}
+    if pos and (pos.get("framework") == name):
+        return JSONResponse(
+            {"ok": False,
+             "error": ("a position is open under framework " + name +
+                       " - stop the engine and let it close before editing")},
+            status_code=409)
+
+    edits = payload or {}
+    ok, err = _config.save_framework_params(name, edits)
+    if not ok:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    return {"ok": True}
+
+
 @app.get("/api/frameworks")
 async def api_frameworks_list():
     """All registered frameworks plus which one is active."""
@@ -5715,6 +6128,22 @@ async def dashboard():
     <!-- Toast for refresh feedback -->
     <div class="toast" id="toast"></div>
 
+    <!-- Framework parameter editor -->
+    <div class="fw-modal-overlay" id="fwModalOverlay">
+      <div class="fw-modal" id="fwModal" role="dialog" aria-modal="true">
+        <div class="fw-modal-head">
+          <h3 id="fwModalTitle">Edit Framework</h3>
+          <button class="fw-modal-close" onclick="closeFwModal()" title="Close">✕</button>
+        </div>
+        <p class="fw-modal-note" id="fwModalNote"></p>
+        <div class="fw-modal-body" id="fwModalBody"></div>
+        <div class="fw-modal-foot">
+          <button class="fw-btn-secondary" onclick="closeFwModal()">CANCEL</button>
+          <button class="fw-btn-primary" id="fwSaveBtn" onclick="saveFrameworkParams()">SAVE</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Navigation Drawer -->
     <div class="nav-drawer" id="navDrawer">
         <div class="drawer-top">
@@ -5786,6 +6215,25 @@ async def dashboard():
 
     <!-- PAGE B: OTHERS VIEW -->
     <div id="pageOthers" style="display:none;">
+
+        <div class="section" id="marketPulseSection">
+            <h2>Market Pulse — All Scraped Pairs</h2>
+            <p class="board-note">Computed from stored 15m candles, not from trades. Refreshes with the page.</p>
+            <div id="marketPulseBody" class="analytics-loading">Computing market analytics…</div>
+        </div>
+
+        <div class="section" id="volatilitySection">
+            <h2>Volatility Board — ATR% (14-bar)</h2>
+            <p class="board-note">Which pairs actually move enough to reach a target. ATR as % of price, 15m bars.</p>
+            <div id="volatilityBody" class="analytics-loading">Loading…</div>
+        </div>
+
+        <div class="section" id="signalSweepSection">
+            <h2>Signal Sweep — Active Framework View</h2>
+            <p class="board-note">If the engine ticked right now: who would qualify under the ACTIVE framework, and why the others do not.</p>
+            <div id="signalSweepBody" class="analytics-loading">Loading…</div>
+        </div>
+
         <div class="section">
             <h2>OHLCV Data Summary</h2>
             <div class="cards ohlcv-cards">
