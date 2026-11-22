@@ -1632,7 +1632,7 @@ def _self_check():
             "hunt_id": "L-00005", "symbol": "BEATIDR", "live": True,
             "order_id": "beatidr-market-1", "entry_price": 1514.0,
             "exit_price": None, "quantity": 13.21003963, "net_pnl_idr": None,
-            "pnl_known": False, "exit_time": 1795008736.0, "cost_idr": 20000.0}]}
+            "pnl_known": False, "exit_time": time.time() - 60, "cost_idr": 20000.0}]}
         _out = globals()['reconcile_pending_live'](_st, limit=5)
         _row = _st["live_trade_log"][0]
     finally:
@@ -1657,6 +1657,63 @@ def _self_check():
     assert _a["attempted"] == 1, _a
     assert _b["attempted"] == 0, "re-polled inside the backoff window"
     print("[PASS] an unmatchable pending row backs off instead of polling every tick")
+
+    # --- 0e. ONE ORDER CAN FILL IN SEVERAL PIECES --------------------------
+    # PIEVERSEIDR sold at its +5% target in two partial fills on one order:
+    # 0.28255206 + 0.07976021 = the full 0.36231227 position. The old matcher
+    # required ONE fill to equal the whole position, matched neither, and left
+    # a +916 IDR win labelled "unknown" for ten hours.
+    _split = [
+        {"orderId": "pieverseidr-limit-1", "isBuyer": False, "qty": "0.07976021",
+         "quoteQty": "4622", "commission": "13", "commissionAsset": "idr",
+         "time": 1795280569000},
+        {"orderId": "pieverseidr-limit-1", "isBuyer": False, "qty": "0.28255206",
+         "quoteQty": "16376", "commission": "50", "commissionAsset": "idr",
+         "time": 1795280541000},
+        {"orderId": "pieverseidr-limit-0", "isBuyer": True, "qty": "0.36231227",
+         "quoteQty": "19999", "commission": "20", "commissionAsset": "idr",
+         "time": 1795215503000},
+    ]
+    _ext = {"hunt_id": "L-00012", "symbol": "PIEVERSEIDR", "live": True,
+            "quantity": 0.36231227, "entry_price": 55201.0,
+            "exit_price": 0.0, "net_pnl_idr": None, "pnl_known": False,
+            "exit_reason": "EXIT_EXTERNAL_SELL",
+            "exit_time": 1795280584.74231, "cost_idr": 20019.0}
+    _agg = globals()["match_sell_fills"](_split, _ext)
+    assert _agg and abs(_agg["qty"] - 0.36231227) < 1e-6, _agg
+    assert _agg["fills"] == 2 and _agg["quoteQty"] == 20998.0, _agg
+    assert abs(_agg["commission"] - 63.0) < 1e-9, _agg
+    _hist3 = live_api.trade_history_v2
+    live_api.trade_history_v2 = lambda *a, **k: _split
+    try:
+        _st3 = {"live_trade_log": [dict(_ext)]}
+        globals()["repair_live_ledger"](_st3, apply=True)
+        _healed = _st3["live_trade_log"][0]
+    finally:
+        live_api.trade_history_v2 = _hist3
+    # (16376 + 4622) - (50 + 13) - 20019 = +916
+    assert _healed["net_pnl_idr"] == 916.0, _healed
+    assert abs(_healed["net_pnl_pct"] - 4.5757) < 0.01, _healed
+    print(f"[PASS] two partial fills aggregate and heal to "
+          f"{_healed['net_pnl_idr']:+.0f} IDR ({_healed['net_pnl_pct']:+.2f}%)")
+
+    # --- 0f. an exhausted row still retries once a day -------------------
+    _st4 = {"live_trade_log": [{
+        "hunt_id": "L-9", "symbol": "ZZZIDR", "live": True, "order_id": "z-1",
+        "entry_price": 100.0, "exit_price": None, "quantity": 1.0,
+        "net_pnl_idr": None, "pnl_known": False,
+        "exit_time": time.time(),
+        "reconcile_attempts": 20, "last_reconcile_at": time.time() - 3600}]}
+    _c = globals()["reconcile_pending_live"](_st4, limit=5)
+    assert _c["attempted"] == 0, "retried inside the 24h window after exhaustion"
+    _st4["live_trade_log"][0]["last_reconcile_at"] = time.time() - 25 * 3600
+    live_api.trade_history_v2 = lambda *a, **k: []
+    try:
+        _d = globals()["reconcile_pending_live"](_st4, limit=5)
+    finally:
+        live_api.trade_history_v2 = _hist3
+    assert _d["attempted"] == 1, "exhausted row never retries"
+    print("[PASS] an exhausted row retries once a day, not never")
 
     # --- 0b. a position lacking entry_time entirely still sells ------------
     _bare = {"hunt_id": "L-9", "symbol": "XIDR", "pair_id": "xidr",
@@ -2315,6 +2372,106 @@ def _self_check():
     print("\n=== ALL SELF-CHECKS PASSED ===")
 
 
+
+# ---------------------------------------------------------------------------
+# Fill matching - a single order can land as several fills
+# ---------------------------------------------------------------------------
+def match_sell_fills(rows, trade, qty=None, max_age_hours=72):
+    """Find the fills that closed `trade` and aggregate them into one result.
+
+    An Indodax order is NOT one fill. A market/limit sell can match in several
+    pieces - the PIEVERSEIDR exit split into 0.28255206 + 0.07976021 on one
+    limit order. A matcher that requires ONE fill to equal the whole position
+    fails on every partial fill and leaves a real, profitable trade labelled
+    "unknown" forever.
+
+    Strategy, strongest evidence first:
+      1. order id from the trade record -> take every fill with that id
+      2. group fills by order id; take a group whose summed qty equals the
+         position (within tolerance) and whose time is near the exit
+      3. otherwise take consecutive fills (newest first) whose summed qty
+         reaches the position, all within `max_age_hours` of the exit
+
+    Returns a synthetic dict with qty/quoteQty/commission/fee asset and
+    `fills` / `order_ids`, or None.
+    """
+    def _num(v):
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    if qty is None:
+        qty = _num(trade.get("quantity") or trade.get("coins"))
+    tol = max(1e-9, qty * 1e-6) if qty else 1e-9
+
+    sells = [r for r in (rows or []) if isinstance(r, dict) and not r.get("isBuyer")]
+    if not sells:
+        return None
+
+    exit_ts = _num(trade.get("exit_time"))
+    # myTrades timestamps can be seconds or milliseconds
+    def _sec(r):
+        t = _num(r.get("time"))
+        return t / 1000.0 if t > 1e12 else t
+
+    def _window(r):
+        if not exit_ts:
+            return True                      # no clock in the row: accept all
+        return -600 <= _sec(r) - exit_ts <= max_age_hours * 3600
+
+    def _aggregate(picks):
+        if not picks:
+            return None
+        q = sum(_num(r.get("qty")) for r in picks)
+        quote = sum(_num(r.get("quoteQty")) for r in picks)
+        fee = sum(_num(r.get("commission")) for r in picks
+                  if str(r.get("commissionAsset") or "").lower() == "idr")
+        return {
+            "qty": q,
+            "quoteQty": quote,
+            "commission": fee,
+            "commissionAsset": "idr",
+            "price": (quote / q) if q else 0.0,
+            "fills": len(picks),
+            "order_ids": sorted({str(r.get("orderId") or r.get("clientOrderId") or "")
+                                 for r in picks}),
+        }
+
+    # 1. exact order id on the trade record
+    want = str(trade.get("full_order_id") or trade.get("order_id") or "")
+    if want:
+        same = [r for r in sells
+                if want in (str(r.get("orderId") or ""),
+                            str(r.get("clientOrderId") or ""))]
+        if same:
+            return _aggregate(same)
+
+    # 2. group by order id, look for a group summing to the position
+    groups = {}
+    for r in sells:
+        oid = str(r.get("orderId") or r.get("clientOrderId") or "single")
+        groups.setdefault(oid, []).append(r)
+    for picks in groups.values():
+        if not qty:
+            break
+        if abs(sum(_num(r.get("qty")) for r in picks) - qty) <= tol:
+            if any(_window(r) for r in picks):
+                return _aggregate(picks)
+
+    # 3. consecutive fills whose summed qty reaches the position
+    ordered = sorted(sells, key=_sec, reverse=True)
+    picks, acc = [], 0.0
+    for r in ordered:
+        if not _window(r):
+            continue
+        picks.append(r)
+        acc += _num(r.get("qty"))
+        if qty and acc >= qty - tol:
+            return _aggregate(picks)
+    return None
+
+
 def reconcile_pending_live(state: dict, max_age_hours: float = 72,
                            limit: int = 3, client=None) -> Dict[str, Any]:
     """Fill in proceeds for live sells the exchange had not reported yet.
@@ -2363,8 +2520,14 @@ def reconcile_pending_live(state: dict, max_age_hours: float = 72,
         # minutes, and give up entirely after 20 attempts.
         tries = int(t.get("reconcile_attempts") or 0)
         last_try = float(t.get("last_reconcile_at") or 0)
-        if tries >= 20 or (last_try and now - last_try < 300):
+        if last_try and now - last_try < 300:
             continue
+        if tries >= 20:
+            # 20 fast attempts exhausted the burst. Keep ONE retry per day:
+            # a late fill, or a fix to the matcher, must still be able to
+            # heal the row instead of leaving it unknown forever.
+            if last_try and now - last_try < 24 * 3600:
+                continue
         sym = (t.get("symbol") or "").lower()
         if not sym:
             continue
@@ -2383,35 +2546,17 @@ def reconcile_pending_live(state: dict, max_age_hours: float = 72,
                                           "why": "no sell fills reported yet"})
             continue
 
-        want_oid = str(t.get("full_order_id") or t.get("order_id") or "")
-        pick = None
-        if want_oid:
-            for r in reversed(rows):
-                if want_oid in (str(r.get("orderId") or ""),
-                                str(r.get("clientOrderId") or "")):
-                    pick = r
-                    break
-        if pick is None:
-            try:
-                qty = float(t.get("quantity") or 0)
-            except (TypeError, ValueError):
-                qty = 0.0
-            for r in reversed(rows):
-                try:
-                    if qty and abs(float(r.get("qty") or 0) - qty) < max(1e-9, qty * 1e-6):
-                        pick = r
-                        break
-                except (TypeError, ValueError):
-                    continue
+        # A SELL CAN BE MANY FILLS. The old matcher required ONE fill whose
+        # qty equalled the whole position, so a target order split into two
+        # partial fills matched nothing and left a real win "unknown".
+        pick = match_sell_fills(rows, t, max_age_hours=max_age_hours)
         if pick is None:
             done["still_pending"].append({"hunt_id": t.get("hunt_id"),
-                                          "why": "no fill matches this trade"})
+                                          "why": "no fill set matches this trade"})
             continue
 
         proceeds = float(pick.get("quoteQty") or 0)
-        fee = 0.0
-        if (pick.get("commissionAsset") or "").lower() == "idr":
-            fee = float(pick.get("commission") or 0)
+        fee = float(pick.get("commission") or 0)
         e_qty = float(pick.get("qty") or 0) or float(t.get("quantity") or 0)
         if proceeds <= 0 or e_qty <= 0:
             done["still_pending"].append({"hunt_id": t.get("hunt_id"),
@@ -2498,38 +2643,18 @@ def repair_live_ledger(state: dict, apply: bool = False,
         except (TypeError, ValueError):
             qty = 0.0
 
-        # match the SELL fills for this quantity, newest-first search
-        sells = [r for r in rows if not r.get("isBuyer")]
+        # match the SELL fills - AGGREGATED, because one order can fill in
+        # several pieces. PIEVERSEIDR sold as 0.28255206 + 0.07976021; no
+        # single fill equalled the position and the trade stayed "unknown".
         buys = [r for r in rows if r.get("isBuyer")]
-        pick = None
-        # An exact order id is proof, not inference: use it when the row
-        # carries one (a sell recorded after this change always will).
-        want_oid = str(t.get("full_order_id") or t.get("order_id") or "")
-        if want_oid:
-            for r in reversed(sells):
-                if want_oid in (str(r.get("orderId") or ""),
-                                str(r.get("clientOrderId") or "")):
-                    pick = r
-                    break
-        for r in reversed(sells) if pick is None else []:
-            try:
-                if qty and abs(float(r.get("qty") or 0) - qty) < max(1e-9, qty * 1e-6):
-                    pick = r
-                    break
-            except (TypeError, ValueError):
-                continue
-        if pick is None and sells:
-            pick = sells[-1]
-
+        pick = match_sell_fills(rows, t, qty=qty, max_age_hours=72)
         if pick is None:
             out["skipped"].append({"hunt_id": t.get("hunt_id"),
-                                   "why": "no matching sell fill on the exchange"})
+                                   "why": "no matching sell fills on the exchange"})
             continue
 
         proceeds = float(pick.get("quoteQty") or 0)
         fee = float(pick.get("commission") or 0)
-        if (pick.get("commissionAsset") or "").lower() != "idr":
-            fee = 0.0
         e_qty = float(pick.get("qty") or 0) or qty
         new_exit = (proceeds / e_qty) if e_qty else None
 
