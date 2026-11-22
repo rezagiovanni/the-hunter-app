@@ -1310,6 +1310,19 @@ def close_externally_sold(state: dict, rec: dict,
     }
 
     state.setdefault("live_trade_log", []).append(trade)
+    # AN EXTERNAL SELL IS STILL AN EXIT. Without this the pair is immediately
+    # eligible again: PIEVERSEIDR sold at 00:03 was the WINNER at 10:18 with
+    # an empty cooldown cell, and CSTIDR likewise. The engine could buy back
+    # the pair it had just left.
+    try:
+        from state import set_cooldown
+        import config as _config
+        hours = float(_config.get(_config.current(), "trading", {}).get(
+            "cooldown_hours", _config.DEFAULTS["trading"]["cooldown_hours"]))
+        state.setdefault("cooldowns", {})
+        set_cooldown(state, sym, hours=hours, now=now)
+    except Exception:                                        # noqa: BLE001
+        pass                                     # a cooldown must never block closing
     state["position"] = None
     state["phase"] = "HUNTING"
 
@@ -2266,6 +2279,12 @@ def _self_check():
         assert _t["exit_price"] == 0.0 and _t["exit_price_source"] == "unknown", _t
         assert _t["net_pnl_idr"] is None and _t["pnl_known"] is False, _t
         print("[PASS] a manually sold position closes with an unknown exit price")
+
+        # An external sell is STILL AN EXIT: the pair must get the same
+        # cooldown as any other. Without it the bot re-buys the pair it just
+        # left (PIEVERSEIDR was the winner 10h after being sold).
+        assert st18.get("cooldowns", {}).get("UAIIDR"), st18.get("cooldowns")
+        print("[PASS] an external sell sets the normal cooldown on the pair")
 
         # b) coins 'gone' because a SELL ORDER is working -> do NOT close
         _selling = {"uai_idr": [{"order_id": "9", "type": "sell",
